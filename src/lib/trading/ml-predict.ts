@@ -38,7 +38,7 @@ export interface MLPrediction {
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
-  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string } | null; // P1: meta-labeling model
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -54,60 +54,113 @@ function wilsonCI(observed: number, n: number, z = 1.96): { lo: number; hi: numb
   return { lo: Math.max(0, center - spread), hi: Math.min(1, center + spread) };
 }
 
-// Weighted logistic regression for meta-labeling (uniqueness-weighted)
+// Weighted logistic regression for meta-labeling (uniqueness-weighted + class balancing)
 function trainWeightedLogisticRegression(
   features: number[][], labels: number[], weights: number[],
   learningRate = 0.01, iterations = 200
-): { weights: number[]; bias: number; accuracy: number; brierScore: number; precision: number; recall: number } {
+): { weights: number[]; bias: number; accuracy: number; brierScore: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number } {
   const n = features.length;
   const d = features[0]?.length || 0;
-  // Standardize
+
+  // P1: Class balancing — up-sample minority class (barrier hits)
+  // Instead of SMOTE, use cost-sensitive weighting: minority class gets higher weight
+  const posCount = labels.filter(l => l === 1).length;
+  const negCount = n - posCount;
+  const posWeight = negCount / Math.max(1, posCount); // up-weight minority
+  const classWeights = labels.map(l => (l === 1 ? posWeight : 1));
+  // Combine class weight with uniqueness weight
+  const combinedWeights = weights.map((w, i) => w * classWeights[i]);
+
+  // Standardize (weighted)
   const means: number[] = new Array(d).fill(0);
   const stdDevs: number[] = new Array(d).fill(1);
+  const totalW = combinedWeights.reduce((a, x) => a + x, 0) || 1;
   for (let j = 0; j < d; j++) {
-    let wsum = 0, wtotal = 0;
-    for (let i = 0; i < n; i++) { wsum += features[i][j] * weights[i]; wtotal += weights[i]; }
-    means[j] = wsum / Math.max(1e-10, wtotal);
+    let wsum = 0;
+    for (let i = 0; i < n; i++) wsum += features[i][j] * combinedWeights[i];
+    means[j] = wsum / totalW;
     let wvar = 0;
-    for (let i = 0; i < n; i++) wvar += weights[i] * (features[i][j] - means[j]) ** 2;
-    wvar /= Math.max(1e-10, wtotal);
+    for (let i = 0; i < n; i++) wvar += combinedWeights[i] * (features[i][j] - means[j]) ** 2;
+    wvar /= totalW;
     stdDevs[j] = Math.sqrt(wvar) || 1;
   }
   const standardized = features.map(row => row.map((v, j) => (v - means[j]) / stdDevs[j]));
+
   const w = new Array(d).fill(0);
   let b = 0;
-  const totalW = weights.reduce((a, x) => a + x, 0) || 1;
   for (let iter = 0; iter < iterations; iter++) {
     const grad = new Array(d).fill(0);
     let gradB = 0;
     for (let i = 0; i < n; i++) {
       const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
       const pred = sigmoid(z);
-      const err = (pred - labels[i]) * weights[i];
+      const err = (pred - labels[i]) * combinedWeights[i];
       for (let j = 0; j < d; j++) grad[j] += err * standardized[i][j];
       gradB += err;
     }
     for (let j = 0; j < d; j++) w[j] -= learningRate * grad[j] / totalW;
     b -= learningRate * gradB / totalW;
   }
-  // Metrics
-  let correct = 0, brierSum = 0, tp = 0, fp = 0, fn = 0;
+
+  // Compute predictions for threshold optimization
+  const predProbs: { prob: number; label: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+    predProbs.push({ prob: sigmoid(z), label: labels[i] });
+  }
+  predProbs.sort((a, b2) => a.prob - b2.prob);
+
+  // P2: Threshold optimization — find threshold that maximizes F1
+  let bestThreshold = 0.5, bestF1 = 0, bestPrecision = 0, bestRecall = 0;
+  for (let t = 0.05; t <= 0.95; t += 0.05) {
+    let tp = 0, fp = 0, fn = 0;
+    for (const p of predProbs) {
+      const pred = p.prob >= t ? 1 : 0;
+      if (pred === 1 && p.label === 1) tp++;
+      if (pred === 1 && p.label === 0) fp++;
+      if (pred === 0 && p.label === 1) fn++;
+    }
+    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+    if (f1 > bestF1) { bestF1 = f1; bestThreshold = t; bestPrecision = prec; bestRecall = rec; }
+  }
+
+  // P3: PR-AUC for meta-model
+  let prevPrec = posCount > 0 ? posCount / n : 0.5, prevRec = 0, prAUC = 0;
+  let tp2 = 0;
+  for (let i = predProbs.length - 1; i >= 0; i--) {
+    if (predProbs[i].label === 1) tp2++;
+    const rank = predProbs.length - i;
+    const prec = tp2 / rank;
+    const rec = posCount > 0 ? tp2 / posCount : 0;
+    prAUC += (rec - prevRec) * (prec + prevPrec) / 2;
+    prevPrec = prec; prevRec = rec;
+  }
+  prAUC = Math.max(0, Math.min(1, prAUC));
+
+  // Default threshold (0.5) metrics
+  let correct = 0, brierSum = 0, tpDef = 0, fpDef = 0, fnDef = 0;
   for (let i = 0; i < n; i++) {
     const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
     const pred = sigmoid(z);
     const predLabel = pred > 0.5 ? 1 : 0;
     if (predLabel === labels[i]) correct++;
     brierSum += (pred - labels[i]) ** 2;
-    if (predLabel === 1 && labels[i] === 1) tp++;
-    if (predLabel === 1 && labels[i] === 0) fp++;
-    if (predLabel === 0 && labels[i] === 1) fn++;
+    if (predLabel === 1 && labels[i] === 1) tpDef++;
+    if (predLabel === 1 && labels[i] === 0) fpDef++;
+    if (predLabel === 0 && labels[i] === 1) fnDef++;
   }
+  const precDef = (tpDef + fpDef) > 0 ? tpDef / (tpDef + fpDef) : 0;
+  const recDef = (tpDef + fnDef) > 0 ? tpDef / (tpDef + fnDef) : 0;
+  const f1Def = (precDef + recDef) > 0 ? 2 * precDef * recDef / (precDef + recDef) : 0;
+
   return {
     weights: w, bias: b,
     accuracy: n > 0 ? (correct / n) * 100 : 0,
     brierScore: n > 0 ? brierSum / n : 0.25,
-    precision: (tp + fp) > 0 ? tp / (tp + fp) : 0,
-    recall: (tp + fn) > 0 ? tp / (tp + fn) : 0,
+    precision: precDef, recall: recDef, f1Score: f1Def, prAUC,
+    optimalThreshold: bestThreshold, precisionAtThreshold: bestPrecision, recallAtThreshold: bestRecall, f1AtThreshold: bestF1,
   };
 }
 
@@ -682,10 +735,16 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     aucROC: metaAUC,
     precision: metaResult.precision,
     recall: metaResult.recall,
+    f1Score: metaResult.f1Score,
+    prAUC: metaResult.prAUC,
+    optimalThreshold: metaResult.optimalThreshold,
+    precisionAtThreshold: metaResult.precisionAtThreshold,
+    recallAtThreshold: metaResult.recallAtThreshold,
+    f1AtThreshold: metaResult.f1AtThreshold,
     avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
     samples: tbTotal,
     barrierHitRate: tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0,
-    description: metaAUC > 0.6 ? "Meta-model can filter trades (AUC > 0.6)" : metaAUC > 0.55 ? "Meta-model weak filtering (AUC 0.55-0.6)" : "Meta-model no filtering power (AUC ≈ 0.5)",
+    description: metaResult.f1AtThreshold > 0.3 ? `Meta-model can filter trades (F1=${metaResult.f1AtThreshold.toFixed(2)} at threshold ${metaResult.optimalThreshold.toFixed(2)})` : metaAUC > 0.6 ? `Meta-model weak (AUC ${metaAUC.toFixed(2)}, F1=${metaResult.f1AtThreshold.toFixed(2)})` : `Meta-model no filtering power (AUC ${metaAUC.toFixed(2)})`,
   };
 
   return {
