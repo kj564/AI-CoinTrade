@@ -119,15 +119,29 @@ function sigmoid(x: number): number {
   return 1 / (1 + Math.exp(-x));
 }
 
-// Train logistic regression: returns weights + bias + accuracy
+// Train logistic regression with STANDARDIZED features + p-values
 function trainLogisticRegression(
   features: number[][],
   labels: number[],
   learningRate = 0.01,
   iterations = 200
-): { weights: number[]; bias: number; accuracy: number } {
+): { weights: number[]; bias: number; accuracy: number; brierScore: number; calibration: any[]; calibrationPerRegime: Record<string, any[]>; featureImportance: any[]; stdDevs: number[]; pValues: number[]; zScores: number[] } {
   const n = features.length;
   const d = features[0]?.length || 0;
+
+  // P1: Standardize features (z-score) — coefficients only comparable if standardized
+  const means: number[] = new Array(d).fill(0);
+  const stdDevs: number[] = new Array(d).fill(1);
+  for (let j = 0; j < d; j++) {
+    for (let i = 0; i < n; i++) means[j] += features[i][j];
+    means[j] /= n;
+    let variance = 0;
+    for (let i = 0; i < n; i++) variance += (features[i][j] - means[j]) ** 2;
+    variance /= n;
+    stdDevs[j] = Math.sqrt(variance) || 1;
+  }
+  const standardized: number[][] = features.map(row => row.map((v, j) => (v - means[j]) / stdDevs[j]));
+
   const weights = new Array(d).fill(0);
   let bias = 0;
 
@@ -135,10 +149,10 @@ function trainLogisticRegression(
     const grad = new Array(d).fill(0);
     let gradBias = 0;
     for (let i = 0; i < n; i++) {
-      const z = bias + features[i].reduce((a, w, j) => a + w * weights[j], 0);
+      const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
       const pred = sigmoid(z);
       const err = pred - labels[i];
-      for (let j = 0; j < d; j++) grad[j] += err * features[i][j];
+      for (let j = 0; j < d; j++) grad[j] += err * standardized[i][j];
       gradBias += err;
     }
     for (let j = 0; j < d; j++) weights[j] -= learningRate * grad[j] / n;
@@ -149,11 +163,10 @@ function trainLogisticRegression(
   let correct = 0;
   let brierSum = 0;
   for (let i = 0; i < n; i++) {
-    const z = bias + features[i].reduce((a, w, j) => a + w * weights[j], 0);
+    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
     const pred = sigmoid(z);
     const predLabel = pred > 0.5 ? 1 : 0;
     if (predLabel === labels[i]) correct++;
-    // Brier score: (predicted_prob - actual_outcome)²
     brierSum += (pred - labels[i]) ** 2;
   }
   const accuracy = n > 0 ? (correct / n) * 100 : 0;
@@ -169,7 +182,7 @@ function trainLogisticRegression(
     volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
   };
   for (let i = 0; i < n; i++) {
-    const z = bias + features[i].reduce((a, w, j) => a + w * weights[j], 0);
+    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
     const pred = sigmoid(z);
     const binIdx = Math.min(9, Math.floor(pred * 10));
     bins[binIdx].preds.push(pred);
@@ -205,12 +218,27 @@ function trainLogisticRegression(
     });
   }
 
-  // P2: Feature importance — rank by absolute weight magnitude
-  const featureImportance = weights.map((w, i) => ({ name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0 }))
+  // P2: Feature importance on STANDARDIZED coefficients (now comparable)
+  // P2: Wald test for p-values — z = weight / SE, p = 2 * (1 - Φ(|z|))
+  // SE ≈ 1 / sqrt(n * p(1-p)) for logistic regression (approximation)
+  const pHat = labels.reduce((a, b) => a + b, 0) / n; // base rate
+  const seApprox = Math.sqrt(1 / (n * pHat * (1 - pHat)));
+  const zScores: number[] = weights.map(w => Math.abs(seApprox) > 0 ? w / seApprox : 0);
+  // Approximate p-value from z-score (two-tailed, normal approximation)
+  const pValues: number[] = zScores.map(z => {
+    // Φ(|z|) approximation via error function
+    const absZ = Math.abs(z);
+    const p = 1 - 0.5 * (1 + Math.tanh(0.7978 * absZ * (1 + 0.044715 * absZ * absZ))); // tanh approximation of erf
+    return Math.max(0, Math.min(1, 2 * p));
+  });
+  const featureImportance = weights.map((w, i) => ({
+    name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0,
+    zScore: zScores[i], pValue: pValues[i], significant: pValues[i] < 0.05,
+  }))
     .sort((a, b) => b.absWeight - a.absWeight)
     .map((f, i) => ({ ...f, rank: i + 1 }));
 
-  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance };
+  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, stdDevs, pValues, zScores };
 }
 
 export function predictDirection(candles: Candle[]): MLPrediction | null {
