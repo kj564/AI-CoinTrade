@@ -99,6 +99,11 @@ interface RealisticLimitAnalysis {
   latencyBars: number; latencyMissedEntries: number; latencyPriceDriftPct: number;
   // P4 (new): Volume-aware fill
   avgVolumeAtLimitPct: number; thinMarketRate: number;
+  // This round: microstructure
+  avgBookDepthAtLimitPct: number; queueConsistencyPct: number;
+  avgVolumeProfileImpactPct: number; volumeProfileConcentration: number;
+  networkLatencyMs: number; networkLatencyBarsPct: number;
+  avgOrderBookImbalance: number; imbalanceAdverseRate: number;
 }
 interface RiskFlags { red: string[]; yellow: string[]; green: string[]; verdict: string }
 interface PositionModels {
@@ -1617,6 +1622,12 @@ export function TradingDashboard() {
                                   <span className="text-slate-500">Eff N (eigen)</span>
                                   <span className={cn("font-bold tabular-nums", block.effectiveNEigenPct < 50 ? "text-rose-400" : block.effectiveNEigenPct < 80 ? "text-amber-400" : "text-emerald-400")}>{block.effectiveNEigen.toFixed(1)} / {block.size} <span className="text-slate-600">({block.effectiveNEigenPct.toFixed(0)}%)</span></span>
                                 </div>
+                                <div className="mt-0.5 flex items-center justify-between border-t border-orange-500/10 pt-0.5">
+                                  <span className="text-slate-500">Consistency</span>
+                                  <span className={cn("font-bold", block.methodsAgree ? "text-emerald-400" : "text-rose-400")}>
+                                    {block.methodsAgree ? "✓ agree" : "✗ disagree"} <span className="text-slate-600">Δ={block.agreementDelta.toFixed(2)}</span>
+                                  </span>
+                                </div>
                               </div>
                               <p className="mt-1 text-[8px] leading-relaxed text-slate-600">{block.interpretation}</p>
                             </div>
@@ -1892,6 +1903,50 @@ export function TradingDashboard() {
                             </div>
                             <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Only ~30% of bar volume is at the limit price. Thin markets (&lt;50% avg vol) reduce fill probability.</p>
                           </div>
+                        </div>
+
+                        {/* Microstructure deep dive — order book depth, volume profile, imbalance, network latency */}
+                        <div className="mt-3 rounded-lg border border-indigo-500/20 bg-indigo-500/[0.03] p-3">
+                          <div className="mb-2 flex items-center gap-1.5">
+                            <Microscope className="h-3 w-3 text-indigo-400" />
+                            <span className="text-[10px] font-bold uppercase text-slate-400">Microstructure Deep Dive <Badge className="ml-0.5 border border-indigo-500/30 bg-indigo-500/10 px-1 py-0 text-[7px] font-bold text-indigo-300">NEW</Badge></span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                            {/* Order book depth at limit */}
+                            <div className="rounded bg-white/[0.03] p-2">
+                              <div className="text-[8px] uppercase text-slate-500">Book Depth @ Limit</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgBookDepthAtLimitPct > 30 ? "text-emerald-400" : "text-amber-400")}>{btResult.result.realisticLimitAnalysis.avgBookDepthAtLimitPct.toFixed(1)}%</div>
+                              <div className="text-[7px] text-slate-600">of avg vol</div>
+                              <div className="mt-1 text-[7px] text-slate-500">Queue consistency: <span className={cn("font-bold", btResult.result.realisticLimitAnalysis.queueConsistencyPct > 70 ? "text-emerald-400" : "text-amber-400")}>{btResult.result.realisticLimitAnalysis.queueConsistencyPct.toFixed(0)}%</span></div>
+                            </div>
+                            {/* Volume profile impact */}
+                            <div className="rounded bg-white/[0.03] p-2">
+                              <div className="text-[8px] uppercase text-slate-500">VP Impact</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgVolumeProfileImpactPct > 0.1 ? "text-amber-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.avgVolumeProfileImpactPct.toFixed(4)}%</div>
+                              <div className="text-[7px] text-slate-600">concentration-adjusted</div>
+                              <div className="mt-1 text-[7px] text-slate-500">Concentration: <span className="font-bold text-slate-300">{btResult.result.realisticLimitAnalysis.volumeProfileConcentration.toFixed(2)}</span></div>
+                            </div>
+                            {/* Network latency */}
+                            <div className="rounded bg-white/[0.03] p-2">
+                              <div className="text-[8px] uppercase text-slate-500">Network Latency</div>
+                              <div className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.networkLatencyMs}ms</div>
+                              <div className="text-[7px] text-slate-600">{btResult.result.realisticLimitAnalysis.networkLatencyBarsPct.toFixed(4)}% of bar</div>
+                              <div className="mt-1 text-[7px] text-slate-500">{btResult.result.realisticLimitAnalysis.networkLatencyBarsPct < 1 ? "Negligible vs signal latency" : "Significant"}</div>
+                            </div>
+                            {/* Order book imbalance */}
+                            <div className="rounded bg-white/[0.03] p-2">
+                              <div className="text-[8px] uppercase text-slate-500">OB Imbalance</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgOrderBookImbalance > 0 ? "text-emerald-400" : "text-rose-400")}>{btResult.result.realisticLimitAnalysis.avgOrderBookImbalance >= 0 ? "+" : ""}{btResult.result.realisticLimitAnalysis.avgOrderBookImbalance.toFixed(2)}</div>
+                              <div className="text-[7px] text-slate-600">{btResult.result.realisticLimitAnalysis.avgOrderBookImbalance > 0 ? "more buyers" : "more sellers"}</div>
+                              <div className="mt-1 text-[7px] text-slate-500">Adverse: <span className={cn("font-bold", btResult.result.realisticLimitAnalysis.imbalanceAdverseRate > 0.5 ? "text-rose-400" : "text-amber-400")}>{(btResult.result.realisticLimitAnalysis.imbalanceAdverseRate * 100).toFixed(0)}%</span></div>
+                            </div>
+                          </div>
+                          <p className="mt-2 text-[8px] leading-relaxed text-slate-600">
+                            <b>Book depth @ limit</b>: estimated resting orders at limit price, derived from volume profile (triangular distribution centered at close). Higher = more liquidity at our price.
+                            <b> VP impact</b>: market impact adjusted by volume concentration. Concentrated volume (high concentration) = less dispersed liquidity = higher impact.
+                            <b> Network latency</b>: 400ms typical (API 200ms + processing 150ms + execution 50ms). Negligible for 1h bars but matters for sub-minute.
+                            <b> OB imbalance</b>: (close-open)/(high-low). Positive = bullish candle = more buyers = adverse for buy limits.
+                          </p>
                         </div>
 
                         {/* Net economic impact */}

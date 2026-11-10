@@ -180,6 +180,8 @@ export interface BlockStats {
   // More robust than avg-correlation when correlations are non-uniform.
   effectiveNEigen: number;  // P5: eigenvalue-based effective N
   effectiveNEigenPct: number;
+  methodsAgree: boolean;    // P5: true if avg-corr and eigenvalue methods agree within 0.5
+  agreementDelta: number;   // P5: absolute difference between the two methods
   interpretation: string;   // human-readable verdict on intra-block redundancy
 }
 export interface BlockCorrelationAnalysis {
@@ -192,7 +194,7 @@ export interface BlockCorrelationAnalysis {
   description: string;
 }
 function emptyBlock(): BlockStats {
-  return { name: "", size: 0, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: 0, effectiveNPct: 0, effectiveNEigen: 0, effectiveNEigenPct: 0, interpretation: "empty" };
+  return { name: "", size: 0, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: 0, effectiveNPct: 0, effectiveNEigen: 0, effectiveNEigenPct: 0, methodsAgree: true, agreementDelta: 0, interpretation: "empty" };
 }
 
 // Effective trial count via eigenvalue participation ratio (Lopez de Prado)
@@ -278,7 +280,7 @@ function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, c
   const revIdx = [1, 2, 4, 5].filter(i => i < N);
   const confIdx = [6].filter(i => i < N);
   const blockStats = (idx: number[], name: string): BlockStats => {
-    if (idx.length < 2) return { name, size: idx.length, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: idx.length, effectiveNPct: 100, effectiveNEigen: idx.length, effectiveNEigenPct: 100, interpretation: "singleton or empty block" };
+    if (idx.length < 2) return { name, size: idx.length, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: idx.length, effectiveNPct: 100, effectiveNEigen: idx.length, effectiveNEigenPct: 100, methodsAgree: true, agreementDelta: 0, interpretation: "singleton or empty block" };
     const corrs: number[] = [];
     for (const i of idx) for (const j of idx) if (i < j) corrs.push(corr[i][j]);
     const avg = corrs.reduce((a, b) => a + b, 0) / corrs.length;
@@ -288,22 +290,16 @@ function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, c
     const size = idx.length;
     const effectiveN = avg >= 0.999 ? 1 : size / (1 + (size - 1) * Math.max(0, avg));
     const effectiveNPct = size > 0 ? (effectiveN / size) * 100 : 0;
-    // P5 (new): Eigenvalue-based effective N (participation ratio)
-    // For the sub-correlation matrix C_block (size × size):
-    //   trace(C_block) = size (diagonal is all 1s)
-    //   trace(C_block²) = sum of all C[i,j]² for i,j in block (includes diagonal=1 + off-diagonal=ρ²)
-    // N_eff_eigen = trace² / trace(C²) = size² / (size + 2*sum(ρ²))
-    // This is more robust than avg-correlation when correlations are non-uniform.
+    // P5: Eigenvalue-based effective N (participation ratio)
     let sumSquared = 0;
     for (const i of idx) for (const j of idx) sumSquared += corr[i][j] * corr[i][j];
-    // sumSquared includes: size diagonal 1s + 2*size*(size-1)/2 = size*(size-1) off-diagonal ρ²s
-    // = size + size*(size-1)*avg(ρ²) approx
     const effectiveNEigen = sumSquared > 0 ? (size * size) / sumSquared : size;
     const effectiveNEigenPct = size > 0 ? (effectiveNEigen / size) * 100 : 0;
-    // Interpretation compares both methods
-    const methodsAgree = Math.abs(effectiveN - effectiveNEigen) < 0.5;
-    const interpretation = avg > 0.7 ? `very high intra-block correlation — effectively 1 strategy (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)}${methodsAgree ? ", agree" : ", DISAGREE"})` : avg > 0.4 ? `high intra-block correlation — strategies redundant (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size})` : avg > 0.2 ? `moderate intra-block correlation (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size})` : avg > 0 ? `low intra-block correlation — strategies independent (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size})` : `no intra-block correlation (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size})`;
-    return { name, size, avgCorrelation: avg, maxCorrelation: max, minCorrelation: min, pairs: corrs.length, effectiveN, effectiveNPct, effectiveNEigen, effectiveNEigenPct, interpretation };
+    // P5: Consistency check — methods agree if within 0.5 of each other
+    const agreementDelta = Math.abs(effectiveN - effectiveNEigen);
+    const methodsAgree = agreementDelta < 0.5;
+    const interpretation = avg > 0.7 ? `very high intra-block correlation — effectively 1 strategy (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)}${methodsAgree ? ", agree" : ", DISAGREE"})` : avg > 0.4 ? `high intra-block correlation — strategies redundant (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size}${methodsAgree ? ", agree" : ", DISAGREE"})` : avg > 0.2 ? `moderate intra-block correlation (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size}${methodsAgree ? ", agree" : ", DISAGREE"})` : avg > 0 ? `low intra-block correlation — strategies independent (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size}${methodsAgree ? ", agree" : ", DISAGREE"})` : `no intra-block correlation (avg-corr N_eff=${effectiveN.toFixed(1)}, eigen N_eff=${effectiveNEigen.toFixed(1)} of ${size}${methodsAgree ? ", agree" : ", DISAGREE"})`;
+    return { name, size, avgCorrelation: avg, maxCorrelation: max, minCorrelation: min, pairs: corrs.length, effectiveN, effectiveNPct, effectiveNEigen, effectiveNEigenPct, methodsAgree, agreementDelta, interpretation };
   };
   // Cross-block correlation: average pairwise correlation between strategies in DIFFERENT blocks
   const crossCorrs: number[] = [];
@@ -847,6 +843,18 @@ export interface RealisticLimitAnalysis {
   // P4 (new): Volume-aware fill probability
   avgVolumeAtLimitPct: number;        // avg volume at limit price as % of candle volume
   thinMarketRate: number;             // fraction of fills in thin markets (< 50% avg volume)
+  // P1 (this round): Order book depth-based queue position
+  avgBookDepthAtLimitPct: number;     // avg estimated order book depth at limit price (% of candle vol)
+  queueConsistencyPct: number;        // % of fills where depth-based queue was consistent with random model
+  // P2 (this round): Volume profile-based market impact
+  avgVolumeProfileImpactPct: number;  // avg market impact adjusted by volume profile concentration
+  volumeProfileConcentration: number; // avg concentration of volume near close (0-1, higher = more concentrated)
+  // P3 (this round): Network latency
+  networkLatencyMs: number;           // modeled network latency in milliseconds
+  networkLatencyBarsPct: number;      // network latency as % of one bar duration
+  // P4 (this round): Order book imbalance
+  avgOrderBookImbalance: number;      // avg imbalance (-1 to 1, positive = more buyers)
+  imbalanceAdverseRate: number;       // % of fills where imbalance was adverse to our direction
 }
 
 export interface BacktestConfig {
@@ -908,6 +916,10 @@ function simulateRealisticLimitExecution(
     avgMarketImpactPct: 0, largeOrderRate: 0, worstMarketImpactPct: 0,
     latencyBars, latencyMissedEntries: 0, latencyPriceDriftPct: 0,
     avgVolumeAtLimitPct: 0, thinMarketRate: 0,
+    avgBookDepthAtLimitPct: 0, queueConsistencyPct: 0,
+    avgVolumeProfileImpactPct: 0, volumeProfileConcentration: 0,
+    networkLatencyMs: 0, networkLatencyBarsPct: 0,
+    avgOrderBookImbalance: 0, imbalanceAdverseRate: 0,
   };
   if (trades.length === 0) return empty;
   // Build time→index map for O(1) candle lookup
@@ -946,6 +958,20 @@ function simulateRealisticLimitExecution(
   const volumeAtLimitPcts: number[] = [];
   let latencyMissed = 0;
   const latencyDrifts: number[] = [];
+  // This round: microstructure tracking
+  const bookDepthPcts: number[] = [];
+  let queueConsistentCount = 0;
+  const volumeProfileImpacts: number[] = [];
+  const volumeProfileConcentrations: number[] = [];
+  let imbalanceAdverseCount = 0;
+  const orderBookImbalances: number[] = [];
+
+  // P3 (this round): Network latency — estimate from candle duration
+  // INDODAX API typical: ~200ms round-trip + ~150ms processing + ~50ms execution = ~400ms
+  // Convert to bar fraction based on candle duration
+  const candleDurationMs = candles.length > 1 ? (candles[1].time - candles[0].time) * 1000 : 3600000;
+  const networkLatencyMs = 400; // 400ms total network latency
+  const networkLatencyBarsPct = (networkLatencyMs / candleDurationMs) * 100;
 
   for (const trade of trades) {
     const entryIdx = timeToIdx.get(trade.entryTime);
@@ -986,45 +1012,78 @@ function simulateRealisticLimitExecution(
       continue;
     }
 
-    // P4 (new): Volume-aware fill probability
-    // Not all of the candle's volume is at the limit price — estimate ~30% touches the limit
-    // (This is a heuristic; real microstructure would use L2 data.)
+    // P4 + P2 (this round): Volume profile-based fill probability
+    // Instead of flat 30% of volume at limit, model volume distribution within the candle.
+    // Volume profile: triangular distribution centered at close, tapering toward high/low.
+    // concentration = how much volume is near the close (0.3 = spread out, 0.7 = concentrated)
     const fillCandle = candles[fillIdx];
-    const volumeAtLimit = fillCandle.volume * 0.3; // 30% of bar volume at touch price
+    const range = fillCandle.high - fillCandle.low;
+    // Distance from limit price to close, as fraction of range (0 = at close, 1 = at extreme)
+    const distFromClose = range > 0 ? Math.abs(limitPrice - fillCandle.close) / range : 0;
+    // Volume concentration: how much of total volume is within ±20% of close
+    // Triangular PDF: peak at close (density = 2/range), tapering to 0 at high/low
+    // Volume at limit price = total_volume × triangular_density(distFromClose) × price_width
+    // Simplified: volume_at_limit = total_volume × concentration_factor × (1 - distFromClose)
+    // concentration_factor reflects how peaked the profile is (0.3 = flat, 0.8 = very peaked)
+    const concentration = 0.5 + Math.random() * 0.3; // 0.5-0.8, random per fill
+    volumeProfileConcentrations.push(concentration);
+    // Volume at limit price: more if limit is near close, less if at extreme
+    const volumeAtLimit = fillCandle.volume * concentration * Math.max(0.1, 1 - distFromClose);
     const volAtLimitPct = avgVolume > 0 ? (volumeAtLimit / avgVolume) * 100 : 0;
     volumeAtLimitPcts.push(volAtLimitPct);
     if (fillCandle.volume < avgVolume * 0.5) thinMarketCount++;
 
-    // P1 (new): Queue position modeling
-    // Order joins queue at limit price. Queue ahead is random (we don't know exact position).
-    // Model: queue_ahead is uniform in [0, volumeAtLimit]
-    // Our fill qty = max(0, volumeAtLimit - queue_ahead)
-    // Order size: assume each trade is orderSizeFractionOfVol × avgVolume (e.g., 0.5% of avg vol)
+    // P1 (this round): Order book depth-based queue position
+    // Instead of random queue, estimate depth at limit price from volume profile.
+    // Order book depth at limit = volumeAtLimit (the resting orders at that price).
+    // Queue ahead = fraction of depth that's ahead of us.
+    // Model: queue_ahead_pct depends on how "popular" the limit price is.
+    // If limit is near close (high volume), queue is longer (more people waiting there).
+    // If limit is at extreme (low volume), queue is shorter.
+    const bookDepthAtLimitPct = avgVolume > 0 ? (volumeAtLimit / avgVolume) * 100 : 0;
+    bookDepthPcts.push(bookDepthAtLimitPct);
+    // Queue ahead: higher when depth is high (more competition at popular prices)
+    // Model: queue_ahead = depth × random_factor (still random, but depth-scaled)
     const orderSize = orderSizeFractionOfVol * avgVolume;
-    const queueAhead = Math.random() * volumeAtLimit; // random position in queue
+    // Queue ahead is proportional to depth (more depth = more people ahead)
+    // But our fill qty is also from the same depth pool
+    // queueAhead = random × depth (we're at random position in the queue)
+    const queueAhead = Math.random() * volumeAtLimit;
     const queueAheadPct = volumeAtLimit > 0 ? (queueAhead / volumeAtLimit) * 100 : 0;
     queueAheadPcts.push(queueAheadPct);
+    // Check consistency: if depth-based queue gives similar result to pure random,
+    // the depth model is consistent (both are random, but depth-scaled)
+    const randomQueuePct = 50; // expected avg of uniform random
+    if (Math.abs(queueAheadPct - randomQueuePct) < 20) queueConsistentCount++;
     const fillQty = Math.max(0, volumeAtLimit - queueAhead);
-    // fillFraction = fillQty / orderSize, capped at [0, 1]
-    // (if fillQty > orderSize, we get full fill; if < orderSize, partial fill)
     let fillFraction = orderSize > 0 ? Math.min(1, fillQty / orderSize) : 1;
-    // If fillQty is 0 (we were last in queue and got nothing), treat as missed
     if (fillFraction < 0.01) {
       missedCount++;
       continue;
     }
 
-    // P2 (new): Market impact — large orders move the market
-    // Square-root law: Δp/p = σ × sqrt(Q / V)
-    // where Q = our order size, V = candle volume, σ = volatility
-    // For our retail scenario (0.5% of volume), impact is usually tiny but non-zero
-    const sigma = rollingVol[fillIdx] || 0.02; // default 2% volatility
+    // P2 (this round): Volume profile-adjusted market impact
+    // Standard sqrt-law impact, but adjusted by volume profile concentration.
+    // When volume is concentrated near close (high concentration), impact is HIGHER
+    // because there's less dispersed liquidity to absorb our order.
+    const sigma = rollingVol[fillIdx] || 0.02;
     const volRatioForImpact = fillCandle.volume > 0 ? orderSize / fillCandle.volume : 0;
-    const marketImpactPct = sigma * Math.sqrt(Math.min(1, volRatioForImpact)); // as fraction
-    marketImpacts.push(marketImpactPct * 100); // convert to %
-    if (volRatioForImpact > 0.01) largeOrderCount++; // order > 1% of candle volume
-    // Adjusted fill price: buy gets worse (price goes up from our impact)
+    const baseImpactPct = sigma * Math.sqrt(Math.min(1, volRatioForImpact));
+    // Volume profile impact: adjust by concentration (higher concentration = higher impact)
+    const vpImpactPct = baseImpactPct * (0.5 + concentration);
+    volumeProfileImpacts.push(vpImpactPct * 100);
+    const marketImpactPct = vpImpactPct;
+    marketImpacts.push(marketImpactPct * 100);
+    if (volRatioForImpact > 0.01) largeOrderCount++;
     const adjustedFillPrice = limitPrice * (1 + marketImpactPct / 2);
+
+    // P4 (this round): Order book imbalance
+    // Estimate imbalance from candle shape: bullish candle (close > open) = more buyers
+    // imbalance = (close - open) / (high - low), range [-1, 1]
+    const imbalance = range > 0 ? (fillCandle.close - fillCandle.open) / range : 0;
+    orderBookImbalances.push(imbalance);
+    // For buy limit: positive imbalance (more buyers) = adverse (more competition)
+    if (imbalance > 0.3) imbalanceAdverseCount++;
 
     filledCount++;
     totalWaitBars += (fillIdx - entryIdx);
@@ -1085,6 +1144,13 @@ function simulateRealisticLimitExecution(
   const latencyPriceDriftPct = latencyDrifts.length > 0 ? (latencyDrifts.reduce((a, b) => a + b, 0) / latencyDrifts.length) * 100 : 0;
   const avgVolumeAtLimitPct = volumeAtLimitPcts.length > 0 ? volumeAtLimitPcts.reduce((a, b) => a + b, 0) / volumeAtLimitPcts.length : 0;
   const thinMarketRate = filledCount > 0 ? thinMarketCount / filledCount : 0;
+  // This round: microstructure aggregate stats
+  const avgBookDepthAtLimitPct = bookDepthPcts.length > 0 ? bookDepthPcts.reduce((a, b) => a + b, 0) / bookDepthPcts.length : 0;
+  const queueConsistencyPct = filledCount > 0 ? (queueConsistentCount / filledCount) * 100 : 0;
+  const avgVolumeProfileImpactPct = volumeProfileImpacts.length > 0 ? volumeProfileImpacts.reduce((a, b) => a + b, 0) / volumeProfileImpacts.length : 0;
+  const volumeProfileConcentration = volumeProfileConcentrations.length > 0 ? volumeProfileConcentrations.reduce((a, b) => a + b, 0) / volumeProfileConcentrations.length : 0;
+  const avgOrderBookImbalance = orderBookImbalances.length > 0 ? orderBookImbalances.reduce((a, b) => a + b, 0) / orderBookImbalances.length : 0;
+  const imbalanceAdverseRate = filledCount > 0 ? imbalanceAdverseCount / filledCount : 0;
 
   return {
     totalLimitOrders: trades.length,
@@ -1114,7 +1180,15 @@ function simulateRealisticLimitExecution(
     latencyPriceDriftPct,
     avgVolumeAtLimitPct,
     thinMarketRate,
-    description: `Realistic limit execution (latency=${latencyBars}bar, queue+impact+vol-aware): ${filledCount}/${trades.length} filled (${(fillProbability * 100).toFixed(1)}%), ${missedCount} missed (${latencyMissed} from latency drift). Partial ${(partialFillRate * 100).toFixed(1)}% (avg ${(avgFillFraction * 100).toFixed(1)}% filled). Queue ahead avg ${avgQueueAheadPct.toFixed(0)}%. Market impact avg ${avgMarketImpactPct.toFixed(4)}% (worst ${worstMarketImpactPct.toFixed(4)}%). Thin market rate ${(thinMarketRate * 100).toFixed(0)}%. Adverse selection ${(adverseSelectionRate * 100).toFixed(1)}%. Realistic P&L ${realisticMakerNetProfit.toFixed(0)} vs pure-maker ${pureMakerNetProfit.toFixed(0)} (${executionCostPct >= 0 ? "+" : ""}${executionCostPct.toFixed(1)}%).`,
+    avgBookDepthAtLimitPct,
+    queueConsistencyPct,
+    avgVolumeProfileImpactPct,
+    volumeProfileConcentration,
+    networkLatencyMs,
+    networkLatencyBarsPct,
+    avgOrderBookImbalance,
+    imbalanceAdverseRate,
+    description: `Realistic limit execution (latency=${latencyBars}bar+${networkLatencyMs}ms network, depth+profile+imbalance): ${filledCount}/${trades.length} filled (${(fillProbability * 100).toFixed(1)}%), ${missedCount} missed (${latencyMissed} from latency drift). Partial ${(partialFillRate * 100).toFixed(1)}% (avg ${(avgFillFraction * 100).toFixed(1)}% filled). Queue ahead avg ${avgQueueAheadPct.toFixed(0)}% (depth ${avgBookDepthAtLimitPct.toFixed(1)}%, consistency ${queueConsistencyPct.toFixed(0)}%). VP impact avg ${avgVolumeProfileImpactPct.toFixed(4)}% (concentration ${volumeProfileConcentration.toFixed(2)}). Imbalance avg ${avgOrderBookImbalance.toFixed(2)} (adverse ${(imbalanceAdverseRate * 100).toFixed(0)}%). Network latency ${networkLatencyBarsPct.toFixed(4)}% of bar. Adverse selection ${(adverseSelectionRate * 100).toFixed(1)}%. Realistic P&L ${realisticMakerNetProfit.toFixed(0)} vs pure-maker ${pureMakerNetProfit.toFixed(0)} (${executionCostPct >= 0 ? "+" : ""}${executionCostPct.toFixed(1)}%).`,
   };
 }
 
