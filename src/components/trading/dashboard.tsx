@@ -104,6 +104,19 @@ interface RealisticLimitAnalysis {
   avgVolumeProfileImpactPct: number; volumeProfileConcentration: number;
   networkLatencyMs: number; networkLatencyBarsPct: number;
   avgOrderBookImbalance: number; imbalanceAdverseRate: number;
+  // L2 calibration
+  l2Snapshot: L2SnapshotData | null;
+}
+interface L2SnapshotData {
+  pair: string; timestamp: string;
+  topBidPrice: number; topAskPrice: number; realSpreadPct: number;
+  topBidVolume: number; topAskVolume: number; topOfBookImbalance: number;
+  totalBidVolume: number; totalAskVolume: number; totalImbalance: number;
+  bidLevels: number; askLevels: number;
+  bidDepthProfile: { priceLevelPct: number; cumulativeVol: number }[];
+  askDepthProfile: { priceLevelPct: number; cumulativeVol: number }[];
+  depthCalibrationFactor: number; spreadCalibrationFactor: number; imbalanceCalibrationFactor: number;
+  description: string;
 }
 interface RiskFlags { red: string[]; yellow: string[]; green: string[]; verdict: string }
 interface PositionModels {
@@ -1948,6 +1961,93 @@ export function TradingDashboard() {
                             <b> OB imbalance</b>: (close-open)/(high-low). Positive = bullish candle = more buyers = adverse for buy limits.
                           </p>
                         </div>
+
+                        {/* L2 Order Book Snapshot — real INDODAX depth data */}
+                        {btResult.result.realisticLimitAnalysis.l2Snapshot && (
+                          <div className="mt-3 rounded-lg border border-teal-500/20 bg-teal-500/[0.03] p-3">
+                            <div className="mb-2 flex items-center justify-between">
+                              <div className="flex items-center gap-1.5">
+                                <Layers className="h-3 w-3 text-teal-400" />
+                                <span className="text-[10px] font-bold uppercase text-slate-400">L2 Order Book Snapshot <Badge className="ml-0.5 border border-teal-500/30 bg-teal-500/10 px-1 py-0 text-[7px] font-bold text-teal-300">LIVE</Badge></span>
+                              </div>
+                              <span className="text-[8px] text-slate-600">Real INDODAX depth · calibrates synthesized model</span>
+                            </div>
+                            {(() => {
+                              const l2 = btResult.result.realisticLimitAnalysis.l2Snapshot!;
+                              return (
+                                <>
+                                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                                    <div className="rounded bg-white/[0.03] p-2">
+                                      <div className="text-[8px] uppercase text-slate-500">Real Spread</div>
+                                      <div className={cn("font-bold tabular-nums", l2.realSpreadPct > 0.2 ? "text-amber-400" : "text-emerald-400")}>{l2.realSpreadPct.toFixed(3)}%</div>
+                                      <div className="text-[7px] text-slate-600">vs 0.1% assumed</div>
+                                      <div className="mt-0.5 text-[7px] text-slate-500">Calibration: <span className={cn("font-bold", l2.spreadCalibrationFactor > 2 ? "text-rose-400" : "text-slate-300")}>{l2.spreadCalibrationFactor.toFixed(2)}×</span></div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] p-2">
+                                      <div className="text-[8px] uppercase text-slate-500">Top-of-Book Imbalance</div>
+                                      <div className={cn("font-bold tabular-nums", l2.topOfBookImbalance > 0 ? "text-emerald-400" : "text-rose-400")}>{l2.topOfBookImbalance >= 0 ? "+" : ""}{l2.topOfBookImbalance.toFixed(2)}</div>
+                                      <div className="text-[7px] text-slate-600">{l2.topOfBookImbalance > 0 ? "more buyers" : "more sellers"}</div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] p-2">
+                                      <div className="text-[8px] uppercase text-slate-500">Total Imbalance</div>
+                                      <div className={cn("font-bold tabular-nums", l2.totalImbalance > 0 ? "text-emerald-400" : "text-rose-400")}>{l2.totalImbalance >= 0 ? "+" : ""}{l2.totalImbalance.toFixed(2)}</div>
+                                      <div className="text-[7px] text-slate-600">all levels</div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] p-2">
+                                      <div className="text-[8px] uppercase text-slate-500">Depth Calibration</div>
+                                      <div className={cn("font-bold tabular-nums", l2.depthCalibrationFactor > 2 ? "text-emerald-400" : l2.depthCalibrationFactor < 0.5 ? "text-rose-400" : "text-slate-300")}>{l2.depthCalibrationFactor.toFixed(2)}×</div>
+                                      <div className="text-[7px] text-slate-600">synthesized vs real</div>
+                                    </div>
+                                  </div>
+                                  {/* Top-of-book details */}
+                                  <div className="mt-2 grid grid-cols-2 gap-2 text-[9px]">
+                                    <div className="rounded bg-emerald-500/[0.06] p-2">
+                                      <div className="text-[8px] font-bold text-emerald-400">Best Bid</div>
+                                      <div className="font-bold tabular-nums text-slate-200">{fmtIDR(l2.topBidPrice)}</div>
+                                      <div className="text-[7px] text-slate-500">vol: <span className="tabular-nums text-slate-300">{l2.topBidVolume.toFixed(6)}</span></div>
+                                      <div className="text-[7px] text-slate-500">{l2.bidLevels} levels · total {l2.totalBidVolume.toFixed(4)}</div>
+                                    </div>
+                                    <div className="rounded bg-rose-500/[0.06] p-2">
+                                      <div className="text-[8px] font-bold text-rose-400">Best Ask</div>
+                                      <div className="font-bold tabular-nums text-slate-200">{fmtIDR(l2.topAskPrice)}</div>
+                                      <div className="text-[7px] text-slate-500">vol: <span className="tabular-nums text-slate-300">{l2.topAskVolume.toFixed(6)}</span></div>
+                                      <div className="text-[7px] text-slate-500">{l2.askLevels} levels · total {l2.totalAskVolume.toFixed(4)}</div>
+                                    </div>
+                                  </div>
+                                  {/* Depth profile visualization */}
+                                  <div className="mt-2">
+                                    <div className="mb-1 text-[8px] font-bold text-slate-500">Cumulative Depth Profile (top 10 levels)</div>
+                                    <div className="flex items-end gap-1 h-16">
+                                      {/* Bid side (left) */}
+                                      {l2.bidDepthProfile.slice(0, 10).reverse().map((d, i) => {
+                                        const maxVol = Math.max(...l2.bidDepthProfile.concat(l2.askDepthProfile).map(p => p.cumulativeVol), 1);
+                                        const h = (d.cumulativeVol / maxVol) * 100;
+                                        return <div key={`b${i}`} className="flex-1 bg-emerald-500/40 rounded-t" style={{ height: `${h}%` }} title={`${d.priceLevelPct.toFixed(2)}% from mid: ${d.cumulativeVol.toFixed(4)}`} />;
+                                      })}
+                                      {/* Separator */}
+                                      <div className="w-[2px] bg-slate-500/30" />
+                                      {/* Ask side (right) */}
+                                      {l2.askDepthProfile.slice(0, 10).map((d, i) => {
+                                        const maxVol = Math.max(...l2.bidDepthProfile.concat(l2.askDepthProfile).map(p => p.cumulativeVol), 1);
+                                        const h = (d.cumulativeVol / maxVol) * 100;
+                                        return <div key={`a${i}`} className="flex-1 bg-rose-500/40 rounded-t" style={{ height: `${h}%` }} title={`${d.priceLevelPct.toFixed(2)}% from mid: ${d.cumulativeVol.toFixed(4)}`} />;
+                                      })}
+                                    </div>
+                                    <div className="mt-1 flex justify-between text-[7px] text-slate-600">
+                                      <span>← bids (deep)</span>
+                                      <span>spread</span>
+                                      <span>asks (deep) →</span>
+                                    </div>
+                                  </div>
+                                  <p className="mt-2 text-[8px] leading-relaxed text-slate-500">{l2.description}</p>
+                                  <p className="mt-1 text-[8px] leading-relaxed text-slate-600">
+                                    Real L2 snapshot from INDODAX depth API. Used to calibrate the synthesized microstructure model: real spread replaces assumed 0.1%, real imbalance (70% weight) blends with candle-shape estimate, real depth scales volume-at-limit estimate. For historical backtests, this is a representative snapshot applied to past candles.
+                                  </p>
+                                </>
+                              );
+                            })()}
+                          </div>
+                        )}
 
                         {/* Net economic impact */}
                         <div className="mt-3 rounded-lg border border-rose-500/20 bg-rose-500/[0.04] p-3">

@@ -855,6 +855,37 @@ export interface RealisticLimitAnalysis {
   // P4 (this round): Order book imbalance
   avgOrderBookImbalance: number;      // avg imbalance (-1 to 1, positive = more buyers)
   imbalanceAdverseRate: number;       // % of fills where imbalance was adverse to our direction
+  // L2 calibration: real order book snapshot from INDODAX API (current state, used to calibrate historical model)
+  l2Snapshot: L2Snapshot | null;      // null if L2 data unavailable
+}
+
+// P1 (this round): L2 order book snapshot from INDODAX API
+// Captures the real order book structure at backtest time, used to calibrate
+// the synthesized microstructure model. For historical backtests, this is a
+// representative snapshot (current state applied to historical candles).
+export interface L2Snapshot {
+  pair: string;
+  timestamp: string;
+  // Real order book metrics
+  topBidPrice: number;
+  topAskPrice: number;
+  realSpreadPct: number;          // (ask - bid) / mid, as %
+  topBidVolume: number;           // volume at best bid
+  topAskVolume: number;           // volume at best ask
+  topOfBookImbalance: number;     // (bidVol - askVol) / (bidVol + askVol), -1 to 1
+  totalBidVolume: number;         // sum of all bid levels
+  totalAskVolume: number;         // sum of all ask levels
+  totalImbalance: number;         // (totalBid - totalAsk) / (totalBid + totalAsk)
+  bidLevels: number;              // count of bid price levels
+  askLevels: number;              // count of ask price levels
+  // Depth profile: volume at each 0.1% price level from mid
+  bidDepthProfile: { priceLevelPct: number; cumulativeVol: number }[];
+  askDepthProfile: { priceLevelPct: number; cumulativeVol: number }[];
+  // Calibration factors (how L2 adjusts the synthesized model)
+  depthCalibrationFactor: number; // real depth / synthesized depth estimate
+  spreadCalibrationFactor: number; // real spread / assumed spread
+  imbalanceCalibrationFactor: number; // real imbalance / candle-shape imbalance
+  description: string;
 }
 
 export interface BacktestConfig {
@@ -865,11 +896,98 @@ export interface BacktestConfig {
   spreadPct?: number;    // bid-ask spread as % (default 0.001 = 0.1%)
   slippagePct?: number;  // slippage as % (default 0.0005 = 0.05%)
   useRealisticFees?: boolean; // if true, apply maker/taker/spread/slippage
+  l2Snapshot?: L2Snapshot | null; // P1 (this round): real order book snapshot for calibration
 }
 
 // Compute realistic execution cost: taker fee + spread + slippage
 function executionCost(price: number, feeRate: number, spreadPct: number, slippagePct: number): number {
   return price * (feeRate + spreadPct + slippagePct);
+}
+
+// P1 (this round): Build L2 snapshot from INDODAX depth data
+// Takes raw { buy: [[price, amount], ...], sell: [[price, amount], ...] } and computes
+// structured microstructure metrics for calibrating the realistic limit execution model.
+export function buildL2Snapshot(
+  pair: string,
+  depth: { buy: [string, string][]; sell: [string, string][] },
+  assumedSpreadPct: number,
+  avgCandleVolume: number
+): L2Snapshot {
+  // Parse bid/ask levels (buy = bids, sorted high→low; sell = asks, sorted low→high)
+  const bids = depth.buy
+    .map(([p, a]) => ({ price: parseFloat(p), amount: parseFloat(a) }))
+    .filter(b => b.price > 0 && b.amount > 0)
+    .sort((a, b) => b.price - a.price); // highest bid first
+  const asks = depth.sell
+    .map(([p, a]) => ({ price: parseFloat(p), amount: parseFloat(a) }))
+    .filter(a => a.price > 0 && a.amount > 0)
+    .sort((a, b) => a.price - b.price); // lowest ask first
+
+  const topBidPrice = bids.length > 0 ? bids[0].price : 0;
+  const topAskPrice = asks.length > 0 ? asks[0].price : 0;
+  const midPrice = (topBidPrice + topAskPrice) / 2 || topBidPrice;
+  const realSpreadPct = midPrice > 0 ? ((topAskPrice - topBidPrice) / midPrice) * 100 : 0;
+
+  const topBidVolume = bids.length > 0 ? bids[0].amount : 0;
+  const topAskVolume = asks.length > 0 ? asks[0].amount : 0;
+  const topOfBookImbalance = (topBidVolume + topAskVolume) > 0
+    ? (topBidVolume - topAskVolume) / (topBidVolume + topAskVolume) : 0;
+
+  const totalBidVolume = bids.reduce((a, b) => a + b.amount, 0);
+  const totalAskVolume = asks.reduce((a, b) => a + b.amount, 0);
+  const totalImbalance = (totalBidVolume + totalAskVolume) > 0
+    ? (totalBidVolume - totalAskVolume) / (totalBidVolume + totalAskVolume) : 0;
+
+  // Build depth profile: cumulative volume at each 0.1% price level from mid
+  const bidDepthProfile: { priceLevelPct: number; cumulativeVol: number }[] = [];
+  let cumBidVol = 0;
+  for (const b of bids) {
+    const pctFromMid = midPrice > 0 ? ((midPrice - b.price) / midPrice) * 100 : 0;
+    cumBidVol += b.amount;
+    bidDepthProfile.push({ priceLevelPct: pctFromMid, cumulativeVol: cumBidVol });
+    if (bidDepthProfile.length >= 20) break; // cap at 20 levels
+  }
+  const askDepthProfile: { priceLevelPct: number; cumulativeVol: number }[] = [];
+  let cumAskVol = 0;
+  for (const a of asks) {
+    const pctFromMid = midPrice > 0 ? ((a.price - midPrice) / midPrice) * 100 : 0;
+    cumAskVol += a.amount;
+    askDepthProfile.push({ priceLevelPct: pctFromMid, cumulativeVol: cumAskVol });
+    if (askDepthProfile.length >= 20) break;
+  }
+
+  // Calibration factors: how L2 adjusts the synthesized model
+  // Depth calibration: real top-of-book volume vs avg candle volume
+  // If real depth is high relative to candle volume, synthesized model underestimates fill probability
+  const synthesizedDepthEstimate = avgCandleVolume * 0.3 * 0.5; // 30% of bar vol at limit × 50% concentration
+  const depthCalibrationFactor = synthesizedDepthEstimate > 0
+    ? Math.min(5, Math.max(0.1, totalBidVolume / synthesizedDepthEstimate)) : 1;
+  // Spread calibration: real spread vs assumed spread
+  const spreadCalibrationFactor = assumedSpreadPct > 0 ? realSpreadPct / (assumedSpreadPct * 100) : 1;
+  // Imbalance calibration: real imbalance (used as ground truth)
+  const imbalanceCalibrationFactor = 1; // real imbalance replaces synthesized
+
+  return {
+    pair,
+    timestamp: new Date().toISOString(),
+    topBidPrice,
+    topAskPrice,
+    realSpreadPct,
+    topBidVolume,
+    topAskVolume,
+    topOfBookImbalance,
+    totalBidVolume,
+    totalAskVolume,
+    totalImbalance,
+    bidLevels: bids.length,
+    askLevels: asks.length,
+    bidDepthProfile,
+    askDepthProfile,
+    depthCalibrationFactor,
+    spreadCalibrationFactor,
+    imbalanceCalibrationFactor,
+    description: `L2 snapshot: ${bids.length} bid levels, ${asks.length} ask levels. Spread ${(realSpreadPct).toFixed(3)}%. Top-of-book imbalance ${topOfBookImbalance.toFixed(2)}. Total bid vol ${totalBidVolume.toFixed(4)} vs ask vol ${totalAskVolume.toFixed(4)} (imbalance ${totalImbalance.toFixed(2)}). Depth calibration: ${depthCalibrationFactor.toFixed(2)}× synthesized estimate.`,
+  };
 }
 
 // P1-3: Realistic limit order execution simulator
@@ -902,7 +1020,8 @@ function simulateRealisticLimitExecution(
   maxWaitBars = 3,
   adverseSelectionBars = 1,
   latencyBars = 1,
-  orderSizeFractionOfVol = 0.005
+  orderSizeFractionOfVol = 0.005,
+  l2Snapshot: L2Snapshot | null = null
 ): RealisticLimitAnalysis {
   const empty: RealisticLimitAnalysis = {
     totalLimitOrders: 0, filledOrders: 0, missedOrders: 0,
@@ -920,6 +1039,7 @@ function simulateRealisticLimitExecution(
     avgVolumeProfileImpactPct: 0, volumeProfileConcentration: 0,
     networkLatencyMs: 0, networkLatencyBarsPct: 0,
     avgOrderBookImbalance: 0, imbalanceAdverseRate: 0,
+    l2Snapshot,
   };
   if (trades.length === 0) return empty;
   // Build time→index map for O(1) candle lookup
@@ -1028,7 +1148,12 @@ function simulateRealisticLimitExecution(
     const concentration = 0.5 + Math.random() * 0.3; // 0.5-0.8, random per fill
     volumeProfileConcentrations.push(concentration);
     // Volume at limit price: more if limit is near close, less if at extreme
-    const volumeAtLimit = fillCandle.volume * concentration * Math.max(0.1, 1 - distFromClose);
+    // If L2 available, calibrate using real depth data
+    let volumeAtLimit = fillCandle.volume * concentration * Math.max(0.1, 1 - distFromClose);
+    if (l2Snapshot && l2Snapshot.depthCalibrationFactor > 0) {
+      // Scale synthesized estimate by L2 calibration factor
+      volumeAtLimit *= l2Snapshot.depthCalibrationFactor;
+    }
     const volAtLimitPct = avgVolume > 0 ? (volumeAtLimit / avgVolume) * 100 : 0;
     volumeAtLimitPcts.push(volAtLimitPct);
     if (fillCandle.volume < avgVolume * 0.5) thinMarketCount++;
@@ -1080,7 +1205,11 @@ function simulateRealisticLimitExecution(
     // P4 (this round): Order book imbalance
     // Estimate imbalance from candle shape: bullish candle (close > open) = more buyers
     // imbalance = (close - open) / (high - low), range [-1, 1]
-    const imbalance = range > 0 ? (fillCandle.close - fillCandle.open) / range : 0;
+    // If L2 snapshot available, blend synthesized with real imbalance (L2 takes priority)
+    const candleImbalance = range > 0 ? (fillCandle.close - fillCandle.open) / range : 0;
+    const imbalance = l2Snapshot
+      ? l2Snapshot.totalImbalance * 0.7 + candleImbalance * 0.3 // 70% real L2, 30% candle (historical variation)
+      : candleImbalance;
     orderBookImbalances.push(imbalance);
     // For buy limit: positive imbalance (more buyers) = adverse (more competition)
     if (imbalance > 0.3) imbalanceAdverseCount++;
@@ -1188,7 +1317,8 @@ function simulateRealisticLimitExecution(
     networkLatencyBarsPct,
     avgOrderBookImbalance,
     imbalanceAdverseRate,
-    description: `Realistic limit execution (latency=${latencyBars}bar+${networkLatencyMs}ms network, depth+profile+imbalance): ${filledCount}/${trades.length} filled (${(fillProbability * 100).toFixed(1)}%), ${missedCount} missed (${latencyMissed} from latency drift). Partial ${(partialFillRate * 100).toFixed(1)}% (avg ${(avgFillFraction * 100).toFixed(1)}% filled). Queue ahead avg ${avgQueueAheadPct.toFixed(0)}% (depth ${avgBookDepthAtLimitPct.toFixed(1)}%, consistency ${queueConsistencyPct.toFixed(0)}%). VP impact avg ${avgVolumeProfileImpactPct.toFixed(4)}% (concentration ${volumeProfileConcentration.toFixed(2)}). Imbalance avg ${avgOrderBookImbalance.toFixed(2)} (adverse ${(imbalanceAdverseRate * 100).toFixed(0)}%). Network latency ${networkLatencyBarsPct.toFixed(4)}% of bar. Adverse selection ${(adverseSelectionRate * 100).toFixed(1)}%. Realistic P&L ${realisticMakerNetProfit.toFixed(0)} vs pure-maker ${pureMakerNetProfit.toFixed(0)} (${executionCostPct >= 0 ? "+" : ""}${executionCostPct.toFixed(1)}%).`,
+    l2Snapshot,
+    description: `Realistic limit execution (latency=${latencyBars}bar+${networkLatencyMs}ms network, depth+profile+imbalance${l2Snapshot ? "+L2" : ""}): ${filledCount}/${trades.length} filled (${(fillProbability * 100).toFixed(1)}%), ${missedCount} missed (${latencyMissed} from latency drift). Partial ${(partialFillRate * 100).toFixed(1)}% (avg ${(avgFillFraction * 100).toFixed(1)}% filled). Queue ahead avg ${avgQueueAheadPct.toFixed(0)}% (depth ${avgBookDepthAtLimitPct.toFixed(1)}%, consistency ${queueConsistencyPct.toFixed(0)}%). VP impact avg ${avgVolumeProfileImpactPct.toFixed(4)}% (concentration ${volumeProfileConcentration.toFixed(2)}). Imbalance avg ${avgOrderBookImbalance.toFixed(2)} (adverse ${(imbalanceAdverseRate * 100).toFixed(0)}%). Network latency ${networkLatencyBarsPct.toFixed(4)}% of bar. Adverse selection ${(adverseSelectionRate * 100).toFixed(1)}%. Realistic P&L ${realisticMakerNetProfit.toFixed(0)} vs pure-maker ${pureMakerNetProfit.toFixed(0)} (${executionCostPct >= 0 ? "+" : ""}${executionCostPct.toFixed(1)}%).`,
   };
 }
 
@@ -1338,8 +1468,9 @@ export function runBacktest(candles: Candle[], config: BacktestConfig): Backtest
   };
 
   // P1-3: Realistic limit order execution — fill probability, partial fill, adverse selection
+  // P1 (this round): pass L2 snapshot for calibration when available
   const realisticLimitAnalysis = simulateRealisticLimitExecution(
-    candles, trades, makerFee, fee, 3, 1
+    candles, trades, makerFee, fee, 3, 1, 1, 0.005, config.l2Snapshot ?? null
   );
 
   return {

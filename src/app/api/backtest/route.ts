@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTicker } from "@/lib/indodax";
-import { runBacktest, assessRisk, optimizePositions, generateReport, type BacktestConfig } from "@/lib/trading/backtest";
+import { getTicker, getDepth } from "@/lib/indodax";
+import { runBacktest, assessRisk, optimizePositions, generateReport, buildL2Snapshot, type BacktestConfig } from "@/lib/trading/backtest";
 import { loadCandles, type Timeframe } from "@/lib/trading/candles";
 import { fetchLastNDays } from "@/lib/trading/ccxt-provider";
 
@@ -33,6 +33,12 @@ export async function POST(req: NextRequest) {
     const source = candles.length >= 50 ? "historical" : "recent";
     const btInput = candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
 
+    // P1 (this round): Fetch real L2 order book depth for microstructure calibration
+    const depthPair = pair.includes("_") ? pair.replace("_", "") : pair;
+    const depth = await getDepth(depthPair);
+    const avgVol = btInput.reduce((a, c) => a + c.volume, 0) / Math.max(1, btInput.length);
+    const l2Snapshot = depth ? buildL2Snapshot(pair, depth, 0.001, avgVol) : null;
+
     const config: BacktestConfig = {
       strategy: strategy || "sma_cross",
       initialCapital: initialCapital || 10000000,
@@ -41,6 +47,7 @@ export async function POST(req: NextRequest) {
       takeProfitPct: takeProfitPct || 0.05,
       params: params || {},
       feeRate,
+      l2Snapshot,
     };
     const result = runBacktest(btInput, config);
     const risk = assessRisk(result, config.strategy);
