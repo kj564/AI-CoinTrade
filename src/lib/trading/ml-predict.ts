@@ -38,7 +38,7 @@ export interface MLPrediction {
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
-  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[] } | null; // P1: meta-labeling model
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[]; aucROCLift: number; prAUCLift: number; aucEffectSize: number; prEffectSize: number; f1EffectSize: number; calibratedCalibrationPerRegime: Record<string, any[]> } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -881,6 +881,37 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   }
   const nestedAvgF1 = nestedResults.reduce((a, b) => a + b.outerF1, 0) / nFolds;
 
+  // P2: Calibration plot per regime with CI for ISOTONIC-calibrated predictions
+  const calibratedRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
+    trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+    ranging: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+    volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+  };
+  for (let i = 0; i < metaFeatures.length; i++) {
+    const z = metaResult.bias + metaFeatures[i].reduce((a, w, j) => a + w * metaResult.weights[j], 0);
+    const rawProb = sigmoid(z);
+    const calibProb = isotonicFn(rawProb);
+    const binIdx = Math.min(9, Math.floor(calibProb * 10));
+    const feat = metaFeatures[i];
+    const smaRatio = feat[2], atrPct = feat[6];
+    const regime = atrPct > 0.02 ? "volatile" : (smaRatio > 1.005 || smaRatio < 0.995) ? "trending" : "ranging";
+    calibratedRegimeBins[regime][binIdx].preds.push(calibProb);
+    calibratedRegimeBins[regime][binIdx].labels.push(metaLabels[i]);
+  }
+  const calibratedCalibrationPerRegime: Record<string, any[]> = {};
+  for (const [regime, rb] of Object.entries(calibratedRegimeBins)) {
+    calibratedCalibrationPerRegime[regime] = rb.map((b) => {
+      const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+      return {
+        bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+        predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+        observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+        count: b.preds.length,
+        ciLo: ci.lo, ciHi: ci.hi,
+      };
+    });
+  }
+
   // P2: Calibration plot per regime for meta-model
   const metaRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
     trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
@@ -915,6 +946,14 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   const tbUp = tbMetaOutcomes.filter(o => o === 1).length;
   const tbDown = tbMetaOutcomes.filter(o => o === -1).length;
   const tbTimeout = tbMetaLabels.filter(l => l === 0).length;
+  // P1: Effect size based on AUC/PR-AUC lift over base rate
+  const barrierHitRate = tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0.043;
+  const aucROCLift = metaAUC - 0.5;
+  const prAUCLift = metaResult.prAUC - barrierHitRate;
+  const aucEffectSize = aucROCLift / 0.5;
+  const prEffectSize = prAUCLift / Math.max(0.001, 1 - barrierHitRate);
+  const randomF1 = 2 * barrierHitRate * 0.5 / (barrierHitRate + 0.5);
+  const f1EffectSize = (nestedAvgF1 - randomF1) / Math.max(0.001, 1 - randomF1);
   const tripleBarrier = {
     upBarrier: tbUpBarrier, downBarrier: tbDownBarrier, maxBars: tbMaxBars,
     labels: tbMetaLabels,
@@ -954,6 +993,12 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     plattThreshold: oosPlatt.threshold,
     nestedCVF1: nestedAvgF1,
     nestedCVResults: nestedResults,
+    aucROCLift,
+    prAUCLift,
+    aucEffectSize,
+    prEffectSize,
+    f1EffectSize,
+    calibratedCalibrationPerRegime,
     description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : nestedAvgF1 > 0.15 ? `Meta-model weak OOS (nested CV F1=${nestedAvgF1.toFixed(2)}, isotonic F1=${oosIsotonic.f1.toFixed(2)})` : `Meta-model no OOS value (nested CV F1=${nestedAvgF1.toFixed(2)}, raw F1=${oosRaw.f1.toFixed(2)})`,
   };
 
