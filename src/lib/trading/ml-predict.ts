@@ -29,7 +29,7 @@ export interface MLPrediction {
   brierScore: number;     // P5: Brier score (lower = better calibrated, 0=perfect, 0.25=random)
   calibration: { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]; // reliability curve with Wilson CI
   calibrationPerRegime: Record<string, { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]>; // per-regime calibration with CI
-  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
+  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number; bootstrapCILo: number; bootstrapCIHi: number; oddsRatio: number; orCILo: number; orCIHi: number; effectSize: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
   ablation: { feature: string; dropped: number; accuracyDelta: number; description: string }[]; // P3: feature ablation
   description: string;
 }
@@ -289,11 +289,54 @@ function trainLogisticRegression(
   }
   ablation.sort((a, b) => b.accuracyDelta - a.accuracyDelta);
 
-  const featureImportance = weights.map((w, i) => ({
-    name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0,
-    zScore: zScores[i], pValue: rawPValues[i], adjustedPValue: adjustedP[i], significant: adjustedP[i] < 0.05,
-    ciLo: ci95[i].lo, ciHi: ci95[i].hi,
-  }))
+  // P2: Bootstrap CI for coefficients (1000 resamples, percentile method)
+  // More robust than Wald CI for small samples or non-normal distributions
+  const nBootstrap = 200; // reduced from 1000 for performance
+  const bootstrapWeights: number[][] = [];
+  for (let b = 0; b < nBootstrap; b++) {
+    // Resample with replacement
+    const sampleIdx: number[] = [];
+    for (let i = 0; i < n; i++) sampleIdx.push(Math.floor(Math.random() * n));
+    const bsFeatures = sampleIdx.map(i => standardized[i]);
+    const bsLabels = sampleIdx.map(i => labels[i]);
+    // Quick train (50 iterations for speed)
+    const bsWeights = new Array(d).fill(0);
+    let bsBias = 0;
+    for (let iter = 0; iter < 50; iter++) {
+      const grad = new Array(d).fill(0);
+      let gradB = 0;
+      for (let i = 0; i < n; i++) {
+        const z = bsBias + bsFeatures[i].reduce((a, w, j) => a + w * bsWeights[j], 0);
+        const pred = sigmoid(z);
+        const err = pred - bsLabels[i];
+        for (let j = 0; j < d; j++) grad[j] += err * bsFeatures[i][j];
+        gradB += err;
+      }
+      for (let j = 0; j < d; j++) bsWeights[j] -= learningRate * grad[j] / n;
+      bsBias -= learningRate * gradB / n;
+    }
+    bootstrapWeights.push(bsWeights);
+  }
+  // Percentile CI: 2.5th and 97.5th percentiles
+  const bootstrapCI: { lo: number; hi: number }[] = weights.map((_, j) => {
+    const sorted = bootstrapWeights.map(bw => bw[j]).sort((a, b) => a - b);
+    const loIdx = Math.floor(nBootstrap * 0.025);
+    const hiIdx = Math.floor(nBootstrap * 0.975);
+    return { lo: sorted[loIdx] || 0, hi: sorted[hiIdx] || 0 };
+  });
+
+  const featureImportance = weights.map((w, i) => {
+    const oddsRatio = Math.exp(w); // exp(w) = odds ratio for 1-SD increase in standardized feature
+    const orCI = { lo: Math.exp(ci95[i].lo), hi: Math.exp(ci95[i].hi) };
+    return {
+      name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0,
+      zScore: zScores[i], pValue: rawPValues[i], adjustedPValue: adjustedP[i], significant: adjustedP[i] < 0.05,
+      ciLo: ci95[i].lo, ciHi: ci95[i].hi,
+      bootstrapCILo: bootstrapCI[i].lo, bootstrapCIHi: bootstrapCI[i].hi,
+      oddsRatio, orCILo: orCI.lo, orCIHi: orCI.hi,
+      effectSize: Math.abs(oddsRatio - 1), // |OR - 1| = effect size (0 = no effect, >0.5 = large)
+    };
+  })
     .sort((a, b) => b.absWeight - a.absWeight)
     .map((f, i) => ({ ...f, rank: i + 1 }));
 
