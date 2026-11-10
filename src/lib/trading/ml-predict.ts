@@ -31,6 +31,9 @@ export interface MLPrediction {
   calibrationPerRegime: Record<string, { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]>; // per-regime calibration with CI
   featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number; bootstrapCILo: number; bootstrapCIHi: number; oddsRatio: number; orCILo: number; orCIHi: number; effectSize: number; probDiff: number; probDiffPct: number; pBase: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
   ablation: { feature: string; dropped: number; accuracyDelta: number; description: string; bsCILo: number; bsCIHi: number; significant: boolean }[]; // P3: feature ablation
+  aucROC: number;     // P1: Area Under ROC Curve (0.5 = random, 1.0 = perfect)
+  aucPR: number;      // P1: Area Under Precision-Recall Curve
+  permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[]; // P2: model-agnostic importance
   description: string;
 }
 
@@ -356,6 +359,75 @@ function trainLogisticRegression(
     return { lo: sorted[loIdx] || 0, hi: sorted[hiIdx] || 0 };
   });
 
+  // P1: AUC-ROC + PR-AUC — threshold-independent discrimination metrics
+  // AUC = area under ROC curve (0.5 = random, 1.0 = perfect)
+  // PR-AUC = area under precision-recall curve (base rate = random)
+  const predProbs: { prob: number; label: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+    predProbs.push({ prob: sigmoid(z), label: labels[i] });
+  }
+  predProbs.sort((a, b) => b.prob - a.prob);
+  // ROC AUC via trapezoidal rule
+  let tp = 0, fp = 0, prevTPR = 0, prevFPR = 0, aucROC = 0;
+  const totalPos = predProbs.filter(p => p.label === 1).length;
+  const totalNeg = n - totalPos;
+  for (const p of predProbs) {
+    if (p.label === 1) tp++; else fp++;
+    const tpr = totalPos > 0 ? tp / totalPos : 0;
+    const fpr = totalNeg > 0 ? fp / totalNeg : 0;
+    aucROC += (fpr - prevFPR) * (tpr + prevTPR) / 2;
+    prevTPR = tpr; prevFPR = fpr;
+  }
+  // PR-AUC via trapezoidal rule
+  let prevPrecision = totalPos > 0 ? totalPos / n : 0.5;
+  let prevRecall = 0, aucPR = 0;
+  tp = 0;
+  for (const p of predProbs) {
+    if (p.label === 1) tp++;
+    const precision = (tp) / (tp + (predProbs.indexOf(p) + 1 - tp));
+    const recall = totalPos > 0 ? tp / totalPos : 0;
+    aucPR += (recall - prevRecall) * (precision + prevPrecision) / 2;
+    prevPrecision = precision; prevRecall = recall;
+  }
+  aucPR = Math.max(0, Math.min(1, aucPR));
+
+  // P2: Permutation importance with bootstrap CI
+  // Shuffle each feature, measure accuracy drop. Model-agnostic, more robust than coefficients.
+  const nPerm = 50;
+  const permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[] = [];
+  for (let permIdx = 0; permIdx < d; permIdx++) {
+    const deltas: number[] = [];
+    for (let p = 0; p < nPerm; p++) {
+      // Shuffle feature permIdx
+      const shuffled = standardized.map((row, i) => {
+        const newRow = [...row];
+        const swapWith = Math.floor(Math.random() * n);
+        newRow[permIdx] = standardized[swapWith][permIdx];
+        return newRow;
+      });
+      // Compute accuracy with shuffled feature
+      let permCorrect = 0;
+      for (let i = 0; i < n; i++) {
+        const z = bias + shuffled[i].reduce((a, w, j) => a + w * weights[j], 0);
+        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) permCorrect++;
+      }
+      const permAcc = (permCorrect / n) * 100;
+      deltas.push(baselineAccuracy - permAcc);
+    }
+    deltas.sort((a, b) => a - b);
+    const mean = deltas.reduce((a, b) => a + b, 0) / nPerm;
+    const ciLo = deltas[Math.floor(nPerm * 0.025)] || 0;
+    const ciHi = deltas[Math.floor(nPerm * 0.975)] || 0;
+    const sig = ciLo > 0; // significant if CI excludes 0 from below (dropping feature hurts)
+    permutationImportance.push({
+      feature: FEATURE_NAMES[permIdx] || `Feature ${permIdx}`,
+      importance: mean,
+      ciLo, ciHi, significant: sig,
+    });
+  }
+  permutationImportance.sort((a, b) => b.importance - a.importance);
+
   // P1: Probability difference effect size — how much does P(up) change
   // when a feature increases by 1 SD? More interpretable than OR.
   // P_base = sigmoid(bias + sum(w_j * 0)) = sigmoid(bias) (all features at mean, z-score=0)
@@ -391,7 +463,7 @@ function trainLogisticRegression(
     .sort((a, b) => b.absWeight - a.absWeight)
     .map((f, i) => ({ ...f, rank: i + 1 }));
 
-  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
+  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, permutationImportance, aucROC, aucPR, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
 }
 
 export function predictDirection(candles: Candle[]): MLPrediction | null {
@@ -445,6 +517,9 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     calibrationPerRegime: model.calibrationPerRegime,
     featureImportance: model.featureImportance,
     ablation: model.ablation,
+    permutationImportance: model.permutationImportance,
+    aucROC: model.aucROC,
+    aucPR: model.aucPR,
     trainingSamples: featureList.length,
     description,
   };
