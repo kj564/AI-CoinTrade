@@ -34,6 +34,10 @@ export interface MLPrediction {
   aucROC: number;     // P1: Area Under ROC Curve (0.5 = random, 1.0 = perfect)
   aucPR: number;      // P1: Area Under Precision-Recall Curve
   permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[]; // P2: model-agnostic importance
+  lrStat: number;       // P3: Likelihood Ratio test statistic
+  lrDF: number;         // P3: degrees of freedom
+  lrPValue: number;     // P3: p-value for LR test (model as a whole)
+  tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
   description: string;
 }
 
@@ -359,6 +363,39 @@ function trainLogisticRegression(
     return { lo: sorted[loIdx] || 0, hi: sorted[hiIdx] || 0 };
   });
 
+  // P3: Likelihood Ratio Test — full model vs null (intercept-only) model
+  // LR = -2 * (logLik_null - logLik_full) ~ chi-squared(df = d)
+  // Tests whether the model as a whole has ANY predictive power
+  const logLikFull = (() => {
+    let ll = 0;
+    for (let i = 0; i < n; i++) {
+      const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+      const p = sigmoid(z);
+      ll += labels[i] * Math.log(p + 1e-10) + (1 - labels[i]) * Math.log(1 - p + 1e-10);
+    }
+    return ll;
+  })();
+  const nullProb = labels.reduce((a, b) => a + b, 0) / n; // base rate
+  const logLikNull = (() => {
+    let ll = 0;
+    for (let i = 0; i < n; i++) {
+      ll += labels[i] * Math.log(nullProb + 1e-10) + (1 - labels[i]) * Math.log(1 - nullProb + 1e-10);
+    }
+    return ll;
+  })();
+  const lrStat = -2 * (logLikNull - logLikFull);
+  const lrDF = d; // degrees of freedom = number of features
+  // Chi-squared survival function (1 - CDF) approximation
+  // For large DF, use Wilson-Hilferty approximation
+  const lrPValue = (() => {
+    if (lrStat <= 0) return 1;
+    const h = 2 / (9 * lrDF);
+    const z = (Math.pow(lrStat / lrDF, 1/3) - (1 - h)) / Math.sqrt(h);
+    // P(X > lrStat) = P(Z > z) = 1 - Φ(z)
+    const p = 0.5 * (1 + Math.tanh(0.7978 * z * (1 + 0.044715 * z * z)));
+    return Math.max(0, Math.min(1, 1 - p));
+  })();
+
   // P1: AUC-ROC + PR-AUC — threshold-independent discrimination metrics
   // AUC = area under ROC curve (0.5 = random, 1.0 = perfect)
   // PR-AUC = area under precision-recall curve (base rate = random)
@@ -463,7 +500,7 @@ function trainLogisticRegression(
     .sort((a, b) => b.absWeight - a.absWeight)
     .map((f, i) => ({ ...f, rank: i + 1 }));
 
-  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, permutationImportance, aucROC, aucPR, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
+  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, permutationImportance, aucROC, aucPR, lrStat, lrDF, lrPValue, logLikFull, logLikNull, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
 }
 
 export function predictDirection(candles: Candle[]): MLPrediction | null {
@@ -508,6 +545,37 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   else if (direction === "down") description = `ML model memprediksi harga turun jam depan dengan ${(100 - probabilityPct).toFixed(0)}% probability. Model accuracy: ${model.accuracy.toFixed(0)}% pada ${featureList.length} sampel training.`;
   else description = `ML model uncertain (${probabilityPct.toFixed(0)}% up). Tidak ada sinyal kuat. Model accuracy: ${model.accuracy.toFixed(0)}%.`;
 
+  // P4: Triple-barrier labeling (Lopez de Prado)
+  // Instead of binary "up/down next hour", use three barriers:
+  // Upper: price +X% within N bars → label 1 (profit)
+  // Lower: price -X% within N bars → label -1 (loss)  
+  // Time: neither hit within N bars → label 0 (timeout)
+  const tbUpBarrier = 0.02;   // 2% profit barrier
+  const tbDownBarrier = 0.02; // 2% loss barrier
+  const tbMaxBars = 6;        // 6-hour window
+  const tbLabels: number[] = [];
+  let tbUp = 0, tbDown = 0, tbTimeout = 0;
+  for (let i = 30; i < candles.length - tbMaxBars; i++) {
+    const entryPrice = candles[i].close;
+    let label = 0; // timeout
+    for (let j = 1; j <= tbMaxBars; j++) {
+      const ret = (candles[i + j].close - entryPrice) / entryPrice;
+      if (ret >= tbUpBarrier) { label = 1; tbUp++; break; }
+      if (ret <= -tbDownBarrier) { label = -1; tbDown++; break; }
+    }
+    if (label === 0) tbTimeout++;
+    tbLabels.push(label);
+  }
+  const tbTotal = tbLabels.length;
+  const tripleBarrier = {
+    upBarrier: tbUpBarrier, downBarrier: tbDownBarrier, maxBars: tbMaxBars,
+    labels: tbLabels,
+    upCount: tbUp, downCount: tbDown, timeoutCount: tbTimeout,
+    upPct: tbTotal > 0 ? (tbUp / tbTotal) * 100 : 0,
+    downPct: tbTotal > 0 ? (tbDown / tbTotal) * 100 : 0,
+    timeoutPct: tbTotal > 0 ? (tbTimeout / tbTotal) * 100 : 0,
+  };
+
   return {
     probability, probabilityPct, direction, confidence,
     features: currentFeatures,
@@ -520,6 +588,10 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     permutationImportance: model.permutationImportance,
     aucROC: model.aucROC,
     aucPR: model.aucPR,
+    lrStat: model.lrStat,
+    lrDF: model.lrDF,
+    lrPValue: model.lrPValue,
+    tripleBarrier,
     trainingSamples: featureList.length,
     description,
   };
