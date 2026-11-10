@@ -6,6 +6,7 @@ import {
   Send, Activity, AlertTriangle, Zap, Target, Shield, BarChart3,
   ChevronRight, Clock, Layers, Gauge, CircleDot, ArrowUpRight, ArrowDownRight,
   CheckCircle2, XCircle, AlertCircle, Sparkles,
+  ChevronDown, Microscope, GitBranch, Split, Scale, Sigma, Dice5,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +18,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 
 // ── Types (match actual API / library shapes) ──
@@ -66,6 +68,19 @@ interface BacktestResult {
   verdict: string;
   totalFees: number; sortinoRatio: number; calmarRatio: number;
   monteCarlo: MonteCarloResult | null;
+  feeScenarios?: FeeScenario[];
+  feeBreakdown?: FeeBreakdown;
+}
+interface FeeScenario {
+  name: string; description: string;
+  entryFeeRate: number; exitFeeRate: number;
+  totalFees: number; netProfit: number; profitFactor: number; winRate: number;
+  feeSavingVsTaker: number; feeSavingPct: number;
+}
+interface FeeBreakdown {
+  takerFeeRate: number; makerFeeRate: number; spreadPct: number; slippagePct: number;
+  costPerSideTaker: number; costPerSideMaker: number; costPerSideHybrid: number;
+  savingsMakerVsTakerPct: number; savingsHybridVsTakerPct: number; note: string;
 }
 interface RiskFlags { red: string[]; yellow: string[]; green: string[]; verdict: string }
 interface PositionModels {
@@ -246,6 +261,8 @@ export function TradingDashboard() {
   // AI analysis (TradingAgents-inspired multi-agent LLM)
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
+  // Research Lab collapsible (advanced ML metrics)
+  const [labOpen, setLabOpen] = useState(false);
   // refs to always have latest capital/risk in interval without re-triggering effect
   const sigCapitalRef = useRef(sigCapital);
   const sigRiskRef = useRef(sigRisk);
@@ -852,6 +869,278 @@ export function TradingDashboard() {
                         </div>
                         <p className="text-[10px] text-slate-500">{signal.ml.description}</p>
                         <div className="mt-1 text-[9px] text-slate-600">Logistic regression · 8 features · {signal.ml.trainingSamples} samples · acc {signal.ml.modelAccuracy.toFixed(0)}% · Brier {signal.ml.brierScore?.toFixed(3) ?? "—"} (0=perfect, 0.25=random) · confidence {signal.ml.confidence.toFixed(0)}%</div>
+
+                        {/* ── Research Lab (collapsible advanced metrics) ── */}
+                        <Collapsible open={labOpen} onOpenChange={setLabOpen} className="mt-3">
+                          <CollapsibleTrigger asChild>
+                            <button className="flex w-full items-center justify-between rounded-lg border border-purple-500/20 bg-purple-500/[0.04] px-3 py-2 text-left transition-colors hover:bg-purple-500/[0.07]">
+                              <div className="flex items-center gap-2">
+                                <Microscope className="h-3.5 w-3.5 text-purple-400" />
+                                <span className="text-[11px] font-bold uppercase tracking-wide text-purple-300">Research Lab</span>
+                                <span className="text-[9px] text-slate-500">· effect sizes · calibration · MDI/MDA · meta-labeling · dynamic barriers</span>
+                              </div>
+                              <ChevronDown className={cn("h-4 w-4 text-purple-300 transition-transform", labOpen && "rotate-180")} />
+                            </button>
+                          </CollapsibleTrigger>
+                          <CollapsibleContent className="mt-3 space-y-3">
+                            {/* ── Effect sizes summary ── */}
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                              <div className="mb-2 flex items-center gap-1.5"><Scale className="h-3 w-3 text-amber-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Effect Sizes (AUC/PR-AUC/F1)</span></div>
+                              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                                <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                  <div className="text-[9px] text-slate-500">AUC-ROC Lift</div>
+                                  <div className={cn("font-bold tabular-nums", (signal.ml.metaModel?.aucROCLift ?? 0) > 0.05 ? "text-emerald-400" : (signal.ml.metaModel?.aucROCLift ?? 0) < 0 ? "text-rose-400" : "text-slate-300")}>{(signal.ml.metaModel?.aucROCLift ?? 0).toFixed(3)}</div>
+                                  <div className="text-[8px] text-slate-600">vs 0.5 base</div>
+                                </div>
+                                <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                  <div className="text-[9px] text-slate-500">PR-AUC Lift</div>
+                                  <div className={cn("font-bold tabular-nums", (signal.ml.metaModel?.prAUCLift ?? 0) > 0.05 ? "text-emerald-400" : (signal.ml.metaModel?.prAUCLift ?? 0) < 0 ? "text-rose-400" : "text-slate-300")}>{(signal.ml.metaModel?.prAUCLift ?? 0).toFixed(3)}</div>
+                                  <div className="text-[8px] text-slate-600">vs barrier hit rate</div>
+                                </div>
+                                <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                  <div className="text-[9px] text-slate-500">AUC Effect Size</div>
+                                  <div className={cn("font-bold tabular-nums", (signal.ml.metaModel?.aucEffectSize ?? 0) > 0.1 ? "text-emerald-400" : "text-slate-300")}>{(signal.ml.metaModel?.aucEffectSize ?? 0).toFixed(3)}</div>
+                                  <div className="text-[8px] text-slate-600">lift / 0.5</div>
+                                </div>
+                                <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                  <div className="text-[9px] text-slate-500">F1 Effect Size</div>
+                                  <div className={cn("font-bold tabular-nums", (signal.ml.metaModel?.f1EffectSize ?? 0) < 0 ? "text-rose-400" : (signal.ml.metaModel?.f1EffectSize ?? 0) > 0.1 ? "text-emerald-400" : "text-slate-300")}>{(signal.ml.metaModel?.f1EffectSize ?? 0).toFixed(3)}</div>
+                                  <div className="text-[8px] text-slate-600">nested CV vs random</div>
+                                </div>
+                              </div>
+                              <p className="mt-2 text-[9px] leading-relaxed text-slate-500">
+                                Paradox test: AUC lift &gt; 0.05 → moderate <b>ranking ability</b>; F1 effect size &lt; 0 → no <b>usable threshold</b>.{(signal.ml.metaModel?.aucROCLift ?? 0) > 0.05 && (signal.ml.metaModel?.f1EffectSize ?? 0) < 0 ? " ← PARADOX confirmed: model ranks well but no deployable threshold exists." : ""}
+                              </p>
+                            </div>
+
+                            {/* ── Calibration per regime ── */}
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                              <div className="mb-2 flex items-center gap-1.5"><Sigma className="h-3 w-3 text-blue-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Calibration Per Regime (Wilson 95% CI)</span></div>
+                              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                                {["trending", "ranging", "volatile"].map((regime) => {
+                                  const bins = signal.ml.calibrationPerRegime?.[regime] || [];
+                                  const metaBins = signal.ml.metaModel?.calibratedCalibrationPerRegime?.[regime] || [];
+                                  const hasData = bins.some((b: any) => b.count > 0);
+                                  return (
+                                    <div key={regime} className="rounded bg-white/[0.03] p-2">
+                                      <div className="mb-1 flex items-center justify-between">
+                                        <span className="text-[10px] font-bold capitalize text-slate-300">{regime}</span>
+                                        <span className="text-[8px] text-slate-600">{bins.reduce((a: number, b: any) => a + b.count, 0)} pts</span>
+                                      </div>
+                                      {!hasData ? (
+                                        <div className="py-2 text-center text-[9px] text-slate-600">no samples</div>
+                                      ) : (
+                                        <div className="space-y-0.5">
+                                          {bins.filter((b: any) => b.count > 0).map((b: any, i: number) => {
+                                            const meta = metaBins.find((m: any) => m.bin === b.bin);
+                                            const observedPct = b.observed * 100;
+                                            const predictedPct = b.predicted * 100;
+                                            const ciLoPct = b.ciLo * 100, ciHiPct = b.ciHi * 100;
+                                            return (
+                                              <div key={i} className="text-[9px]">
+                                                <div className="flex items-center justify-between">
+                                                  <span className="text-slate-500 tabular-nums">{b.bin}</span>
+                                                  <span className="text-slate-400 tabular-nums">pred {predictedPct.toFixed(0)}% / obs {observedPct.toFixed(0)}% <span className="text-slate-600">[{ciLoPct.toFixed(0)}-{ciHiPct.toFixed(0)}]</span></span>
+                                                </div>
+                                                <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-slate-800/60">
+                                                  <div className="absolute inset-y-0 left-0 bg-blue-500/40" style={{ width: `${predictedPct}%` }} />
+                                                  <div className="absolute inset-y-0 w-[3px] bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.5)]" style={{ left: `calc(${observedPct}% - 1.5px)` }} />
+                                                  {meta && <div className="absolute inset-y-0 w-[2px] bg-purple-400/70" style={{ left: `calc(${meta.observed * 100}% - 1px)` }} />}
+                                                </div>
+                                              </div>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                              <div className="mt-2 flex gap-3 text-[8px] text-slate-600">
+                                <span className="flex items-center gap-1"><span className="inline-block h-1.5 w-3 bg-blue-500/40" /> predicted</span>
+                                <span className="flex items-center gap-1"><span className="inline-block h-1.5 w-[2px] bg-emerald-400" /> observed</span>
+                                <span className="flex items-center gap-1"><span className="inline-block h-1.5 w-[2px] bg-purple-400/70" /> isotonic-calibrated</span>
+                              </div>
+                            </div>
+
+                            {/* ── Feature selection (3-method combined, NEW) ── */}
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                              <div className="mb-2 flex items-center gap-1.5"><GitBranch className="h-3 w-3 text-emerald-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Feature Selection (Wald + MDA + MDI — 3-method agreement)</span></div>
+                              <div className="overflow-x-auto">
+                                <table className="w-full text-[9px] tabular-nums">
+                                  <thead>
+                                    <tr className="text-left text-slate-500">
+                                      <th className="py-1 pr-2 font-medium">Feature</th>
+                                      <th className="px-1 font-medium text-center">Wald rank</th>
+                                      <th className="px-1 font-medium text-center">MDA rank</th>
+                                      <th className="px-1 font-medium text-center">MDI rank</th>
+                                      <th className="px-1 font-medium text-center">Avg</th>
+                                      <th className="pl-1 font-medium text-left">Verdict</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {(signal.ml.featureSelection || []).map((fs: any) => (
+                                      <tr key={fs.feature} className="border-t border-white/[0.04]">
+                                        <td className="py-1 pr-2 text-slate-300">{fs.feature}</td>
+                                        <td className="px-1 text-center text-slate-400">{fs.waldRank}</td>
+                                        <td className="px-1 text-center text-slate-400">{fs.mdaRank}</td>
+                                        <td className="px-1 text-center text-slate-400">{fs.mdiRank}</td>
+                                        <td className="px-1 text-center text-slate-300">{fs.combinedScore.toFixed(1)}</td>
+                                        <td className="pl-1">
+                                          <Badge className={cn("border px-1 py-0 text-[8px] font-bold",
+                                            fs.verdict === "useful" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" :
+                                            fs.verdict === "borderline" ? "border-amber-500/30 bg-amber-500/10 text-amber-300" :
+                                            "border-rose-500/30 bg-rose-500/10 text-rose-300")}>
+                                            {fs.verdict}
+                                          </Badge>
+                                          <span className="ml-1 text-[8px] text-slate-600">{fs.recommendation}</span>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <p className="mt-2 text-[9px] leading-relaxed text-slate-500">
+                                3 independent methods must agree before a feature is "useful". Wald = coefficient significance, MDA = permutation accuracy drop, MDI = Gini decrease in CART tree. All "noise" → no feature has real predictive value.
+                              </p>
+                            </div>
+
+                            {/* ── MDI + MDA importance ranking ── */}
+                            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                                <div className="mb-2 flex items-center gap-1.5"><Split className="h-3 w-3 text-teal-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">MDI (Mean Decrease Impurity)</span></div>
+                                <div className="space-y-1">
+                                  {(signal.ml.mdiImportance || []).slice(0, 8).map((m: any) => (
+                                    <div key={m.feature} className="flex items-center gap-2 text-[9px]">
+                                      <span className="w-20 shrink-0 text-slate-400">{m.feature}</span>
+                                      <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-800/60">
+                                        <div className="absolute inset-y-0 left-0 bg-teal-500/50" style={{ width: `${(m.importance * 100).toFixed(1)}%` }} />
+                                      </div>
+                                      <span className="w-12 shrink-0 text-right tabular-nums text-slate-300">{(m.importance * 100).toFixed(1)}%</span>
+                                      <span className="w-3 shrink-0 text-center text-[8px] text-slate-600">#{m.rank}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                                <p className="mt-2 text-[9px] text-slate-600">CART ensemble (20 trees, depth 4). % of total Gini decrease attributed to each feature.</p>
+                              </div>
+
+                              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                                <div className="mb-2 flex items-center gap-1.5"><Dice5 className="h-3 w-3 text-fuchsia-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">MDA (Permutation Importance)</span></div>
+                                <div className="space-y-1">
+                                  {(signal.ml.mdaImportance || []).slice(0, 8).map((m: any) => (
+                                    <div key={m.feature} className="flex items-center gap-2 text-[9px]">
+                                      <span className="w-20 shrink-0 text-slate-400">{m.feature}</span>
+                                      <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-800/60">
+                                        <div className={cn("absolute inset-y-0 left-0", m.significant ? "bg-fuchsia-500/60" : "bg-fuchsia-500/30")} style={{ width: `${Math.min(100, Math.abs(m.importance) * 5).toFixed(1)}%` }} />
+                                      </div>
+                                      <span className="w-12 shrink-0 text-right tabular-nums text-slate-300">{m.importance.toFixed(2)}%</span>
+                                      <span className="w-3 shrink-0 text-center text-[8px] text-slate-600">#{m.rank}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                                <p className="mt-2 text-[9px] text-slate-600">Shuffle feature, measure accuracy drop. CI [2.5%, 97.5%] from 50 permutations.</p>
+                              </div>
+                            </div>
+
+                            {/* ── Triple-barrier: fixed vs dynamic ── */}
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                              <div className="mb-2 flex items-center gap-1.5"><Target className="h-3 w-3 text-amber-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Triple-Barrier Labeling (Fixed vs Dynamic)</span></div>
+                              <div className="grid grid-cols-2 gap-2">
+                                <div className="rounded bg-white/[0.03] p-2">
+                                  <div className="mb-1 text-[9px] font-bold text-slate-400">Fixed ±2% / 6h</div>
+                                  {signal.ml.tripleBarrier && (
+                                    <div className="space-y-0.5 text-[9px] tabular-nums">
+                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.tripleBarrier.upPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.tripleBarrier.downPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.tripleBarrier.timeoutPct.toFixed(1)}%</span></div>
+                                    </div>
+                                  )}
+                                </div>
+                                <div className="rounded bg-white/[0.03] p-2">
+                                  <div className="mb-1 text-[9px] font-bold text-slate-400">Dynamic ±2×ATR / 6h <Badge className="ml-1 border border-amber-500/30 bg-amber-500/10 px-1 py-0 text-[7px] font-bold text-amber-300">NEW</Badge></div>
+                                  {signal.ml.dynamicTripleBarrier && (
+                                    <div className="space-y-0.5 text-[9px] tabular-nums">
+                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.upPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.downPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.timeoutPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between text-[8px] text-slate-600"><span>avg barrier</span><span>{(signal.ml.dynamicTripleBarrier.avgUpBarrierPct * 100).toFixed(2)}%</span></div>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <p className="mt-2 text-[9px] leading-relaxed text-slate-500">{signal.ml.dynamicTripleBarrier?.description}</p>
+                            </div>
+
+                            {/* ── Meta-model summary + return attribution (NEW) ── */}
+                            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                                <div className="mb-2 flex items-center gap-1.5"><Layers className="h-3 w-3 text-purple-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Meta-Labeling Model</span></div>
+                                {signal.ml.metaModel && (
+                                  <div className="space-y-1 text-[9px]">
+                                    <div className="grid grid-cols-2 gap-1">
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">AUC-ROC</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.metaModel.aucROC.toFixed(3)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">PR-AUC</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.metaModel.prAUC.toFixed(3)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Nested CV F1</div><div className={cn("font-bold tabular-nums", signal.ml.metaModel.nestedCVF1 > 0.2 ? "text-emerald-400" : "text-rose-400")}>{signal.ml.metaModel.nestedCVF1.toFixed(2)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">OOS F1</div><div className={cn("font-bold tabular-nums", signal.ml.metaModel.oosF1 > 0.2 ? "text-emerald-400" : "text-rose-400")}>{signal.ml.metaModel.oosF1.toFixed(2)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Isotonic Brier</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.metaModel.isotonicBrier.toFixed(3)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Platt Brier</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.metaModel.plattBrier.toFixed(3)}</div></div>
+                                    </div>
+                                    <div className="text-[8px] text-slate-600">avg uniqueness: {signal.ml.metaModel.avgUniqueness.toFixed(3)} · samples: {signal.ml.metaModel.samples}</div>
+                                    {signal.ml.metaModel.dynamicBarrierMetaModel && (
+                                      <div className="mt-1 rounded bg-purple-500/[0.06] px-1.5 py-1 text-[8px]">
+                                        <div className="font-bold text-purple-300">Return-Attribution Weighting <Badge className="ml-1 border border-purple-500/30 bg-purple-500/10 px-1 py-0 text-[7px] text-purple-300">NEW</Badge></div>
+                                        <div className="mt-0.5 text-slate-400">AUC {signal.ml.metaModel.dynamicBarrierMetaModel.aucROC.toFixed(3)} · F1 {signal.ml.metaModel.dynamicBarrierMetaModel.f1Score.toFixed(2)}</div>
+                                      </div>
+                                    )}
+                                    <p className="text-[8px] leading-relaxed text-slate-500">{signal.ml.metaModel.description}</p>
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                                <div className="mb-2 flex items-center gap-1.5"><Wallet className="h-3 w-3 text-cyan-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Return Attribution Weighting <Badge className="ml-1 border border-cyan-500/30 bg-cyan-500/10 px-1 py-0 text-[7px] font-bold text-cyan-300">NEW</Badge></span></div>
+                                {signal.ml.returnAttribution && (
+                                  <div className="space-y-1 text-[9px]">
+                                    <div className="grid grid-cols-2 gap-1">
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Avg Uniqueness</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.returnAttribution.avgUniqueness.toFixed(3)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Avg |return|</div><div className="font-bold tabular-nums text-slate-200">{(signal.ml.returnAttribution.avgReturnAbs * 100).toFixed(2)}%</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Avg Combined W</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.returnAttribution.avgCombinedWeight.toFixed(3)}</div></div>
+                                      <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">Weight Range</div><div className="font-bold tabular-nums text-slate-200">[{signal.ml.returnAttribution.minWeight.toFixed(2)}, {signal.ml.returnAttribution.maxWeight.toFixed(2)}]</div></div>
+                                    </div>
+                                    <p className="text-[8px] leading-relaxed text-slate-500">{signal.ml.returnAttribution.description}</p>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* ── LR test + ablation ── */}
+                            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                              <div className="mb-2 flex items-center gap-1.5"><BarChart3 className="h-3 w-3 text-orange-400" /><span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Likelihood Ratio + Ablation</span></div>
+                              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                <div>
+                                  <div className="mb-1 text-[9px] font-bold text-slate-400">LR Test (whole-model significance)</div>
+                                  <div className="grid grid-cols-3 gap-1 text-[9px]">
+                                    <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">statistic</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.lrStat.toFixed(2)}</div></div>
+                                    <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">df</div><div className="font-bold tabular-nums text-slate-200">{signal.ml.lrDF}</div></div>
+                                    <div className="rounded bg-white/[0.03] px-1.5 py-1"><div className="text-[8px] text-slate-500">p-value</div><div className={cn("font-bold tabular-nums", signal.ml.lrPValue < 0.05 ? "text-emerald-400" : "text-rose-400")}>{signal.ml.lrPValue.toFixed(3)}</div></div>
+                                  </div>
+                                  <p className="mt-1 text-[8px] text-slate-600">{signal.ml.lrPValue < 0.05 ? "Model significant (reject null)." : "Model NOT significant — 8 features collectively no better than base rate."}</p>
+                                </div>
+                                <div>
+                                  <div className="mb-1 text-[9px] font-bold text-slate-400">Ablation (drop each feature, Δ accuracy)</div>
+                                  <div className="space-y-0.5 text-[9px]">
+                                    {(signal.ml.ablation || []).slice(0, 4).map((a: any) => (
+                                      <div key={a.feature} className="flex items-center justify-between rounded bg-white/[0.03] px-1.5 py-0.5">
+                                        <span className="text-slate-400">{a.feature}</span>
+                                        <span className={cn("tabular-nums", a.accuracyDelta > 0.5 ? "text-rose-400" : a.accuracyDelta < -0.5 ? "text-emerald-400" : "text-slate-400")}>Δ{a.accuracyDelta.toFixed(2)}%</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                          </CollapsibleContent>
+                        </Collapsible>
                       </div>
                     </Card>
                   )}
@@ -1231,6 +1520,44 @@ export function TradingDashboard() {
                     <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
                       Ranked by composite score (log(PF) + Sharpe − bust penalty). Buy &amp; Hold = benchmark yang harus dikalahin. #1 (green) = strategi terbaik. "✓ beats" = ngalahin buy &amp; hold. Grid search + walk-forward untuk strategi terpilih. Fee 0.3% masuk semua.
                     </p>
+
+                    {/* P4: Block Correlation Analysis */}
+                    {compareResult.deflatedSharpe?.effTrialsInfo?.blockCorrelation && (
+                      <div className="mt-3 rounded-lg border border-orange-500/20 bg-orange-500/[0.03] p-3">
+                        <div className="mb-2 flex items-center gap-1.5">
+                          <GitBranch className="h-3 w-3 text-orange-400" />
+                          <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Block Correlation Analysis <Badge className="ml-1 border border-orange-500/30 bg-orange-500/10 px-1 py-0 text-[7px] font-bold text-orange-300">NEW</Badge></span>
+                        </div>
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                          {[
+                            { label: "Trend-following", block: compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.trendBlock, color: "text-amber-400" },
+                            { label: "Mean-reversion", block: compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.reversionBlock, color: "text-cyan-400" },
+                            { label: "Confluence", block: compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.confluenceBlock, color: "text-purple-400" },
+                          ].map(({ label, block, color }) => (
+                            <div key={label} className="rounded bg-white/[0.03] p-2">
+                              <div className="mb-1 flex items-center justify-between">
+                                <span className={cn("text-[10px] font-bold", color)}>{label}</span>
+                                <span className="text-[8px] text-slate-600">{block.size} strat · {block.pairs} pairs</span>
+                              </div>
+                              <div className="grid grid-cols-3 gap-1 text-[9px]">
+                                <div><div className="text-[8px] text-slate-500">avg ρ</div><div className={cn("font-bold tabular-nums", block.avgCorrelation > 0.7 ? "text-rose-400" : block.avgCorrelation > 0.4 ? "text-amber-400" : "text-emerald-400")}>{block.avgCorrelation.toFixed(2)}</div></div>
+                                <div><div className="text-[8px] text-slate-500">max ρ</div><div className="font-bold tabular-nums text-slate-300">{block.maxCorrelation.toFixed(2)}</div></div>
+                                <div><div className="text-[8px] text-slate-500">min ρ</div><div className="font-bold tabular-nums text-slate-300">{block.minCorrelation.toFixed(2)}</div></div>
+                              </div>
+                              <p className="mt-1 text-[8px] leading-relaxed text-slate-600">{block.interpretation}</p>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-2 grid grid-cols-2 gap-2 rounded bg-white/[0.02] p-2 text-[9px] sm:grid-cols-3">
+                          <div><div className="text-[8px] text-slate-500">Cross-block avg ρ</div><div className="font-bold tabular-nums text-slate-300">{compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.crossBlockAvg.toFixed(3)}</div></div>
+                          <div><div className="text-[8px] text-slate-500">Cross-block max ρ</div><div className="font-bold tabular-nums text-slate-300">{compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.crossBlockMax.toFixed(3)}</div></div>
+                          <div><div className="text-[8px] text-slate-500">Overall avg ρ</div><div className="font-bold tabular-nums text-slate-300">{compareResult.deflatedSharpe.effTrialsInfo.blockCorrelation.overallAvg.toFixed(3)}</div></div>
+                        </div>
+                        <p className="mt-2 text-[9px] leading-relaxed text-slate-500">
+                          Intra-block ρ &gt; 0.7 = strategies redundant (effectively 1 strategy). Cross-block ρ &gt; 0.5 = trend and reversion strategies move together (rare). High overall ρ inflates the apparent trial count → PBO/DSR must use the <i>effective</i> trials (participation ratio), not the raw N. Here: N={compareResult.deflatedSharpe.trials} effective trials from {compareResult.deflatedSharpe.nStrategies} strategies.
+                        </p>
+                      </div>
+                    )}
                   </div>
                 </Card>
               )}
@@ -1304,6 +1631,63 @@ export function TradingDashboard() {
                     </Card>
                   ) : (
                     <Card className="border-white/[0.08] bg-white/[0.03]"><div className="p-4 text-center text-[11px] text-slate-600">Monte Carlo butuh minimal 10 trades (sekarang {btResult.result.tradeCount})</div></Card>
+                  )}
+
+                  {/* P3: Maker Fee Scenario Comparison */}
+                  {btResult.result.feeScenarios && btResult.result.feeScenarios.length > 0 && (
+                    <Card className="border-cyan-500/20 bg-cyan-500/[0.03]">
+                      <div className="p-5">
+                        <div className="mb-3 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-cyan-500/15"><Scale className="h-4 w-4 text-cyan-400" /></div>
+                            <div>
+                              <h4 className="text-sm font-bold">Maker Fee Modeling <Badge className="ml-1 border border-cyan-500/30 bg-cyan-500/10 px-1 py-0 text-[8px] font-bold text-cyan-300">NEW</Badge></h4>
+                              <div className="text-[10px] text-slate-500">3 execution scenarios — how much do you save with limit orders?</div>
+                            </div>
+                          </div>
+                          {btResult.result.feeBreakdown && (
+                            <Badge className="border-cyan-500/30 bg-cyan-500/10 text-[9px] text-cyan-300">taker {(btResult.result.feeBreakdown.takerFeeRate * 100).toFixed(2)}% · maker {(btResult.result.feeBreakdown.makerFeeRate * 100).toFixed(2)}% · spread {(btResult.result.feeBreakdown.spreadPct * 100).toFixed(2)}% · slip {(btResult.result.feeBreakdown.slippagePct * 100).toFixed(2)}%</Badge>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                          {btResult.result.feeScenarios.map((scn) => {
+                            const isBest = scn.feeSavingPct === Math.max(...(btResult.result.feeScenarios || []).map(s => s.feeSavingPct));
+                            return (
+                              <div key={scn.name} className={cn("rounded-lg border p-3", isBest && scn.feeSavingPct > 0 ? "border-cyan-500/30 bg-cyan-500/[0.06]" : "border-white/[0.06] bg-white/[0.02]")}>
+                                <div className="mb-2 flex items-center justify-between">
+                                  <span className="text-[11px] font-bold text-slate-200">{scn.name}</span>
+                                  {isBest && scn.feeSavingPct > 0 && <Badge className="border-cyan-500/30 bg-cyan-500/15 px-1 py-0 text-[8px] font-bold text-cyan-300">BEST</Badge>}
+                                </div>
+                                <div className="space-y-1 text-[9px]">
+                                  <div className="flex justify-between"><span className="text-slate-500">Net Profit</span><span className={cn("font-bold tabular-nums", scn.netProfit >= 0 ? "text-emerald-400" : "text-rose-400")}>{fmtIDR(scn.netProfit)}</span></div>
+                                  <div className="flex justify-between"><span className="text-slate-500">Total Fees</span><span className="font-bold tabular-nums text-slate-300">{fmtIDR(scn.totalFees)}</span></div>
+                                  <div className="flex justify-between"><span className="text-slate-500">Profit Factor</span><span className="font-bold tabular-nums text-slate-300">{isFinite(scn.profitFactor) ? scn.profitFactor.toFixed(2) : "∞"}</span></div>
+                                  <div className="flex justify-between"><span className="text-slate-500">Win Rate</span><span className="font-bold tabular-nums text-slate-300">{scn.winRate.toFixed(1)}%</span></div>
+                                  {scn.feeSavingPct > 0 && (
+                                    <div className="mt-1 rounded bg-cyan-500/[0.08] px-1.5 py-0.5 text-center">
+                                      <div className="text-[8px] text-cyan-400">save {scn.feeSavingPct.toFixed(1)}% vs taker</div>
+                                      <div className="text-[8px] tabular-nums text-cyan-300">{fmtIDR(scn.feeSavingVsTaker)}</div>
+                                    </div>
+                                  )}
+                                </div>
+                                <p className="mt-2 text-[8px] leading-relaxed text-slate-600">{scn.description}</p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {btResult.result.feeBreakdown && (
+                          <div className="mt-3 grid grid-cols-2 gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-[10px] sm:grid-cols-4">
+                            <div><div className="text-[9px] text-slate-500">Cost / side (taker)</div><div className="font-bold tabular-nums text-slate-300">{(btResult.result.feeBreakdown.costPerSideTaker * 100).toFixed(3)}%</div></div>
+                            <div><div className="text-[9px] text-slate-500">Cost / side (maker)</div><div className="font-bold tabular-nums text-emerald-400">{(btResult.result.feeBreakdown.costPerSideMaker * 100).toFixed(3)}%</div></div>
+                            <div><div className="text-[9px] text-slate-500">Hybrid savings</div><div className="font-bold tabular-nums text-cyan-400">{btResult.result.feeBreakdown.savingsHybridVsTakerPct.toFixed(1)}%</div></div>
+                            <div><div className="text-[9px] text-slate-500">Maker savings</div><div className="font-bold tabular-nums text-emerald-400">{btResult.result.feeBreakdown.savingsMakerVsTakerPct.toFixed(1)}%</div></div>
+                          </div>
+                        )}
+                        <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
+                          INDODAX fee structure: <b>taker 0.3%</b> (market order, immediate fill) vs <b>maker 0%</b> (limit order, provides liquidity). Realistic execution = hybrid (limit entry + market exit). Stop-loss/take-profit exits MUST be market orders because they need immediate fill. Entry can be limit if patient.
+                        </p>
+                      </div>
+                    </Card>
                   )}
 
                   {/* equity curve + breakdown */}

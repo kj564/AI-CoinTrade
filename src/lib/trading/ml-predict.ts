@@ -34,11 +34,19 @@ export interface MLPrediction {
   aucROC: number;     // P1: Area Under ROC Curve (0.5 = random, 1.0 = perfect)
   aucPR: number;      // P1: Area Under Precision-Recall Curve
   permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[]; // P2: model-agnostic importance
+  // P5: MDI (Mean Decrease Impurity via decision tree) + MDA (= permutation importance, aliased)
+  mdiImportance: { feature: string; importance: number; rank: number; interpretation: string }[];
+  mdaImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean; rank: number }[];
+  featureSelection: { feature: string; waldSig: boolean; permSig: boolean; mdiRank: number; mdaRank: number; waldRank: number; combinedScore: number; verdict: "useful" | "borderline" | "noise"; recommendation: string }[];
   lrStat: number;       // P3: Likelihood Ratio test statistic
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
-  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[]; aucROCLift: number; prAUCLift: number; aucEffectSize: number; prEffectSize: number; f1EffectSize: number; calibratedCalibrationPerRegime: Record<string, any[]> } | null; // P1: meta-labeling model
+  // P6: Dynamic triple-barrier — barriers scaled by rolling ATR (volatility-adaptive)
+  dynamicTripleBarrier: { kUp: number; kDown: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number; avgUpBarrierPct: number; avgDownBarrierPct: number; description: string } | null;
+  // P7: Return attribution sample weighting — combine uniqueness with |return| magnitude
+  returnAttribution: { avgUniqueness: number; avgReturnAbs: number; avgCombinedWeight: number; minWeight: number; maxWeight: number; description: string };
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[]; aucROCLift: number; prAUCLift: number; aucEffectSize: number; prEffectSize: number; f1EffectSize: number; calibratedCalibrationPerRegime: Record<string, any[]>; dynamicBarrierMetaModel?: any } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -319,6 +327,127 @@ function computeFeatures(candles: Candle[], i: number): Features | null {
 // Sigmoid
 function sigmoid(x: number): number {
   return 1 / (1 + Math.exp(-x));
+}
+
+// P5: MDI (Mean Decrease Impurity) via small CART decision tree
+// Trains a depth-limited binary tree using Gini impurity. At each split,
+// records the impurity decrease attributed to the splitting feature.
+// Final importance per feature = sum of impurity decreases weighted by node size.
+// This is model-agnostic and complementary to logistic regression coefficients.
+interface CARTNode {
+  isLeaf: boolean;
+  prediction: number;       // for leaf: P(y=1)
+  splitFeature?: number;    // for internal: which feature splits
+  splitThreshold?: number;
+  impurityDecrease?: number; // Gini decrease attributed to splitFeature at this node
+  samples?: number;
+  left?: CARTNode;
+  right?: CARTNode;
+}
+
+function giniImpurity(labels: number[]): number {
+  if (labels.length === 0) return 0;
+  const p1 = labels.filter(l => l === 1).length / labels.length;
+  const p0 = 1 - p1;
+  return 1 - p1 * p1 - p0 * p0;
+}
+
+function buildCART(
+  features: number[][], labels: number[], sampleIdx: number[],
+  depth: number, maxDepth: number, mdiAccumulator: number[], minSamplesSplit: number
+): CARTNode {
+  const localLabels = sampleIdx.map(i => labels[i]);
+  const p1 = localLabels.filter(l => l === 1).length / Math.max(1, localLabels.length);
+  const nodeImpurity = giniImpurity(localLabels);
+  const n = sampleIdx.length;
+
+  // Leaf conditions: max depth reached, pure node, too few samples
+  if (depth >= maxDepth || n < minSamplesSplit || nodeImpurity === 0) {
+    return { isLeaf: true, prediction: p1 };
+  }
+
+  const d = features[0]?.length || 0;
+  let bestFeature = -1, bestThreshold = 0, bestGain = -1;
+  let bestLeftIdx: number[] = [], bestRightIdx: number[] = [];
+
+  // For each feature, try a few candidate thresholds (quantile-based)
+  for (let f = 0; f < d; f++) {
+    const values = sampleIdx.map(i => features[i][f]).sort((a, b) => a - b);
+    // Try 5 candidate split points (20/40/60/80th percentiles + median)
+    const percentiles = [0.2, 0.4, 0.5, 0.6, 0.8];
+    for (const pct of percentiles) {
+      const threshold = values[Math.floor(values.length * pct)];
+      const leftIdx: number[] = [];
+      const rightIdx: number[] = [];
+      for (const i of sampleIdx) {
+        if (features[i][f] <= threshold) leftIdx.push(i);
+        else rightIdx.push(i);
+      }
+      if (leftIdx.length < 2 || rightIdx.length < 2) continue;
+      const leftLabels = leftIdx.map(i => labels[i]);
+      const rightLabels = rightIdx.map(i => labels[i]);
+      const leftGini = giniImpurity(leftLabels);
+      const rightGini = giniImpurity(rightLabels);
+      const weightedChildGini = (leftIdx.length * leftGini + rightIdx.length * rightGini) / n;
+      const gain = nodeImpurity - weightedChildGini;
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestFeature = f;
+        bestThreshold = threshold;
+        bestLeftIdx = leftIdx;
+        bestRightIdx = rightIdx;
+      }
+    }
+  }
+
+  // No improving split → leaf
+  if (bestFeature < 0 || bestGain <= 0) {
+    return { isLeaf: true, prediction: p1 };
+  }
+
+  // Record MDI: impurity decrease weighted by fraction of samples reaching this node
+  mdiAccumulator[bestFeature] += bestGain * n;
+
+  return {
+    isLeaf: false,
+    prediction: p1,
+    splitFeature: bestFeature,
+    splitThreshold: bestThreshold,
+    impurityDecrease: bestGain,
+    samples: n,
+    left: buildCART(features, labels, bestLeftIdx, depth + 1, maxDepth, mdiAccumulator, minSamplesSplit),
+    right: buildCART(features, labels, bestRightIdx, depth + 1, maxDepth, mdiAccumulator, minSamplesSplit),
+  };
+}
+
+// Compute MDI feature importance by training an ensemble of small CART trees on bootstrap samples.
+// Returns importance per feature (sum of weighted Gini decreases across all trees), normalized to sum to 1.
+function computeMDI(features: number[][], labels: number[], nTrees = 20, maxDepth = 4): { feature: string; importance: number; rank: number; interpretation: string }[] {
+  const d = features[0]?.length || 0;
+  const n = features.length;
+  const accumulators: number[] = new Array(d).fill(0);
+
+  for (let t = 0; t < nTrees; t++) {
+    // Bootstrap sample
+    const sampleIdx: number[] = [];
+    for (let i = 0; i < n; i++) sampleIdx.push(Math.floor(Math.random() * n));
+    const mdiThisTree: number[] = new Array(d).fill(0);
+    buildCART(features, labels, sampleIdx, 0, maxDepth, mdiThisTree, 4);
+    for (let f = 0; f < d; f++) accumulators[f] += mdiThisTree[f];
+  }
+
+  // Normalize
+  const total = accumulators.reduce((a, b) => a + b, 0) || 1;
+  const normalized = accumulators.map(v => v / total);
+  const result = normalized.map((imp, f) => ({
+    feature: FEATURE_NAMES[f] || `Feature ${f}`,
+    importance: imp,
+    rank: 0,
+    interpretation: imp > 0.25 ? "dominant splitter" : imp > 0.15 ? "important splitter" : imp > 0.05 ? "minor splitter" : "rarely splits",
+  }));
+  result.sort((a, b) => b.importance - a.importance);
+  result.forEach((r, i) => r.rank = i + 1);
+  return result;
 }
 
 // Train logistic regression with STANDARDIZED features + p-values
@@ -962,6 +1091,103 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     downPct: tbTotal > 0 ? (tbDown / tbTotal) * 100 : 0,
     timeoutPct: tbTotal > 0 ? (tbTimeout / tbTotal) * 100 : 0,
   };
+
+  // P6: Dynamic triple-barrier — barriers scaled by rolling ATR (volatility-adaptive)
+  // Fixed 2% barrier is unrealistic: in low-vol periods it's too wide (mostly timeout),
+  // in high-vol periods it's too tight (stops out too easily).
+  // Dynamic: barrier = k × ATR(14) / price, so it adapts to current volatility regime.
+  const tbDynKUp = 2.0;     // up barrier = 2× ATR
+  const tbDynKDown = 2.0;   // down barrier = 2× ATR (symmetric)
+  const tbDynMaxBars = tbMaxBars;
+  const tbDynLabels: number[] = [];
+  const tbDynOutcomes: number[] = [];
+  const tbDynBarrierPcts: number[] = [];
+  for (let i = 30; i < candles.length - tbDynMaxBars; i++) {
+    const entryPrice = candles[i].close;
+    // Rolling ATR(14) at entry time (using prior 30 bars)
+    const atrAtEntry = calcATR(candles.slice(Math.max(0, i - 30), i + 1).map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume })), 14);
+    const upBarrierPct = atrAtEntry > 0 && entryPrice > 0 ? (tbDynKUp * atrAtEntry) / entryPrice : tbUpBarrier;
+    const downBarrierPct = atrAtEntry > 0 && entryPrice > 0 ? (tbDynKDown * atrAtEntry) / entryPrice : tbDownBarrier;
+    tbDynBarrierPcts.push(upBarrierPct);
+    let hit = 0, outcome = 0;
+    for (let j = 1; j <= tbDynMaxBars; j++) {
+      const ret = (candles[i + j].close - entryPrice) / entryPrice;
+      if (ret >= upBarrierPct) { hit = 1; outcome = 1; break; }
+      if (ret <= -downBarrierPct) { hit = 1; outcome = -1; break; }
+    }
+    tbDynLabels.push(hit);
+    tbDynOutcomes.push(outcome);
+  }
+  const tbDynTotal = tbDynLabels.length;
+  const tbDynUp = tbDynOutcomes.filter(o => o === 1).length;
+  const tbDynDown = tbDynOutcomes.filter(o => o === -1).length;
+  const tbDynTimeout = tbDynLabels.filter(l => l === 0).length;
+  const tbDynAvgBarrierPct = tbDynBarrierPcts.length > 0 ? tbDynBarrierPcts.reduce((a, b) => a + b, 0) / tbDynBarrierPcts.length : 0;
+  const dynamicTripleBarrier = {
+    kUp: tbDynKUp, kDown: tbDynKDown, maxBars: tbDynMaxBars,
+    labels: tbDynLabels,
+    upCount: tbDynUp, downCount: tbDynDown, timeoutCount: tbDynTimeout,
+    upPct: tbDynTotal > 0 ? (tbDynUp / tbDynTotal) * 100 : 0,
+    downPct: tbDynTotal > 0 ? (tbDynDown / tbDynTotal) * 100 : 0,
+    timeoutPct: tbDynTotal > 0 ? (tbDynTimeout / tbDynTotal) * 100 : 0,
+    avgUpBarrierPct: tbDynAvgBarrierPct,
+    avgDownBarrierPct: tbDynAvgBarrierPct, // symmetric
+    description: `Dynamic ±${tbDynKUp}×ATR(14) barriers, max ${tbDynMaxBars}h. Avg barrier ${(tbDynAvgBarrierPct * 100).toFixed(2)}% (vs fixed ${tbUpBarrier * 100}%). Timeout ${tbDynTotal > 0 ? ((tbDynTimeout / tbDynTotal) * 100).toFixed(1) : "0"}%.`,
+  };
+
+  // P7: Return attribution sample weighting
+  // Uniqueness weighting alone treats all barrier-hitting samples equally.
+  // Return attribution up-weights samples with BIG absolute returns (more info per sample).
+  // Combined weight = uniqueness × (|return at exit| / mean(|return at exit|))
+  const tbExitReturns: number[] = [];
+  for (let i = 30; i < candles.length - tbMaxBars; i++) {
+    const entryPrice = candles[i].close;
+    let exitRet = 0;
+    for (let j = 1; j <= tbMaxBars; j++) {
+      const ret = (candles[i + j].close - entryPrice) / entryPrice;
+      if (ret >= tbUpBarrier || ret <= -tbDownBarrier) { exitRet = ret; break; }
+      if (j === tbMaxBars) exitRet = ret; // timeout: final-bar return
+    }
+    tbExitReturns.push(Math.abs(exitRet));
+  }
+  const meanAbsReturn = tbExitReturns.length > 0 ? tbExitReturns.reduce((a, b) => a + b, 0) / tbExitReturns.length : 1;
+  const returnAttributionWeights = uniqueness.map((u, i) => u * (tbExitReturns[i] / Math.max(0.0001, meanAbsReturn)));
+  // Train an alternative meta-model using return-attribution weights (vs uniqueness-only)
+  const raMetaResult = trainWeightedLogisticRegression(metaFeatures, metaLabels, returnAttributionWeights, 0.01, 200);
+  const raMetaAUC = computeAUC(metaFeatures, metaLabels, raMetaResult.weights, raMetaResult.bias);
+  const returnAttribution = {
+    avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
+    avgReturnAbs: meanAbsReturn,
+    avgCombinedWeight: returnAttributionWeights.reduce((a, b) => a + b, 0) / Math.max(1, returnAttributionWeights.length),
+    minWeight: returnAttributionWeights.length > 0 ? Math.min(...returnAttributionWeights) : 0,
+    maxWeight: returnAttributionWeights.length > 0 ? Math.max(...returnAttributionWeights) : 0,
+    description: `weight = uniqueness × (|return| / mean(|return|)). Mean |return at exit|=${(meanAbsReturn * 100).toFixed(2)}%. Combined weight range [${returnAttributionWeights.length > 0 ? Math.min(...returnAttributionWeights).toFixed(3) : "0"}, ${returnAttributionWeights.length > 0 ? Math.max(...returnAttributionWeights).toFixed(3) : "0"}]. RA-weighted meta-model AUC ${raMetaAUC.toFixed(3)} vs uniqueness-only ${metaAUC.toFixed(3)}.`,
+  };
+
+  // P5: MDI (Mean Decrease Impurity) via CART ensemble + MDA (permutation importance alias)
+  const mdiImportance = computeMDI(featureList, labels, 20, 4);
+  // MDA = permutation importance (same algorithm), add rank
+  const mdaImportance = model.permutationImportance
+    .slice().sort((a, b) => b.importance - a.importance)
+    .map((p, i) => ({ ...p, rank: i + 1 }));
+  // P5: Combined feature selection — 3 independent methods must agree
+  const featureSelection = FEATURE_NAMES.map((name, f) => {
+    const wald = model.featureImportance.find(fi => fi.name === name);
+    const perm = mdaImportance.find(p => p.feature === name);
+    const mdi = mdiImportance.find(m => m.feature === name);
+    const waldSig = wald?.significant ?? false;
+    const permSig = perm?.significant ?? false;
+    const waldRank = wald?.rank ?? 0;
+    const mdiRank = mdi?.rank ?? 0;
+    const mdaRank = perm?.rank ?? 0;
+    // Combined score: average rank across 3 methods (lower = more important)
+    const combinedScore = (waldRank + mdiRank + mdaRank) / 3;
+    const sigCount = (waldSig ? 1 : 0) + (permSig ? 1 : 0);
+    const verdict: "useful" | "borderline" | "noise" = sigCount >= 2 ? "useful" : sigCount === 1 ? "borderline" : "noise";
+    const recommendation = verdict === "useful" ? "keep" : verdict === "borderline" ? "monitor" : "drop — no signal across 3 independent methods";
+    return { feature: name, waldSig, permSig, mdiRank, mdaRank, waldRank, combinedScore, verdict, recommendation };
+  }).sort((a, b) => a.combinedScore - b.combinedScore);
+
   const metaModel = {
     accuracy: metaResult.accuracy,
     brierScore: metaResult.brierScore,
@@ -999,6 +1225,15 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     prEffectSize,
     f1EffectSize,
     calibratedCalibrationPerRegime,
+    dynamicBarrierMetaModel: {
+      accuracy: raMetaResult.accuracy,
+      brierScore: raMetaResult.brierScore,
+      aucROC: raMetaAUC,
+      f1Score: raMetaResult.f1Score,
+      prAUC: raMetaResult.prAUC,
+      optimalThreshold: raMetaResult.optimalThreshold,
+      description: `Meta-model trained with return-attribution weights (uniqueness × |return|). AUC ${raMetaAUC.toFixed(3)} vs uniqueness-only ${metaAUC.toFixed(3)}. F1 ${raMetaResult.f1Score.toFixed(2)} vs ${metaResult.f1Score.toFixed(2)}.`,
+    },
     description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : nestedAvgF1 > 0.15 ? `Meta-model weak OOS (nested CV F1=${nestedAvgF1.toFixed(2)}, isotonic F1=${oosIsotonic.f1.toFixed(2)})` : `Meta-model no OOS value (nested CV F1=${nestedAvgF1.toFixed(2)}, raw F1=${oosRaw.f1.toFixed(2)})`,
   };
 
@@ -1012,12 +1247,17 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     featureImportance: model.featureImportance,
     ablation: model.ablation,
     permutationImportance: model.permutationImportance,
+    mdiImportance,
+    mdaImportance,
+    featureSelection,
     aucROC: model.aucROC,
     aucPR: model.aucPR,
     lrStat: model.lrStat,
     lrDF: model.lrDF,
     lrPValue: model.lrPValue,
     tripleBarrier,
+    dynamicTripleBarrier,
+    returnAttribution,
     metaModel,
     trainingSamples: featureList.length,
     description,

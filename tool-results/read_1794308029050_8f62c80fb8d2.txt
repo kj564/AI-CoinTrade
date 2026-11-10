@@ -1,0 +1,1026 @@
+     1→// ML Direction Predictor — simple logistic regression that predicts
+     2→// next-hour price direction (up/down probability) based on technical features.
+     3→// Inspired by: arXiv 2306.08157 (Bayesian Networks for crypto prediction)
+     4→// + arXiv 2504.19309 (CNN-Transformer for time series)
+     5→// Practical approach: logistic regression with gradient descent, no GPU needed.
+     6→
+     7→import type { Candle } from "./candles";
+     8→import { calcATR } from "./backtest";
+     9→
+    10→interface Features {
+    11→  rsi: number;          // RSI(14) / 100, normalized 0-1
+    12→  macdHist: number;     // MACD histogram, normalized
+    13→  smaRatio: number;     // SMA10 / SMA20 (>1 = uptrend)
+    14→  stoch: number;        // Stochastic %K / 100
+    15→  obvSlope: number;     // OBV slope (normalized)
+    16→  volRatio: number;     // Volume ratio / 3 (normalized)
+    17→  atrPct: number;       // ATR as % of price (volatility)
+    18→  priceMomentum: number; // (close - close[-5]) / close[-5] (5-bar momentum)
+    19→}
+    20→
+    21→export interface MLPrediction {
+    22→  probability: number;    // 0-1, probability of price going UP next hour
+    23→  probabilityPct: number; // as percentage
+    24→  direction: "up" | "down" | "neutral";
+    25→  confidence: number;     // 0-100
+    26→  features: Features;     // current features used for prediction
+    27→  modelAccuracy: number;  // training accuracy (0-100)
+    28→  trainingSamples: number;
+    29→  brierScore: number;     // P5: Brier score (lower = better calibrated, 0=perfect, 0.25=random)
+    30→  calibration: { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]; // reliability curve with Wilson CI
+    31→  calibrationPerRegime: Record<string, { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]>; // per-regime calibration with CI
+    32→  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number; bootstrapCILo: number; bootstrapCIHi: number; oddsRatio: number; orCILo: number; orCIHi: number; effectSize: number; probDiff: number; probDiffPct: number; pBase: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
+    33→  ablation: { feature: string; dropped: number; accuracyDelta: number; description: string; bsCILo: number; bsCIHi: number; significant: boolean }[]; // P3: feature ablation
+    34→  aucROC: number;     // P1: Area Under ROC Curve (0.5 = random, 1.0 = perfect)
+    35→  aucPR: number;      // P1: Area Under Precision-Recall Curve
+    36→  permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[]; // P2: model-agnostic importance
+    37→  lrStat: number;       // P3: Likelihood Ratio test statistic
+    38→  lrDF: number;         // P3: degrees of freedom
+    39→  lrPValue: number;     // P3: p-value for LR test (model as a whole)
+    40→  tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
+    41→  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[]; aucROCLift: number; prAUCLift: number; aucEffectSize: number; prEffectSize: number; f1EffectSize: number; calibratedCalibrationPerRegime: Record<string, any[]> } | null; // P1: meta-labeling model
+    42→  description: string;
+    43→}
+    44→
+    45→const FEATURE_NAMES = ["RSI", "MACD Hist", "SMA Ratio", "Stochastic", "OBV Slope", "Vol Ratio", "ATR %", "Momentum"];
+    46→
+    47→// Wilson score confidence interval for binomial proportion
+    48→function wilsonCI(observed: number, n: number, z = 1.96): { lo: number; hi: number } {
+    49→  if (n === 0) return { lo: 0, hi: 1 };
+    50→  const p = observed;
+    51→  const denom = 1 + z * z / n;
+    52→  const center = (p + z * z / (2 * n)) / denom;
+    53→  const spread = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom;
+    54→  return { lo: Math.max(0, center - spread), hi: Math.min(1, center + spread) };
+    55→}
+    56→
+    57→// Isotonic regression calibration — fixes miscalibration from class weighting
+    58→// Maps raw probabilities to calibrated probabilities using monotonic fitting
+    59→function isotonicCalibrate(rawProbs: number[], labels: number[]): (p: number) => number {
+    60→  // Sort by raw probability
+    61→  const sorted = rawProbs.map((p, i) => ({ p, label: labels[i] })).sort((a, b) => a.p - b.p);
+    62→  // Pool Adjacent Violators (PAVA) algorithm
+    63→  const blocks: { value: number; weight: number }[] = [];
+    64→  for (const { p, label } of sorted) {
+    65→    blocks.push({ value: label, weight: 1 });
+    66→    // Merge blocks while violating monotonicity
+    67→    while (blocks.length >= 2 && blocks[blocks.length - 2].value > blocks[blocks.length - 1].value) {
+    68→      const right = blocks.pop()!;
+    69→      const left = blocks.pop()!;
+    70→      const totalW = left.weight + right.weight;
+    71→      blocks.push({ value: (left.value * left.weight + right.value * right.weight) / totalW, weight: totalW });
+    72→    }
+    73→  }
+    74→  // Build lookup: for each block, store the calibrated probability and the raw range
+    75→  const lookup: { rawLo: number; rawHi: number; calibrated: number }[] = [];
+    76→  let idx = 0;
+    77→  for (const block of blocks) {
+    78→    const blockSize = block.weight;
+    79→    const rawLo = sorted[idx]?.p ?? 0;
+    80→    const rawHi = sorted[idx + blockSize - 1]?.p ?? 1;
+    81→    lookup.push({ rawLo, rawHi, calibrated: block.value });
+    82→    idx += blockSize;
+    83→  }
+    84→  // Return interpolation function
+    85→  return (p: number) => {
+    86→    if (p <= lookup[0].rawLo) return lookup[0].calibrated;
+    87→    for (let i = 0; i < lookup.length; i++) {
+    88→      if (p >= lookup[i].rawLo && p <= lookup[i].rawHi) return lookup[i].calibrated;
+    89→      if (i < lookup.length - 1 && p > lookup[i].rawHi && p < lookup[i + 1].rawLo) {
+    90→        // Interpolate between blocks
+    91→        const t = (p - lookup[i].rawHi) / (lookup[i + 1].rawLo - lookup[i].rawHi);
+    92→        return lookup[i].calibrated * (1 - t) + lookup[i + 1].calibrated * t;
+    93→      }
+    94→    }
+    95→    return lookup[lookup.length - 1].calibrated;
+    96→  };
+    97→}
+    98→
+    99→// Platt scaling — logistic regression on (raw_prob, label) to calibrate
+   100→function plattCalibrate(rawProbs: number[], labels: number[]): (p: number) => number {
+   101→  // Fit: P(y=1 | raw) = sigmoid(a * raw + b)
+   102→  let a = 0, b = 0;
+   103→  const lr = 0.01;
+   104→  for (let iter = 0; iter < 200; iter++) {
+   105→    let gradA = 0, gradB = 0;
+   106→    for (let i = 0; i < rawProbs.length; i++) {
+   107→      const z = a * rawProbs[i] + b;
+   108→      const pred = sigmoid(z);
+   109→      const err = pred - labels[i];
+   110→      gradA += err * rawProbs[i];
+   111→      gradB += err;
+   112→    }
+   113→    a -= lr * gradA / rawProbs.length;
+   114→    b -= lr * gradB / rawProbs.length;
+   115→  }
+   116→  return (p: number) => sigmoid(a * p + b);
+   117→}
+   118→
+   119→// Weighted logistic regression for meta-labeling (uniqueness-weighted + class balancing)
+   120→function trainWeightedLogisticRegression(
+   121→  features: number[][], labels: number[], weights: number[],
+   122→  learningRate = 0.01, iterations = 200
+   123→): { weights: number[]; bias: number; accuracy: number; brierScore: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number } {
+   124→  const n = features.length;
+   125→  const d = features[0]?.length || 0;
+   126→
+   127→  // P1: Class balancing — up-sample minority class (barrier hits)
+   128→  // Instead of SMOTE, use cost-sensitive weighting: minority class gets higher weight
+   129→  const posCount = labels.filter(l => l === 1).length;
+   130→  const negCount = n - posCount;
+   131→  const posWeight = negCount / Math.max(1, posCount); // up-weight minority
+   132→  const classWeights = labels.map(l => (l === 1 ? posWeight : 1));
+   133→  // Combine class weight with uniqueness weight
+   134→  const combinedWeights = weights.map((w, i) => w * classWeights[i]);
+   135→
+   136→  // Standardize (weighted)
+   137→  const means: number[] = new Array(d).fill(0);
+   138→  const stdDevs: number[] = new Array(d).fill(1);
+   139→  const totalW = combinedWeights.reduce((a, x) => a + x, 0) || 1;
+   140→  for (let j = 0; j < d; j++) {
+   141→    let wsum = 0;
+   142→    for (let i = 0; i < n; i++) wsum += features[i][j] * combinedWeights[i];
+   143→    means[j] = wsum / totalW;
+   144→    let wvar = 0;
+   145→    for (let i = 0; i < n; i++) wvar += combinedWeights[i] * (features[i][j] - means[j]) ** 2;
+   146→    wvar /= totalW;
+   147→    stdDevs[j] = Math.sqrt(wvar) || 1;
+   148→  }
+   149→  const standardized = features.map(row => row.map((v, j) => (v - means[j]) / stdDevs[j]));
+   150→
+   151→  const w = new Array(d).fill(0);
+   152→  let b = 0;
+   153→  for (let iter = 0; iter < iterations; iter++) {
+   154→    const grad = new Array(d).fill(0);
+   155→    let gradB = 0;
+   156→    for (let i = 0; i < n; i++) {
+   157→      const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+   158→      const pred = sigmoid(z);
+   159→      const err = (pred - labels[i]) * combinedWeights[i];
+   160→      for (let j = 0; j < d; j++) grad[j] += err * standardized[i][j];
+   161→      gradB += err;
+   162→    }
+   163→    for (let j = 0; j < d; j++) w[j] -= learningRate * grad[j] / totalW;
+   164→    b -= learningRate * gradB / totalW;
+   165→  }
+   166→
+   167→  // Compute predictions for threshold optimization
+   168→  const predProbs: { prob: number; label: number }[] = [];
+   169→  for (let i = 0; i < n; i++) {
+   170→    const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+   171→    predProbs.push({ prob: sigmoid(z), label: labels[i] });
+   172→  }
+   173→  predProbs.sort((a, b2) => a.prob - b2.prob);
+   174→
+   175→  // P2: Threshold optimization — find threshold that maximizes F1
+   176→  let bestThreshold = 0.5, bestF1 = 0, bestPrecision = 0, bestRecall = 0;
+   177→  for (let t = 0.05; t <= 0.95; t += 0.05) {
+   178→    let tp = 0, fp = 0, fn = 0;
+   179→    for (const p of predProbs) {
+   180→      const pred = p.prob >= t ? 1 : 0;
+   181→      if (pred === 1 && p.label === 1) tp++;
+   182→      if (pred === 1 && p.label === 0) fp++;
+   183→      if (pred === 0 && p.label === 1) fn++;
+   184→    }
+   185→    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+   186→    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+   187→    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+   188→    if (f1 > bestF1) { bestF1 = f1; bestThreshold = t; bestPrecision = prec; bestRecall = rec; }
+   189→  }
+   190→
+   191→  // P3: PR-AUC for meta-model
+   192→  let prevPrec = posCount > 0 ? posCount / n : 0.5, prevRec = 0, prAUC = 0;
+   193→  let tp2 = 0;
+   194→  for (let i = predProbs.length - 1; i >= 0; i--) {
+   195→    if (predProbs[i].label === 1) tp2++;
+   196→    const rank = predProbs.length - i;
+   197→    const prec = tp2 / rank;
+   198→    const rec = posCount > 0 ? tp2 / posCount : 0;
+   199→    prAUC += (rec - prevRec) * (prec + prevPrec) / 2;
+   200→    prevPrec = prec; prevRec = rec;
+   201→  }
+   202→  prAUC = Math.max(0, Math.min(1, prAUC));
+   203→
+   204→  // Default threshold (0.5) metrics
+   205→  let correct = 0, brierSum = 0, tpDef = 0, fpDef = 0, fnDef = 0;
+   206→  for (let i = 0; i < n; i++) {
+   207→    const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+   208→    const pred = sigmoid(z);
+   209→    const predLabel = pred > 0.5 ? 1 : 0;
+   210→    if (predLabel === labels[i]) correct++;
+   211→    brierSum += (pred - labels[i]) ** 2;
+   212→    if (predLabel === 1 && labels[i] === 1) tpDef++;
+   213→    if (predLabel === 1 && labels[i] === 0) fpDef++;
+   214→    if (predLabel === 0 && labels[i] === 1) fnDef++;
+   215→  }
+   216→  const precDef = (tpDef + fpDef) > 0 ? tpDef / (tpDef + fpDef) : 0;
+   217→  const recDef = (tpDef + fnDef) > 0 ? tpDef / (tpDef + fnDef) : 0;
+   218→  const f1Def = (precDef + recDef) > 0 ? 2 * precDef * recDef / (precDef + recDef) : 0;
+   219→
+   220→  return {
+   221→    weights: w, bias: b,
+   222→    accuracy: n > 0 ? (correct / n) * 100 : 0,
+   223→    brierScore: n > 0 ? brierSum / n : 0.25,
+   224→    precision: precDef, recall: recDef, f1Score: f1Def, prAUC,
+   225→    optimalThreshold: bestThreshold, precisionAtThreshold: bestPrecision, recallAtThreshold: bestRecall, f1AtThreshold: bestF1,
+   226→  };
+   227→}
+   228→
+   229→// AUC-ROC computation
+   230→function computeAUC(features: number[][], labels: number[], weights: number[], bias: number): number {
+   231→  const preds: { prob: number; label: number }[] = [];
+   232→  for (let i = 0; i < features.length; i++) {
+   233→    const z = bias + features[i].reduce((a, w, j) => a + w * weights[j], 0);
+   234→    preds.push({ prob: sigmoid(z), label: labels[i] });
+   235→  }
+   236→  preds.sort((a, b) => b.prob - a.prob);
+   237→  const totalPos = preds.filter(p => p.label === 1).length;
+   238→  const totalNeg = preds.length - totalPos;
+   239→  if (totalPos === 0 || totalNeg === 0) return 0.5;
+   240→  let tp = 0, fp = 0, prevTPR = 0, prevFPR = 0, auc = 0;
+   241→  for (const p of preds) {
+   242→    if (p.label === 1) tp++; else fp++;
+   243→    const tpr = tp / totalPos, fpr = fp / totalNeg;
+   244→    auc += (fpr - prevFPR) * (tpr + prevTPR) / 2;
+   245→    prevTPR = tpr; prevFPR = fpr;
+   246→  }
+   247→  return auc;
+   248→}
+   249→
+   250→// Compute features for a candle at index i
+   251→function computeFeatures(candles: Candle[], i: number): Features | null {
+   252→  if (i < 20 || i >= candles.length) return null;
+   253→  const closes = candles.slice(Math.max(0, i - 30), i + 1).map(c => c.close);
+   254→  const highs = candles.slice(Math.max(0, i - 30), i + 1).map(c => c.high);
+   255→  const lows = candles.slice(Math.max(0, i - 30), i + 1).map(c => c.low);
+   256→  const vols = candles.slice(Math.max(0, i - 30), i + 1).map(c => c.volume);
+   257→
+   258→  // RSI(14)
+   259→  let gains = 0, losses = 0;
+   260→  for (let j = 1; j <= 14 && j < closes.length; j++) {
+   261→    const d = closes[j] - closes[j - 1];
+   262→    if (d > 0) gains += d; else losses -= d;
+   263→  }
+   264→  const rsi = losses === 0 ? 100 : gains === 0 ? 0 : 100 - 100 / (1 + gains / losses);
+   265→
+   266→  // SMA10 / SMA20
+   267→  const sma10 = closes.slice(-10).reduce((a, b) => a + b, 0) / 10;
+   268→  const sma20 = closes.slice(-20).reduce((a, b) => a + b, 0) / 20;
+   269→  const smaRatio = sma20 > 0 ? sma10 / sma20 : 1;
+   270→
+   271→  // Stochastic %K
+   272→  const hh = Math.max(...highs.slice(-14));
+   273→  const ll = Math.min(...lows.slice(-14));
+   274→  const stoch = hh === ll ? 50 : 100 * (closes[closes.length - 1] - ll) / (hh - ll);
+   275→
+   276→  // MACD histogram (simplified)
+   277→  const ema = (data: number[], period: number) => {
+   278→    const k = 2 / (period + 1);
+   279→    let e = data[0];
+   280→    for (let j = 1; j < data.length; j++) e = data[j] * k + e * (1 - k);
+   281→    return e;
+   282→  };
+   283→  const ema12 = ema(closes, 12);
+   284→  const ema26 = ema(closes, 26);
+   285→  const macdLine = ema12 - ema26;
+   286→  const macdHist = macdLine; // simplified (no signal line)
+   287→
+   288→  // OBV slope
+   289→  let obv = 0;
+   290→  for (let j = 1; j < closes.length; j++) {
+   291→    if (closes[j] > closes[j - 1]) obv += vols[j] || 0;
+   292→    else if (closes[j] < closes[j - 1]) obv -= vols[j] || 0;
+   293→  }
+   294→  const obvSlope = obv / (closes[closes.length - 1] * Math.max(1, vols.reduce((a, b) => a + b, 0)));
+   295→
+   296→  // Volume ratio
+   297→  const volAvg = vols.slice(-20).reduce((a, b) => a + b, 0) / Math.min(20, vols.length);
+   298→  const volRatio = volAvg > 0 ? vols[vols.length - 1] / volAvg : 1;
+   299→
+   300→  // ATR %
+   301→  const atr = calcATR(candles.slice(Math.max(0, i - 30), i + 1), 14);
+   302→  const atrPct = closes[closes.length - 1] > 0 ? atr / closes[closes.length - 1] : 0;
+   303→
+   304→  // 5-bar momentum
+   305→  const mom = closes.length > 5 ? (closes[closes.length - 1] - closes[closes.length - 6]) / closes[closes.length - 6] : 0;
+   306→
+   307→  return {
+   308→    rsi: rsi / 100,
+   309→    macdHist: macdHist / closes[closes.length - 1], // normalize by price
+   310→    smaRatio,
+   311→    stoch: stoch / 100,
+   312→    obvSlope,
+   313→    volRatio: Math.min(volRatio / 3, 1),
+   314→    atrPct,
+   315→    priceMomentum: mom,
+   316→  };
+   317→}
+   318→
+   319→// Sigmoid
+   320→function sigmoid(x: number): number {
+   321→  return 1 / (1 + Math.exp(-x));
+   322→}
+   323→
+   324→// Train logistic regression with STANDARDIZED features + p-values
+   325→function trainLogisticRegression(
+   326→  features: number[][],
+   327→  labels: number[],
+   328→  learningRate = 0.01,
+   329→  iterations = 200
+   330→): { weights: number[]; bias: number; accuracy: number; brierScore: number; calibration: any[]; calibrationPerRegime: Record<string, any[]>; featureImportance: any[]; stdDevs: number[]; pValues: number[]; zScores: number[] } {
+   331→  const n = features.length;
+   332→  const d = features[0]?.length || 0;
+   333→
+   334→  // P1: Standardize features (z-score) — coefficients only comparable if standardized
+   335→  const means: number[] = new Array(d).fill(0);
+   336→  const stdDevs: number[] = new Array(d).fill(1);
+   337→  for (let j = 0; j < d; j++) {
+   338→    for (let i = 0; i < n; i++) means[j] += features[i][j];
+   339→    means[j] /= n;
+   340→    let variance = 0;
+   341→    for (let i = 0; i < n; i++) variance += (features[i][j] - means[j]) ** 2;
+   342→    variance /= n;
+   343→    stdDevs[j] = Math.sqrt(variance) || 1;
+   344→  }
+   345→  const standardized: number[][] = features.map(row => row.map((v, j) => (v - means[j]) / stdDevs[j]));
+   346→
+   347→  const weights = new Array(d).fill(0);
+   348→  let bias = 0;
+   349→
+   350→  for (let iter = 0; iter < iterations; iter++) {
+   351→    const grad = new Array(d).fill(0);
+   352→    let gradBias = 0;
+   353→    for (let i = 0; i < n; i++) {
+   354→      const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   355→      const pred = sigmoid(z);
+   356→      const err = pred - labels[i];
+   357→      for (let j = 0; j < d; j++) grad[j] += err * standardized[i][j];
+   358→      gradBias += err;
+   359→    }
+   360→    for (let j = 0; j < d; j++) weights[j] -= learningRate * grad[j] / n;
+   361→    bias -= learningRate * gradBias / n;
+   362→  }
+   363→
+   364→  // Compute training accuracy + Brier score (P5: calibration metric)
+   365→  let correct = 0;
+   366→  let brierSum = 0;
+   367→  for (let i = 0; i < n; i++) {
+   368→    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   369→    const pred = sigmoid(z);
+   370→    const predLabel = pred > 0.5 ? 1 : 0;
+   371→    if (predLabel === labels[i]) correct++;
+   372→    brierSum += (pred - labels[i]) ** 2;
+   373→  }
+   374→  const accuracy = n > 0 ? (correct / n) * 100 : 0;
+   375→  const brierScore = n > 0 ? brierSum / n : 0.25; // 0=perfect, 0.25=random guessing
+   376→
+   377→  // P3: Calibration plot / reliability curve
+   378→  // Bin predictions into deciles, compute observed frequency per bin
+   379→  const bins = Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [] as number[], labels: [] as number[] }));
+   380→  // Per-regime calibration: classify each sample by regime, compute separate calibration
+   381→  const regimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
+   382→    trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   383→    ranging: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   384→    volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   385→  };
+   386→  for (let i = 0; i < n; i++) {
+   387→    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   388→    const pred = sigmoid(z);
+   389→    const binIdx = Math.min(9, Math.floor(pred * 10));
+   390→    bins[binIdx].preds.push(pred);
+   391→    bins[binIdx].labels.push(labels[i]);
+   392→    // Classify regime based on features
+   393→    const feat = features[i]; // [rsi, macdHist, smaRatio, stoch, obvSlope, volRatio, atrPct, momentum]
+   394→    const smaRatio = feat[2], atrPct = feat[6];
+   395→    const regime = atrPct > 0.02 ? "volatile" : (smaRatio > 1.005 || smaRatio < 0.995) ? "trending" : "ranging";
+   396→    regimeBins[regime][binIdx].preds.push(pred);
+   397→    regimeBins[regime][binIdx].labels.push(labels[i]);
+   398→  }
+   399→  const calibration = bins.map((b) => {
+   400→    const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+   401→    return {
+   402→      bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+   403→      predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+   404→      observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+   405→      count: b.preds.length,
+   406→      ciLo: ci.lo, ciHi: ci.hi,
+   407→    };
+   408→  });
+   409→  const calibrationPerRegime: Record<string, any[]> = {};
+   410→  for (const [regime, rb] of Object.entries(regimeBins)) {
+   411→    calibrationPerRegime[regime] = rb.map((b) => {
+   412→      const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+   413→      return {
+   414→        bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+   415→        predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+   416→        observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+   417→        count: b.preds.length,
+   418→        ciLo: ci.lo, ciHi: ci.hi,
+   419→      };
+   420→    });
+   421→  }
+   422→
+   423→  // P2: Feature importance on STANDARDIZED coefficients (now comparable)
+   424→  // P2: Wald test for p-values — z = weight / SE, p = 2 * (1 - Φ(|z|))
+   425→  // SE ≈ 1 / sqrt(n * p(1-p)) for logistic regression (approximation)
+   426→  const pHat = labels.reduce((a, b) => a + b, 0) / n; // base rate
+   427→  const seApprox = Math.sqrt(1 / (n * pHat * (1 - pHat)));
+   428→  const zScores: number[] = weights.map(w => Math.abs(seApprox) > 0 ? w / seApprox : 0);
+   429→  // Approximate p-value from z-score (two-tailed, normal approximation)
+   430→  const rawPValues: number[] = zScores.map(z => {
+   431→    const absZ = Math.abs(z);
+   432→    const p = 1 - 0.5 * (1 + Math.tanh(0.7978 * absZ * (1 + 0.044715 * absZ * absZ)));
+   433→    return Math.max(0, Math.min(1, 2 * p));
+   434→  });
+   435→
+   436→  // P1: Multiple-testing correction — Benjamini-Hochberg FDR
+   437→  // Controls False Discovery Rate (expected proportion of false positives among rejected)
+   438→  // Sort p-values, apply BH adjustment: p_adj = p * d / rank
+   439→  const sortedIndices = rawPValues.map((p, i) => ({ p, i })).sort((a, b) => a.p - b.p);
+   440→  const nFeatures = rawPValues.length;
+   441→  const adjustedP: number[] = new Array(nFeatures).fill(0);
+   442→  let prevAdj = 1;
+   443→  for (let k = nFeatures - 1; k >= 0; k--) {
+   444→    const { p, i } = sortedIndices[k];
+   445→    const adj = Math.min(prevAdj, p * nFeatures / (k + 1));
+   446→    adjustedP[i] = Math.min(1, adj);
+   447→    prevAdj = adj;
+   448→  }
+   449→
+   450→  // P2: Confidence interval per coefficient (Wald CI: w ± 1.96 × SE)
+   451→  const ci95: { lo: number; hi: number }[] = weights.map(w => ({
+   452→    lo: w - 1.96 * seApprox,
+   453→    hi: w + 1.96 * seApprox,
+   454→  }));
+   455→
+   456→  // P3: Feature ablation — drop each feature, measure accuracy delta
+   457→  // P2: Bootstrap CI for ablation — is Δ statistically significant?
+   458→  const baselineAccuracy = accuracy;
+   459→  const ablation: { feature: string; dropped: number; accuracyDelta: number; description: string; bsCILo: number; bsCIHi: number; significant: boolean }[] = [];
+   460→  const nBsAblation = 50; // bootstrap iterations for ablation CI
+   461→  for (let dropIdx = 0; dropIdx < d; dropIdx++) {
+   462→    const reducedFeatures = standardized.map(row => row.filter((_, j) => j !== dropIdx));
+   463→    // Full ablation (200 iterations)
+   464→    const reducedWeights = new Array(d - 1).fill(0);
+   465→    let reducedBias = 0;
+   466→    for (let iter = 0; iter < iterations; iter++) {
+   467→      const grad = new Array(d - 1).fill(0);
+   468→      let gradBias = 0;
+   469→      for (let i = 0; i < n; i++) {
+   470→        const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+   471→        const pred = sigmoid(z);
+   472→        const err = pred - labels[i];
+   473→        for (let j = 0; j < d - 1; j++) grad[j] += err * reducedFeatures[i][j];
+   474→        gradBias += err;
+   475→      }
+   476→      for (let j = 0; j < d - 1; j++) reducedWeights[j] -= learningRate * grad[j] / n;
+   477→      reducedBias -= learningRate * gradBias / n;
+   478→    }
+   479→    let reducedCorrect = 0;
+   480→    for (let i = 0; i < n; i++) {
+   481→      const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+   482→      if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) reducedCorrect++;
+   483→    }
+   484→    const reducedAcc = n > 0 ? (reducedCorrect / n) * 100 : 0;
+   485→    const delta = baselineAccuracy - reducedAcc;
+   486→
+   487→    // Bootstrap CI for delta: resample, compute delta each time
+   488→    const bootstrapDeltas: number[] = [];
+   489→    for (let b = 0; b < nBsAblation; b++) {
+   490→      const sampleIdx: number[] = [];
+   491→      for (let i = 0; i < n; i++) sampleIdx.push(Math.floor(Math.random() * n));
+   492→      // Baseline accuracy on bootstrap sample
+   493→      let bsBaseCorrect = 0;
+   494→      for (const i of sampleIdx) {
+   495→        const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   496→        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) bsBaseCorrect++;
+   497→      }
+   498→      const bsBaseAcc = (bsBaseCorrect / n) * 100;
+   499→      // Reduced accuracy on bootstrap sample
+   500→      let bsReducedCorrect = 0;
+   501→      for (const i of sampleIdx) {
+   502→        const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+   503→        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) bsReducedCorrect++;
+   504→      }
+   505→      const bsReducedAcc = (bsReducedCorrect / n) * 100;
+   506→      bootstrapDeltas.push(bsBaseAcc - bsReducedAcc);
+   507→    }
+   508→    bootstrapDeltas.sort((a, b) => a - b);
+   509→    const bsCILo = bootstrapDeltas[Math.floor(nBsAblation * 0.025)] || 0;
+   510→    const bsCIHi = bootstrapDeltas[Math.floor(nBsAblation * 0.975)] || 0;
+   511→    // Significant if CI excludes 0 (both positive or both negative)
+   512→    const sig = (bsCILo > 0 && bsCIHi > 0) || (bsCILo < 0 && bsCIHi < 0);
+   513→
+   514→    ablation.push({
+   515→      feature: FEATURE_NAMES[dropIdx] || `Feature ${dropIdx}`,
+   516→      dropped: dropIdx,
+   517→      accuracyDelta: delta,
+   518→      bsCILo, bsCIHi, significant: sig,
+   519→      description: delta > 0.5 ? `Menghapus menurunkan akurasi ${delta.toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]` : delta < -0.5 ? `Menghapus menaikkan akurasi ${Math.abs(delta).toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]` : `Tidak mengubah akurasi Δ=${delta.toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]`,
+   520→    });
+   521→  }
+   522→  ablation.sort((a, b) => b.accuracyDelta - a.accuracyDelta);
+   523→
+   524→  // P2: Bootstrap CI for coefficients (1000 resamples, percentile method)
+   525→  // More robust than Wald CI for small samples or non-normal distributions
+   526→  const nBootstrap = 200; // reduced from 1000 for performance
+   527→  const bootstrapWeights: number[][] = [];
+   528→  for (let b = 0; b < nBootstrap; b++) {
+   529→    // Resample with replacement
+   530→    const sampleIdx: number[] = [];
+   531→    for (let i = 0; i < n; i++) sampleIdx.push(Math.floor(Math.random() * n));
+   532→    const bsFeatures = sampleIdx.map(i => standardized[i]);
+   533→    const bsLabels = sampleIdx.map(i => labels[i]);
+   534→    // Quick train (50 iterations for speed)
+   535→    const bsWeights = new Array(d).fill(0);
+   536→    let bsBias = 0;
+   537→    for (let iter = 0; iter < 50; iter++) {
+   538→      const grad = new Array(d).fill(0);
+   539→      let gradB = 0;
+   540→      for (let i = 0; i < n; i++) {
+   541→        const z = bsBias + bsFeatures[i].reduce((a, w, j) => a + w * bsWeights[j], 0);
+   542→        const pred = sigmoid(z);
+   543→        const err = pred - bsLabels[i];
+   544→        for (let j = 0; j < d; j++) grad[j] += err * bsFeatures[i][j];
+   545→        gradB += err;
+   546→      }
+   547→      for (let j = 0; j < d; j++) bsWeights[j] -= learningRate * grad[j] / n;
+   548→      bsBias -= learningRate * gradB / n;
+   549→    }
+   550→    bootstrapWeights.push(bsWeights);
+   551→  }
+   552→  // Percentile CI: 2.5th and 97.5th percentiles
+   553→  const bootstrapCI: { lo: number; hi: number }[] = weights.map((_, j) => {
+   554→    const sorted = bootstrapWeights.map(bw => bw[j]).sort((a, b) => a - b);
+   555→    const loIdx = Math.floor(nBootstrap * 0.025);
+   556→    const hiIdx = Math.floor(nBootstrap * 0.975);
+   557→    return { lo: sorted[loIdx] || 0, hi: sorted[hiIdx] || 0 };
+   558→  });
+   559→
+   560→  // P3: Likelihood Ratio Test — full model vs null (intercept-only) model
+   561→  // LR = -2 * (logLik_null - logLik_full) ~ chi-squared(df = d)
+   562→  // Tests whether the model as a whole has ANY predictive power
+   563→  const logLikFull = (() => {
+   564→    let ll = 0;
+   565→    for (let i = 0; i < n; i++) {
+   566→      const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   567→      const p = sigmoid(z);
+   568→      ll += labels[i] * Math.log(p + 1e-10) + (1 - labels[i]) * Math.log(1 - p + 1e-10);
+   569→    }
+   570→    return ll;
+   571→  })();
+   572→  const nullProb = labels.reduce((a, b) => a + b, 0) / n; // base rate
+   573→  const logLikNull = (() => {
+   574→    let ll = 0;
+   575→    for (let i = 0; i < n; i++) {
+   576→      ll += labels[i] * Math.log(nullProb + 1e-10) + (1 - labels[i]) * Math.log(1 - nullProb + 1e-10);
+   577→    }
+   578→    return ll;
+   579→  })();
+   580→  const lrStat = -2 * (logLikNull - logLikFull);
+   581→  const lrDF = d; // degrees of freedom = number of features
+   582→  // Chi-squared survival function (1 - CDF) approximation
+   583→  // For large DF, use Wilson-Hilferty approximation
+   584→  const lrPValue = (() => {
+   585→    if (lrStat <= 0) return 1;
+   586→    const h = 2 / (9 * lrDF);
+   587→    const z = (Math.pow(lrStat / lrDF, 1/3) - (1 - h)) / Math.sqrt(h);
+   588→    // P(X > lrStat) = P(Z > z) = 1 - Φ(z)
+   589→    const p = 0.5 * (1 + Math.tanh(0.7978 * z * (1 + 0.044715 * z * z)));
+   590→    return Math.max(0, Math.min(1, 1 - p));
+   591→  })();
+   592→
+   593→  // P1: AUC-ROC + PR-AUC — threshold-independent discrimination metrics
+   594→  // AUC = area under ROC curve (0.5 = random, 1.0 = perfect)
+   595→  // PR-AUC = area under precision-recall curve (base rate = random)
+   596→  const predProbs: { prob: number; label: number }[] = [];
+   597→  for (let i = 0; i < n; i++) {
+   598→    const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+   599→    predProbs.push({ prob: sigmoid(z), label: labels[i] });
+   600→  }
+   601→  predProbs.sort((a, b) => b.prob - a.prob);
+   602→  // ROC AUC via trapezoidal rule
+   603→  let tp = 0, fp = 0, prevTPR = 0, prevFPR = 0, aucROC = 0;
+   604→  const totalPos = predProbs.filter(p => p.label === 1).length;
+   605→  const totalNeg = n - totalPos;
+   606→  for (const p of predProbs) {
+   607→    if (p.label === 1) tp++; else fp++;
+   608→    const tpr = totalPos > 0 ? tp / totalPos : 0;
+   609→    const fpr = totalNeg > 0 ? fp / totalNeg : 0;
+   610→    aucROC += (fpr - prevFPR) * (tpr + prevTPR) / 2;
+   611→    prevTPR = tpr; prevFPR = fpr;
+   612→  }
+   613→  // PR-AUC via trapezoidal rule
+   614→  let prevPrecision = totalPos > 0 ? totalPos / n : 0.5;
+   615→  let prevRecall = 0, aucPR = 0;
+   616→  tp = 0;
+   617→  for (const p of predProbs) {
+   618→    if (p.label === 1) tp++;
+   619→    const precision = (tp) / (tp + (predProbs.indexOf(p) + 1 - tp));
+   620→    const recall = totalPos > 0 ? tp / totalPos : 0;
+   621→    aucPR += (recall - prevRecall) * (precision + prevPrecision) / 2;
+   622→    prevPrecision = precision; prevRecall = recall;
+   623→  }
+   624→  aucPR = Math.max(0, Math.min(1, aucPR));
+   625→
+   626→  // P2: Permutation importance with bootstrap CI
+   627→  // Shuffle each feature, measure accuracy drop. Model-agnostic, more robust than coefficients.
+   628→  const nPerm = 50;
+   629→  const permutationImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean }[] = [];
+   630→  for (let permIdx = 0; permIdx < d; permIdx++) {
+   631→    const deltas: number[] = [];
+   632→    for (let p = 0; p < nPerm; p++) {
+   633→      // Shuffle feature permIdx
+   634→      const shuffled = standardized.map((row, i) => {
+   635→        const newRow = [...row];
+   636→        const swapWith = Math.floor(Math.random() * n);
+   637→        newRow[permIdx] = standardized[swapWith][permIdx];
+   638→        return newRow;
+   639→      });
+   640→      // Compute accuracy with shuffled feature
+   641→      let permCorrect = 0;
+   642→      for (let i = 0; i < n; i++) {
+   643→        const z = bias + shuffled[i].reduce((a, w, j) => a + w * weights[j], 0);
+   644→        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) permCorrect++;
+   645→      }
+   646→      const permAcc = (permCorrect / n) * 100;
+   647→      deltas.push(baselineAccuracy - permAcc);
+   648→    }
+   649→    deltas.sort((a, b) => a - b);
+   650→    const mean = deltas.reduce((a, b) => a + b, 0) / nPerm;
+   651→    const ciLo = deltas[Math.floor(nPerm * 0.025)] || 0;
+   652→    const ciHi = deltas[Math.floor(nPerm * 0.975)] || 0;
+   653→    const sig = ciLo > 0; // significant if CI excludes 0 from below (dropping feature hurts)
+   654→    permutationImportance.push({
+   655→      feature: FEATURE_NAMES[permIdx] || `Feature ${permIdx}`,
+   656→      importance: mean,
+   657→      ciLo, ciHi, significant: sig,
+   658→    });
+   659→  }
+   660→  permutationImportance.sort((a, b) => b.importance - a.importance);
+   661→
+   662→  // P1: Probability difference effect size — how much does P(up) change
+   663→  // when a feature increases by 1 SD? More interpretable than OR.
+   664→  // P_base = sigmoid(bias + sum(w_j * 0)) = sigmoid(bias) (all features at mean, z-score=0)
+   665→  // P_plus1SD_j = sigmoid(bias + w_j) (feature j at +1 SD, others at mean)
+   666→  // ΔP_j = P_plus1SD_j - P_base
+   667→  const pBase = sigmoid(bias);
+   668→  const probDiff: { feature: string; deltaP: number; pBase: number; pPlus1SD: number }[] = [];
+   669→  for (let j = 0; j < d; j++) {
+   670→    const pPlus1SD = sigmoid(bias + weights[j]);
+   671→    probDiff.push({
+   672→      feature: FEATURE_NAMES[j] || `Feature ${j}`,
+   673→      deltaP: pPlus1SD - pBase,
+   674→      pBase,
+   675→      pPlus1SD,
+   676→    });
+   677→  }
+   678→
+   679→  const featureImportance = weights.map((w, i) => {
+   680→    const oddsRatio = Math.exp(w); // exp(w) = odds ratio for 1-SD increase in standardized feature
+   681→    const orCI = { lo: Math.exp(ci95[i].lo), hi: Math.exp(ci95[i].hi) };
+   682→    return {
+   683→      name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0,
+   684→      zScore: zScores[i], pValue: rawPValues[i], adjustedPValue: adjustedP[i], significant: adjustedP[i] < 0.05,
+   685→      ciLo: ci95[i].lo, ciHi: ci95[i].hi,
+   686→      bootstrapCILo: bootstrapCI[i].lo, bootstrapCIHi: bootstrapCI[i].hi,
+   687→      oddsRatio, orCILo: orCI.lo, orCIHi: orCI.hi,
+   688→      effectSize: Math.abs(oddsRatio - 1), // |OR - 1| = effect size (0 = no effect, >0.5 = large)
+   689→      probDiff: probDiff[i].deltaP, // ΔP = change in P(up) per 1-SD increase
+   690→      probDiffPct: probDiff[i].deltaP * 100, // as percentage points
+   691→      pBase: pBase,
+   692→    };
+   693→  })
+   694→    .sort((a, b) => b.absWeight - a.absWeight)
+   695→    .map((f, i) => ({ ...f, rank: i + 1 }));
+   696→
+   697→  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, permutationImportance, aucROC, aucPR, lrStat, lrDF, lrPValue, logLikFull, logLikNull, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
+   698→}
+   699→
+   700→export function predictDirection(candles: Candle[]): MLPrediction | null {
+   701→  if (candles.length < 50) return null;
+   702→
+   703→  // Build training dataset
+   704→  const featureList: number[][] = [];
+   705→  const labels: number[] = [];
+   706→
+   707→  for (let i = 30; i < candles.length - 1; i++) {
+   708→    const f = computeFeatures(candles, i);
+   709→    if (!f) continue;
+   710→    // Label: 1 if next candle close > current close
+   711→    const label = candles[i + 1].close > candles[i].close ? 1 : 0;
+   712→    featureList.push([f.rsi, f.macdHist, f.smaRatio, f.stoch, f.obvSlope, f.volRatio, f.atrPct, f.priceMomentum]);
+   713→    labels.push(label);
+   714→  }
+   715→
+   716→  if (featureList.length < 20) return null;
+   717→
+   718→  // Train
+   719→  const model = trainLogisticRegression(featureList, labels, 0.01, 200);
+   720→
+   721→  // Predict on current (last) candle
+   722→  const currentFeatures = computeFeatures(candles, candles.length - 1);
+   723→  if (!currentFeatures) return null;
+   724→
+   725→  const currentFeatureVec = [
+   726→    currentFeatures.rsi, currentFeatures.macdHist, currentFeatures.smaRatio,
+   727→    currentFeatures.stoch, currentFeatures.obvSlope, currentFeatures.volRatio,
+   728→    currentFeatures.atrPct, currentFeatures.priceMomentum,
+   729→  ];
+   730→  const z = model.bias + currentFeatureVec.reduce((a, w, j) => a + w * model.weights[j], 0);
+   731→  const probability = sigmoid(z);
+   732→  const probabilityPct = probability * 100;
+   733→
+   734→  const direction: "up" | "down" | "neutral" = probabilityPct > 55 ? "up" : probabilityPct < 45 ? "down" : "neutral";
+   735→  const confidence = Math.abs(probabilityPct - 50) * 2; // 0 at 50%, 100 at 0% or 100%
+   736→
+   737→  let description = "";
+   738→  if (direction === "up") description = `ML model memprediksi harga naik jam depan dengan ${probabilityPct.toFixed(0)}% probability. Model accuracy: ${model.accuracy.toFixed(0)}% pada ${featureList.length} sampel training.`;
+   739→  else if (direction === "down") description = `ML model memprediksi harga turun jam depan dengan ${(100 - probabilityPct).toFixed(0)}% probability. Model accuracy: ${model.accuracy.toFixed(0)}% pada ${featureList.length} sampel training.`;
+   740→  else description = `ML model uncertain (${probabilityPct.toFixed(0)}% up). Tidak ada sinyal kuat. Model accuracy: ${model.accuracy.toFixed(0)}%.`;
+   741→
+   742→  // P1: Meta-labeling (Lopez de Prado) — secondary model on triple-barrier output
+   743→  // Primary model (above) predicts direction. Meta-model predicts whether to ACT on it.
+   744→  // Train on triple-barrier labels: only trade when meta-model says "high probability of profit"
+   745→  // For each sample, compute uniqueness weight = 1 / (number of overlapping windows)
+   746→  // and use it to weight the training
+   747→  const tbUpBarrier = 0.02, tbDownBarrier = 0.02, tbMaxBars = 6;
+   748→  const tbMetaLabels: number[] = []; // 1 if barrier hit (profit or loss), 0 if timeout
+   749→  const tbMetaOutcomes: number[] = []; // +1 if up barrier, -1 if down barrier
+   750→  const uniqueness: number[] = []; // sample uniqueness weight
+   751→  let overlapCount = 0;
+   752→  for (let i = 30; i < candles.length - tbMaxBars; i++) {
+   753→    const entryPrice = candles[i].close;
+   754→    let hit = 0, outcome = 0;
+   755→    for (let j = 1; j <= tbMaxBars; j++) {
+   756→      const ret = (candles[i + j].close - entryPrice) / entryPrice;
+   757→      if (ret >= tbUpBarrier) { hit = 1; outcome = 1; break; }
+   758→      if (ret <= -tbDownBarrier) { hit = 1; outcome = -1; break; }
+   759→    }
+   760→    tbMetaLabels.push(hit);
+   761→    tbMetaOutcomes.push(outcome);
+   762→    // Uniqueness: count how many other windows overlap this one
+   763→    let overlaps = 0;
+   764→    for (let k = Math.max(30, i - tbMaxBars); k < Math.min(candles.length - tbMaxBars, i + tbMaxBars); k++) {
+   765→      if (k !== i) overlaps++;
+   766→    }
+   767→    uniqueness.push(overlaps > 0 ? 1 / (1 + overlaps) : 1);
+   768→    overlapCount += overlaps;
+   769→  }
+   770→  // This is the "should I trade?" model — higher precision than direction model
+   771→  const metaLabels = tbMetaLabels;
+   772→  const metaFeatures: number[][] = [];
+   773→  for (let i = 30; i < candles.length - tbMaxBars; i++) {
+   774→    const f = computeFeatures(candles, i);
+   775→    if (f) metaFeatures.push([f.rsi, f.macdHist, f.smaRatio, f.stoch, f.obvSlope, f.volRatio, f.atrPct, f.priceMomentum]);
+   776→  }
+   777→  // Weighted logistic regression for meta-model (using uniqueness weights)
+   778→  const metaResult = trainWeightedLogisticRegression(metaFeatures, metaLabels, uniqueness, 0.01, 200);
+   779→  const metaAUC = computeAUC(metaFeatures, metaLabels, metaResult.weights, metaResult.bias);
+   780→
+   781→  // P1: Out-of-sample threshold validation with calibration
+   782→  // Split 70/30, train model + calibration on train, validate on test
+   783→  const splitIdx = Math.floor(metaFeatures.length * 0.7);
+   784→  const trainFeatures = metaFeatures.slice(0, splitIdx);
+   785→  const trainLabels = metaLabels.slice(0, splitIdx);
+   786→  const trainWeights = uniqueness.slice(0, splitIdx);
+   787→  const testFeatures = metaFeatures.slice(splitIdx);
+   788→  const testLabels = metaLabels.slice(splitIdx);
+   789→  // Train meta-model on train split
+   790→  const trainMeta = trainWeightedLogisticRegression(trainFeatures, trainLabels, trainWeights, 0.01, 200);
+   791→  // Get raw predictions on train set for calibration fitting
+   792→  const trainRawProbs: number[] = [];
+   793→  for (let i = 0; i < trainFeatures.length; i++) {
+   794→    const z = trainMeta.bias + trainFeatures[i].reduce((a, w, j) => a + w * trainMeta.weights[j], 0);
+   795→    trainRawProbs.push(sigmoid(z));
+   796→  }
+   797→  // Fit calibration methods on train data
+   798→  const isotonicFn = isotonicCalibrate(trainRawProbs, trainLabels);
+   799→  const plattFn = plattCalibrate(trainRawProbs, trainLabels);
+   800→  // Apply calibration to test set
+   801→  const testPredsRaw: { prob: number; label: number }[] = [];
+   802→  const testPredsIsotonic: { prob: number; label: number }[] = [];
+   803→  const testPredsPlatt: { prob: number; label: number }[] = [];
+   804→  for (let i = 0; i < testFeatures.length; i++) {
+   805→    const z = trainMeta.bias + testFeatures[i].reduce((a, w, j) => a + w * trainMeta.weights[j], 0);
+   806→    const rawProb = sigmoid(z);
+   807→    testPredsRaw.push({ prob: rawProb, label: testLabels[i] });
+   808→    testPredsIsotonic.push({ prob: isotonicFn(rawProb), label: testLabels[i] });
+   809→    testPredsPlatt.push({ prob: plattFn(rawProb), label: testLabels[i] });
+   810→  }
+   811→  // Find optimal threshold for each calibration method on test set
+   812→  function findOptimalThreshold(preds: { prob: number; label: number }[]): { threshold: number; f1: number; prec: number; rec: number } {
+   813→    let bestT = 0.5, bestF1 = 0, bestP = 0, bestR = 0;
+   814→    for (let t = 0.05; t <= 0.95; t += 0.05) {
+   815→      let tp = 0, fp = 0, fn = 0;
+   816→      for (const p of preds) {
+   817→        const pred = p.prob >= t ? 1 : 0;
+   818→        if (pred === 1 && p.label === 1) tp++;
+   819→        if (pred === 1 && p.label === 0) fp++;
+   820→        if (pred === 0 && p.label === 1) fn++;
+   821→      }
+   822→      const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+   823→      const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+   824→      const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+   825→      if (f1 > bestF1) { bestF1 = f1; bestT = t; bestP = prec; bestR = rec; }
+   826→    }
+   827→    return { threshold: bestT, f1: bestF1, prec: bestP, rec: bestR };
+   828→  }
+   829→  const oosRaw = findOptimalThreshold(testPredsRaw);
+   830→  const oosIsotonic = findOptimalThreshold(testPredsIsotonic);
+   831→  const oosPlatt = findOptimalThreshold(testPredsPlatt);
+   832→  // Apply TRAIN threshold to TEST set (true OOS)
+   833→  let oosTP = 0, oosFP = 0, oosFN = 0;
+   834→  for (const p of testPredsRaw) {
+   835→    const pred = p.prob >= trainMeta.optimalThreshold ? 1 : 0;
+   836→    if (pred === 1 && p.label === 1) oosTP++;
+   837→    if (pred === 1 && p.label === 0) oosFP++;
+   838→    if (pred === 0 && p.label === 1) oosFN++;
+   839→  }
+   840→  const oosPrecAtTrainThreshold = (oosTP + oosFP) > 0 ? oosTP / (oosTP + oosFP) : 0;
+   841→  const oosRecAtTrainThreshold = (oosTP + oosFN) > 0 ? oosTP / (oosTP + oosFN) : 0;
+   842→  const oosF1AtTrainThreshold = (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) > 0 ? 2 * oosPrecAtTrainThreshold * oosRecAtTrainThreshold / (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) : 0;
+   843→  // Compute Brier score for calibrated predictions (isotonic vs raw)
+   844→  let brierRaw = 0, brierIsotonic = 0, brierPlatt = 0;
+   845→  for (let i = 0; i < testPredsRaw.length; i++) {
+   846→    brierRaw += (testPredsRaw[i].prob - testLabels[i]) ** 2;
+   847→    brierIsotonic += (testPredsIsotonic[i].prob - testLabels[i]) ** 2;
+   848→    brierPlatt += (testPredsPlatt[i].prob - testLabels[i]) ** 2;
+   849→  }
+   850→  brierRaw /= testPredsRaw.length;
+   851→  brierIsotonic /= testPredsIsotonic.length;
+   852→  brierPlatt /= testPredsPlatt.length;
+   853→
+   854→  // P2: Nested CV for threshold optimization (3-fold outer, inner = train threshold)
+   855→  const nFolds = 3;
+   856→  const foldSize = Math.floor(metaFeatures.length / nFolds);
+   857→  const nestedResults: { fold: number; innerThreshold: number; outerF1: number; outerPrec: number; outerRec: number }[] = [];
+   858→  for (let fold = 0; fold < nFolds; fold++) {
+   859→    const outerStart = fold * foldSize;
+   860→    const outerEnd = fold === nFolds - 1 ? metaFeatures.length : (fold + 1) * foldSize;
+   861→    const outerFeatures = metaFeatures.slice(outerStart, outerEnd);
+   862→    const outerLabels = metaLabels.slice(outerStart, outerEnd);
+   863→    const innerFeatures = [...metaFeatures.slice(0, outerStart), ...metaFeatures.slice(outerEnd)];
+   864→    const innerLabels = [...metaLabels.slice(0, outerStart), ...metaLabels.slice(outerEnd)];
+   865→    const innerWeights = [...uniqueness.slice(0, outerStart), ...uniqueness.slice(outerEnd)];
+   866→    // Train on inner, find threshold on inner
+   867→    const innerModel = trainWeightedLogisticRegression(innerFeatures, innerLabels, innerWeights, 0.01, 200);
+   868→    // Apply inner threshold to outer
+   869→    let tp = 0, fp = 0, fn = 0;
+   870→    for (let i = 0; i < outerFeatures.length; i++) {
+   871→      const z = innerModel.bias + outerFeatures[i].reduce((a, w, j) => a + w * innerModel.weights[j], 0);
+   872→      const pred = sigmoid(z) >= innerModel.optimalThreshold ? 1 : 0;
+   873→      if (pred === 1 && outerLabels[i] === 1) tp++;
+   874→      if (pred === 1 && outerLabels[i] === 0) fp++;
+   875→      if (pred === 0 && outerLabels[i] === 1) fn++;
+   876→    }
+   877→    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+   878→    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+   879→    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+   880→    nestedResults.push({ fold: fold + 1, innerThreshold: innerModel.optimalThreshold, outerF1: f1, outerPrec: prec, outerRec: rec });
+   881→  }
+   882→  const nestedAvgF1 = nestedResults.reduce((a, b) => a + b.outerF1, 0) / nFolds;
+   883→
+   884→  // P2: Calibration plot per regime with CI for ISOTONIC-calibrated predictions
+   885→  const calibratedRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
+   886→    trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   887→    ranging: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   888→    volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   889→  };
+   890→  for (let i = 0; i < metaFeatures.length; i++) {
+   891→    const z = metaResult.bias + metaFeatures[i].reduce((a, w, j) => a + w * metaResult.weights[j], 0);
+   892→    const rawProb = sigmoid(z);
+   893→    const calibProb = isotonicFn(rawProb);
+   894→    const binIdx = Math.min(9, Math.floor(calibProb * 10));
+   895→    const feat = metaFeatures[i];
+   896→    const smaRatio = feat[2], atrPct = feat[6];
+   897→    const regime = atrPct > 0.02 ? "volatile" : (smaRatio > 1.005 || smaRatio < 0.995) ? "trending" : "ranging";
+   898→    calibratedRegimeBins[regime][binIdx].preds.push(calibProb);
+   899→    calibratedRegimeBins[regime][binIdx].labels.push(metaLabels[i]);
+   900→  }
+   901→  const calibratedCalibrationPerRegime: Record<string, any[]> = {};
+   902→  for (const [regime, rb] of Object.entries(calibratedRegimeBins)) {
+   903→    calibratedCalibrationPerRegime[regime] = rb.map((b) => {
+   904→      const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+   905→      return {
+   906→        bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+   907→        predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+   908→        observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+   909→        count: b.preds.length,
+   910→        ciLo: ci.lo, ciHi: ci.hi,
+   911→      };
+   912→    });
+   913→  }
+   914→
+   915→  // P2: Calibration plot per regime for meta-model
+   916→  const metaRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
+   917→    trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   918→    ranging: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   919→    volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+   920→  };
+   921→  for (let i = 0; i < metaFeatures.length; i++) {
+   922→    const z = metaResult.bias + metaFeatures[i].reduce((a, w, j) => a + w * metaResult.weights[j], 0);
+   923→    const pred = sigmoid(z);
+   924→    const binIdx = Math.min(9, Math.floor(pred * 10));
+   925→    const feat = metaFeatures[i];
+   926→    const smaRatio = feat[2], atrPct = feat[6];
+   927→    const regime = atrPct > 0.02 ? "volatile" : (smaRatio > 1.005 || smaRatio < 0.995) ? "trending" : "ranging";
+   928→    metaRegimeBins[regime][binIdx].preds.push(pred);
+   929→    metaRegimeBins[regime][binIdx].labels.push(metaLabels[i]);
+   930→  }
+   931→  const metaCalibrationPerRegime: Record<string, any[]> = {};
+   932→  for (const [regime, rb] of Object.entries(metaRegimeBins)) {
+   933→    metaCalibrationPerRegime[regime] = rb.map((b) => {
+   934→      const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+   935→      return {
+   936→        bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+   937→        predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+   938→        observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+   939→        count: b.preds.length,
+   940→        ciLo: ci.lo, ciHi: ci.hi,
+   941→      };
+   942→    });
+   943→  }
+   944→  // Triple-barrier stats
+   945→  const tbTotal = tbMetaLabels.length;
+   946→  const tbUp = tbMetaOutcomes.filter(o => o === 1).length;
+   947→  const tbDown = tbMetaOutcomes.filter(o => o === -1).length;
+   948→  const tbTimeout = tbMetaLabels.filter(l => l === 0).length;
+   949→  // P1: Effect size based on AUC/PR-AUC lift over base rate
+   950→  const barrierHitRate = tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0.043;
+   951→  const aucROCLift = metaAUC - 0.5;
+   952→  const prAUCLift = metaResult.prAUC - barrierHitRate;
+   953→  const aucEffectSize = aucROCLift / 0.5;
+   954→  const prEffectSize = prAUCLift / Math.max(0.001, 1 - barrierHitRate);
+   955→  const randomF1 = 2 * barrierHitRate * 0.5 / (barrierHitRate + 0.5);
+   956→  const f1EffectSize = (nestedAvgF1 - randomF1) / Math.max(0.001, 1 - randomF1);
+   957→  const tripleBarrier = {
+   958→    upBarrier: tbUpBarrier, downBarrier: tbDownBarrier, maxBars: tbMaxBars,
+   959→    labels: tbMetaLabels,
+   960→    upCount: tbUp, downCount: tbDown, timeoutCount: tbTimeout,
+   961→    upPct: tbTotal > 0 ? (tbUp / tbTotal) * 100 : 0,
+   962→    downPct: tbTotal > 0 ? (tbDown / tbTotal) * 100 : 0,
+   963→    timeoutPct: tbTotal > 0 ? (tbTimeout / tbTotal) * 100 : 0,
+   964→  };
+   965→  const metaModel = {
+   966→    accuracy: metaResult.accuracy,
+   967→    brierScore: metaResult.brierScore,
+   968→    aucROC: metaAUC,
+   969→    precision: metaResult.precision,
+   970→    recall: metaResult.recall,
+   971→    f1Score: metaResult.f1Score,
+   972→    prAUC: metaResult.prAUC,
+   973→    optimalThreshold: metaResult.optimalThreshold,
+   974→    precisionAtThreshold: metaResult.precisionAtThreshold,
+   975→    recallAtThreshold: metaResult.recallAtThreshold,
+   976→    f1AtThreshold: metaResult.f1AtThreshold,
+   977→    avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
+   978→    samples: tbTotal,
+   979→    barrierHitRate: tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0,
+   980→    oosThreshold: oosRaw.threshold,
+   981→    oosF1: oosRaw.f1,
+   982→    oosPrecision: oosRaw.prec,
+   983→    oosRecall: oosRaw.rec,
+   984→    oosF1AtTrainThreshold,
+   985→    oosPrecisionAtTrainThreshold: oosPrecAtTrainThreshold,
+   986→    oosRecallAtTrainThreshold: oosRecAtTrainThreshold,
+   987→    calibrationPerRegime: metaCalibrationPerRegime,
+   988→    isotonicBrier: brierIsotonic,
+   989→    plattBrier: brierPlatt,
+   990→    isotonicOosF1: oosIsotonic.f1,
+   991→    plattOosF1: oosPlatt.f1,
+   992→    isotonicThreshold: oosIsotonic.threshold,
+   993→    plattThreshold: oosPlatt.threshold,
+   994→    nestedCVF1: nestedAvgF1,
+   995→    nestedCVResults: nestedResults,
+   996→    aucROCLift,
+   997→    prAUCLift,
+   998→    aucEffectSize,
+   999→    prEffectSize,
+  1000→    f1EffectSize,
+  1001→    calibratedCalibrationPerRegime,
+  1002→    description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : nestedAvgF1 > 0.15 ? `Meta-model weak OOS (nested CV F1=${nestedAvgF1.toFixed(2)}, isotonic F1=${oosIsotonic.f1.toFixed(2)})` : `Meta-model no OOS value (nested CV F1=${nestedAvgF1.toFixed(2)}, raw F1=${oosRaw.f1.toFixed(2)})`,
+  1003→  };
+  1004→
+  1005→  return {
+  1006→    probability, probabilityPct, direction, confidence,
+  1007→    features: currentFeatures,
+  1008→    modelAccuracy: model.accuracy,
+  1009→    brierScore: model.brierScore,
+  1010→    calibration: model.calibration,
+  1011→    calibrationPerRegime: model.calibrationPerRegime,
+  1012→    featureImportance: model.featureImportance,
+  1013→    ablation: model.ablation,
+  1014→    permutationImportance: model.permutationImportance,
+  1015→    aucROC: model.aucROC,
+  1016→    aucPR: model.aucPR,
+  1017→    lrStat: model.lrStat,
+  1018→    lrDF: model.lrDF,
+  1019→    lrPValue: model.lrPValue,
+  1020→    tripleBarrier,
+  1021→    metaModel,
+  1022→    trainingSamples: featureList.length,
+  1023→    description,
+  1024→  };
+  1025→}
+  1026→

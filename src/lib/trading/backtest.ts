@@ -164,11 +164,45 @@ export interface StrategyComparison {
   rank: number;
 }
 
+// P4: Block correlation analysis types
+export interface BlockStats {
+  name: string;
+  size: number;             // number of strategies in block
+  avgCorrelation: number;   // mean pairwise correlation within block
+  maxCorrelation: number;
+  minCorrelation: number;
+  pairs: number;            // number of strategy pairs analyzed
+  interpretation: string;   // human-readable verdict on intra-block redundancy
+}
+export interface BlockCorrelationAnalysis {
+  trendBlock: BlockStats;
+  reversionBlock: BlockStats;
+  confluenceBlock: BlockStats;
+  crossBlockAvg: number;    // avg pairwise correlation between strategies in DIFFERENT blocks
+  crossBlockMax: number;
+  overallAvg: number;
+  description: string;
+}
+function emptyBlock(): BlockStats {
+  return { name: "", size: 0, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, interpretation: "empty" };
+}
+
 // Effective trial count via eigenvalue participation ratio (Lopez de Prado)
 // N_eff = (sum λ)² / sum λ² = (trace(C))² / trace(C²)
 // For correlation matrix: trace(C) = N, trace(C²) = sum of all C[i,j]²
-function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, candleCount?: number): { trials: number; participationRatio: number; avgCorrEstimate: number; avgCorrelation: number; description: string } {
-  if (nStrategies < 2 || equityCurves.length < 2) return { trials: Math.max(1, nStrategies * 25), participationRatio: nStrategies, avgCorrEstimate: nStrategies, avgCorrelation: 0, description: "Too few strategies" };
+function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, candleCount?: number, strategyNamesInput: string[] = []): { trials: number; participationRatio: number; avgCorrEstimate: number; avgCorrelation: number; description: string; blockCorrelation: BlockCorrelationAnalysis; correlationMatrix: number[][]; strategyNames: string[] } {
+  if (nStrategies < 2 || equityCurves.length < 2) {
+    return {
+      trials: Math.max(1, nStrategies * 25),
+      participationRatio: nStrategies,
+      avgCorrEstimate: nStrategies,
+      avgCorrelation: 0,
+      description: "Too few strategies",
+      blockCorrelation: { trendBlock: emptyBlock(), reversionBlock: emptyBlock(), confluenceBlock: emptyBlock(), crossBlockAvg: 0, crossBlockMax: 0, overallAvg: 0, description: "N/A" },
+      correlationMatrix: [],
+      strategyNames: strategyNamesInput,
+    };
+  }
   const N = nStrategies;
   const nCandles = candleCount || Math.max(...equityCurves.map(e => e.length));
 
@@ -226,15 +260,45 @@ function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, c
   // Method 2: Average correlation estimator N_eff = N / (1 + (N-1) * ρ_avg)
   const avgCorr = offDiagCount > 0 ? offDiagSum / offDiagCount : 0;
   const avgCorrEstimate = N / (1 + (N - 1) * avgCorr);
-  // Block correlation: group by strategy type
-  // Trend-following: sma_cross, macd_trend, donchian_breakout, trend_filter_sma
-  // Mean-reversion: rsi_reversal, bollinger_breakout, stochastic_reversal, mean_reversion
-  // Confluence: multi_confluence
-  // Compute average within-block correlation for trend-following block
-  const trendIdx = [0, 3, 7, 8]; // sma_cross, macd_trend, trend_filter_sma, donchian_breakout
-  let trendCorrSum = 0, trendCorrCount = 0;
-  for (const i of trendIdx) for (const j of trendIdx) if (i < j) { trendCorrSum += corr[i][j]; trendCorrCount++; }
-  const trendBlockCorr = trendCorrCount > 0 ? trendCorrSum / trendCorrCount : 0;
+
+  // P4: Structured block correlation analysis
+  // Strategy type blocks (by index in strategies array):
+  //   Trend-following: sma_cross(0), macd_trend(3), trend_filter_sma(7), donchian_breakout(8)
+  //   Mean-reversion:  rsi_reversal(1), bollinger_breakout(2), stochastic_reversal(4), mean_reversion(5)
+  //   Confluence:      multi_confluence(6)
+  const trendIdx = [0, 3, 7, 8].filter(i => i < N);
+  const revIdx = [1, 2, 4, 5].filter(i => i < N);
+  const confIdx = [6].filter(i => i < N);
+  const blockStats = (idx: number[], name: string): BlockStats => {
+    if (idx.length < 2) return { name, size: idx.length, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, interpretation: "singleton or empty block" };
+    const corrs: number[] = [];
+    for (const i of idx) for (const j of idx) if (i < j) corrs.push(corr[i][j]);
+    const avg = corrs.reduce((a, b) => a + b, 0) / corrs.length;
+    const max = Math.max(...corrs);
+    const min = Math.min(...corrs);
+    const interpretation = avg > 0.7 ? "very high intra-block correlation — effectively 1 strategy" : avg > 0.4 ? "high intra-block correlation — strategies are redundant" : avg > 0.2 ? "moderate intra-block correlation" : avg > 0 ? "low intra-block correlation — strategies are independent" : "no intra-block correlation";
+    return { name, size: idx.length, avgCorrelation: avg, maxCorrelation: max, minCorrelation: min, pairs: corrs.length, interpretation };
+  };
+  // Cross-block correlation: average pairwise correlation between strategies in DIFFERENT blocks
+  const crossCorrs: number[] = [];
+  const allBlocks: number[][] = [trendIdx, revIdx, confIdx];
+  for (let bi = 0; bi < allBlocks.length; bi++) {
+    for (let bj = bi + 1; bj < allBlocks.length; bj++) {
+      for (const i of allBlocks[bi]) for (const j of allBlocks[bj]) if (i !== j) crossCorrs.push(corr[i][j]);
+    }
+  }
+  const crossBlockAvg = crossCorrs.length > 0 ? crossCorrs.reduce((a, b) => a + b, 0) / crossCorrs.length : 0;
+  const crossBlockMax = crossCorrs.length > 0 ? Math.max(...crossCorrs) : 0;
+  const blockCorrelation: BlockCorrelationAnalysis = {
+    trendBlock: blockStats(trendIdx, "Trend-following"),
+    reversionBlock: blockStats(revIdx, "Mean-reversion"),
+    confluenceBlock: blockStats(confIdx, "Confluence"),
+    crossBlockAvg,
+    crossBlockMax,
+    overallAvg: avgCorr,
+    description: `Trend block ρ=${blockStats(trendIdx, "").avgCorrelation.toFixed(2)} | Reversion block ρ=${blockStats(revIdx, "").avgCorrelation.toFixed(2)} | Cross-block ρ=${crossBlockAvg.toFixed(2)} | Overall ρ=${avgCorr.toFixed(2)}`,
+  };
+
   // Use the more conservative (lower) of the two estimates
   const conservativeEff = Math.min(participationRatio, avgCorrEstimate);
   const effectiveTrials = Math.max(1, Math.round(conservativeEff * 25));
@@ -243,7 +307,10 @@ function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, c
     participationRatio: Math.round(participationRatio * 10) / 10,
     avgCorrEstimate: Math.round(avgCorrEstimate * 10) / 10,
     avgCorrelation: Math.round(avgCorr * 1000) / 1000,
-    description: `Event-time aligned (${eventCount} active bars / ${nCandles} total) | Participation ratio: ${participationRatio.toFixed(1)} | Avg-corr: ${avgCorrEstimate.toFixed(1)} (ρ_avg=${avgCorr.toFixed(3)}) | Trend block ρ=${trendBlockCorr.toFixed(3)} | Conservative N_eff=${conservativeEff.toFixed(1)} → ${effectiveTrials} trials`,
+    description: `Event-time aligned (${eventCount} active bars / ${nCandles} total) | Participation ratio: ${participationRatio.toFixed(1)} | Avg-corr: ${avgCorrEstimate.toFixed(1)} (ρ_avg=${avgCorr.toFixed(3)}) | Trend block ρ=${blockCorrelation.trendBlock.avgCorrelation.toFixed(3)} | Conservative N_eff=${conservativeEff.toFixed(1)} → ${effectiveTrials} trials`,
+    blockCorrelation,
+    correlationMatrix: corr,
+    strategyNames: strategyNamesInput,
   };
 }
 
@@ -321,7 +388,8 @@ export function compareStrategies(candles: Candle[], config: Omit<BacktestConfig
   const strategySharpes = results.filter(r => r.strategy !== "buy_hold").map(r => r.sharpeRatio);
   const N_strategies = strategySharpes.length;
   // Compute effective trials via dual estimator on CANDLE-ALIGNED returns
-  const effTrialsInfo = computeEffectiveTrials(equityCurves, N_strategies, candles.length);
+  const strategyNameList = strategies.slice(0, N_strategies);
+  const effTrialsInfo = computeEffectiveTrials(equityCurves, N_strategies, candles.length, strategyNameList);
   const effectiveTrials = effTrialsInfo.trials;
 
   const bestSharpe = Math.max(...strategySharpes, 0);
@@ -664,6 +732,32 @@ export interface MonteCarloResult {
   profitProbability: number;     // % of sims that ended profitable
 }
 
+export interface FeeScenario {
+  name: string;
+  description: string;
+  entryFeeRate: number;  // fee rate applied on entry (fraction)
+  exitFeeRate: number;   // fee rate applied on exit (fraction)
+  totalFees: number;     // total fee paid in this scenario
+  netProfit: number;     // net profit with this fee scenario
+  profitFactor: number;  // profit factor with this fee scenario
+  winRate: number;       // win rate with this fee scenario
+  feeSavingVsTaker: number; // how much saved vs pure taker scenario
+  feeSavingPct: number;     // % saving vs pure taker
+}
+
+export interface FeeBreakdown {
+  takerFeeRate: number;    // 0.003 = 0.3% INDODAX taker
+  makerFeeRate: number;    // 0.000 = 0.0% INDODAX maker (limit order)
+  spreadPct: number;       // 0.001 = 0.1% bid-ask spread
+  slippagePct: number;     // 0.0005 = 0.05% slippage
+  costPerSideTaker: number;  // total cost per side (taker execution)
+  costPerSideMaker: number;  // total cost per side (maker execution, no spread/slippage)
+  costPerSideHybrid: number; // maker entry + taker exit
+  savingsMakerVsTakerPct: number; // % cost reduction with pure maker
+  savingsHybridVsTakerPct: number;
+  note: string;
+}
+
 export interface BacktestResult {
   trades: BacktestTrade[];
   netProfit: number; profitFactor: number; maxDrawdown: number;
@@ -676,6 +770,9 @@ export interface BacktestResult {
   sortinoRatio: number;
   calmarRatio: number;
   monteCarlo: MonteCarloResult | null;
+  // P3: Maker fee modeling — 3 execution scenarios
+  feeScenarios: FeeScenario[];
+  feeBreakdown: FeeBreakdown;
 }
 
 export interface BacktestConfig {
@@ -694,11 +791,12 @@ function executionCost(price: number, feeRate: number, spreadPct: number, slippa
 }
 
 export function runBacktest(candles: Candle[], config: BacktestConfig): BacktestResult {
-  const fee = config.feeRate ?? 0.003;
+  const fee = config.feeRate ?? 0.003;          // taker fee (0.3% INDODAX)
+  const makerFee = config.makerFeeRate ?? 0;     // maker fee (0% INDODAX limit order)
   const spreadPct = config.spreadPct ?? 0.001;    // 0.1% spread
   const slippagePct = config.slippagePct ?? 0.0005; // 0.05% slippage
   const realistic = config.useRealisticFees !== false; // default true
-  // Total cost per side: taker fee + spread/2 + slippage
+  // Total cost per side: taker fee + spread/2 + slippage (taker = market order)
   const costPerSide = realistic ? fee + spreadPct / 2 + slippagePct : fee;
   const sl = config.stopLossPct, tp = config.takeProfitPct;
   let trades: BacktestTrade[] = [];
@@ -758,6 +856,85 @@ export function runBacktest(candles: Candle[], config: BacktestConfig): Backtest
   // Monte Carlo (only if enough trades)
   const mc = trades.length >= 10 ? runMonteCarlo(trades, config.initialCapital, 1000, 0.20) : null;
 
+  // P3: Maker fee modeling — recompute trades under 3 execution scenarios
+  // The strategy decides WHEN to enter/exit; the fee model decides HOW MUCH we pay.
+  // 1. Pure taker: entry market + exit market (current default, baseline)
+  // 2. Hybrid (realistic): entry limit (maker, no spread/slippage) + exit market (taker, with spread/slippage)
+  //    — Stop-loss/take-profit exits MUST be market orders (need immediate fill)
+  //    — Signal exits can be limit (assume patient)
+  //    — Conservative: assume ALL exits are taker (worst case for hybrid)
+  // 3. Pure maker: entry limit + exit limit (theoretical best case, requires price to cross twice)
+  const costPerSideTaker = costPerSide; // baseline (already includes spread/slippage)
+  const costPerSideMaker = makerFee;    // maker only, no spread/slippage (limit order at top of book)
+  const costPerSideHybridEntry = makerFee;                                  // maker entry
+  const costPerSideHybridExit = fee + spreadPct / 2 + slippagePct;          // taker exit (worst case)
+  // Recompute PnL per trade under each scenario: PnL = exitPrice - entryPrice - entryFee - exitFee
+  function recomputeScenario(entryRate: number, exitRate: number) {
+    let np = 0, tf = 0, winsCount = 0;
+    const pnls: number[] = [];
+    for (const t of trades) {
+      const entryFee = t.entryPrice * entryRate;
+      const exitFee = t.exitPrice * exitRate;
+      const pnl = t.exitPrice - t.entryPrice - entryFee - exitFee;
+      np += pnl;
+      tf += entryFee + exitFee;
+      pnls.push(pnl);
+      if (pnl > 0) winsCount++;
+    }
+    const w = pnls.filter(p => p > 0);
+    const l = pnls.filter(p => p <= 0);
+    const aw = w.length > 0 ? w.reduce((a, b) => a + b, 0) / w.length : 0;
+    const al = l.length > 0 ? Math.abs(l.reduce((a, b) => a + b, 0) / l.length) : 0;
+    const pf = al > 0 ? aw / al : w.length > 0 ? Infinity : 0;
+    return { netProfit: np, totalFees: tf, profitFactor: pf, winRate: trades.length > 0 ? (winsCount / trades.length) * 100 : 0 };
+  }
+  const takerScn = recomputeScenario(costPerSideTaker, costPerSideTaker);
+  const hybridScn = recomputeScenario(costPerSideHybridEntry, costPerSideHybridExit);
+  const makerScn = recomputeScenario(costPerSideMaker, costPerSideMaker);
+  const feeScenarios: FeeScenario[] = [
+    {
+      name: "Pure Taker",
+      description: "Entry market + exit market (0.3% taker + spread + slippage per side)",
+      entryFeeRate: costPerSideTaker, exitFeeRate: costPerSideTaker,
+      totalFees: takerScn.totalFees, netProfit: takerScn.netProfit,
+      profitFactor: isFinite(takerScn.profitFactor) ? takerScn.profitFactor : 999,
+      winRate: takerScn.winRate,
+      feeSavingVsTaker: 0, feeSavingPct: 0,
+    },
+    {
+      name: "Hybrid (Realistic)",
+      description: "Entry limit (maker 0%) + exit market (taker, SL/TP must fill)",
+      entryFeeRate: costPerSideHybridEntry, exitFeeRate: costPerSideHybridExit,
+      totalFees: hybridScn.totalFees, netProfit: hybridScn.netProfit,
+      profitFactor: isFinite(hybridScn.profitFactor) ? hybridScn.profitFactor : 999,
+      winRate: hybridScn.winRate,
+      feeSavingVsTaker: takerScn.totalFees - hybridScn.totalFees,
+      feeSavingPct: takerScn.totalFees > 0 ? ((takerScn.totalFees - hybridScn.totalFees) / takerScn.totalFees) * 100 : 0,
+    },
+    {
+      name: "Pure Maker (Theoretical)",
+      description: "Entry + exit both limit orders (requires price crossing twice — rarely achievable)",
+      entryFeeRate: costPerSideMaker, exitFeeRate: costPerSideMaker,
+      totalFees: makerScn.totalFees, netProfit: makerScn.netProfit,
+      profitFactor: isFinite(makerScn.profitFactor) ? makerScn.profitFactor : 999,
+      winRate: makerScn.winRate,
+      feeSavingVsTaker: takerScn.totalFees - makerScn.totalFees,
+      feeSavingPct: takerScn.totalFees > 0 ? ((takerScn.totalFees - makerScn.totalFees) / takerScn.totalFees) * 100 : 0,
+    },
+  ];
+  const feeBreakdown: FeeBreakdown = {
+    takerFeeRate: fee,
+    makerFeeRate: makerFee,
+    spreadPct,
+    slippagePct,
+    costPerSideTaker,
+    costPerSideMaker,
+    costPerSideHybrid: costPerSideHybridEntry + costPerSideHybridExit,
+    savingsMakerVsTakerPct: costPerSideTaker > 0 ? ((costPerSideTaker - costPerSideMaker) / costPerSideTaker) * 100 : 0,
+    savingsHybridVsTakerPct: costPerSideTaker > 0 ? ((costPerSideTaker * 2 - (costPerSideHybridEntry + costPerSideHybridExit)) / (costPerSideTaker * 2)) * 100 : 0,
+    note: "INDODAX: maker 0% (limit), taker 0.3% (market). Realistic = hybrid (limit entry + market exit).",
+  };
+
   return {
     trades, netProfit, profitFactor, maxDrawdown: Math.min(maxDD, 100),
     winRate: trades.length > 0 ? (wins.length / trades.length) * 100 : 0,
@@ -767,6 +944,8 @@ export function runBacktest(candles: Candle[], config: BacktestConfig): Backtest
     shortPerformance: shortTrades.reduce((a, t) => a + t.pnl, 0),
     equity: equityCurve, totalFees,
     monteCarlo: mc,
+    feeScenarios,
+    feeBreakdown,
     verdict: assessVerdict(trades.length, profitFactor, Math.min(maxDD, 100), wins.length / Math.max(1, trades.length)),
   };
 }

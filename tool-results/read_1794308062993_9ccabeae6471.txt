@@ -1,0 +1,919 @@
+     1→// Backtest engine v2 — with fee modeling, proper metrics (Sortino/Calmar),
+     2→// Monte Carlo analysis (ported from jesse/quantstats methodology), and
+     3→// 6 strategies. Adapted from DaviddTech/ai-trading-agent framework.
+     4→// Trades on REAL historical OHLCV candles (via ccxt-provider / INDODAX).
+     5→
+     6→export interface Candle { time: number; open: number; high: number; low: number; close: number; volume: number }
+     7→export interface BacktestTrade {
+     8→  entryTime: number; exitTime: number; entryPrice: number; exitPrice: number;
+     9→  side: "long" | "short"; pnl: number; pnlPct: number; entryFee: number; exitFee: number;
+    10→}
+    11→
+    12→// ── Strategy names ──
+    13→
+    14→export type StrategyName =
+    15→  | "sma_cross" | "rsi_reversal" | "bollinger_breakout"
+    16→  | "macd_trend" | "stochastic_reversal" | "mean_reversion" | "multi_confluence"
+    17→  | "trend_filter_sma" | "donchian_breakout";
+    18→
+    19→// ── Indicator helpers (self-contained for backtest) ──
+    20→
+    21→function sma(data: number[], period: number, idx: number): number | null {
+    22→  if (idx < period - 1) return null;
+    23→  let s = 0;
+    24→  for (let i = idx - period + 1; i <= idx; i++) s += data[i];
+    25→  return s / period;
+    26→}
+    27→
+    28→function ema(data: number[], period: number): number[] {
+    29→  const out: number[] = [];
+    30→  const k = 2 / (period + 1);
+    31→  let prev = data[0];
+    32→  for (let i = 0; i < data.length; i++) {
+    33→    prev = i === 0 ? data[0] : data[i] * k + prev * (1 - k);
+    34→    out.push(prev);
+    35→  }
+    36→  return out;
+    37→}
+    38→
+    39→function rsiArr(closes: number[], period: number): number[] {
+    40→  const out: number[] = new Array(closes.length).fill(50);
+    41→  let avgGain = 0, avgLoss = 0;
+    42→  for (let i = 1; i <= period && i < closes.length; i++) {
+    43→    const d = closes[i] - closes[i - 1];
+    44→    if (d > 0) avgGain += d; else avgLoss -= d;
+    45→  }
+    46→  avgGain /= period; avgLoss /= period;
+    47→  if (period < closes.length) out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+    48→  for (let i = period + 1; i < closes.length; i++) {
+    49→    const d = closes[i] - closes[i - 1];
+    50→    const gain = d > 0 ? d : 0, loss = d < 0 ? -d : 0;
+    51→    avgGain = (avgGain * (period - 1) + gain) / period;
+    52→    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    53→    out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+    54→  }
+    55→  return out;
+    56→}
+    57→
+    58→function stddev(data: number[], period: number, idx: number): number {
+    59→  if (idx < period - 1) return 0;
+    60→  const slice = data.slice(idx - period + 1, idx + 1);
+    61→  const m = slice.reduce((a, b) => a + b, 0) / period;
+    62→  const v = slice.reduce((a, b) => a + (b - m) ** 2, 0) / period;
+    63→  return Math.sqrt(v);
+    64→}
+    65→
+    66→function macdHist(closes: number[]): number[] {
+    67→  const ema12 = ema(closes, 12);
+    68→  const ema26 = ema(closes, 26);
+    69→  const line = closes.map((_, i) => ema12[i] - ema26[i]);
+    70→  const signal = ema(line, 9);
+    71→  return line.map((l, i) => l - signal[i]);
+    72→}
+    73→
+    74→function stochastic(highs: number[], lows: number[], closes: number[], period: number, idx: number): number {
+    75→  if (idx < period) return 50;
+    76→  let hh = -Infinity, ll = Infinity;
+    77→  for (let i = idx - period + 1; i <= idx; i++) {
+    78→    if (highs[i] > hh) hh = highs[i];
+    79→    if (lows[i] < ll) ll = lows[i];
+    80→  }
+    81→  if (hh === ll) return 50;
+    82→  return 100 * (closes[idx] - ll) / (hh - ll);
+    83→}
+    84→
+    85→// ADX (Average Directional Index) — Wilder's method, trend strength filter
+    86→// ADX > 25 = trending, < 20 = choppy/ranging
+    87→function adxArr(highs: number[], lows: number[], closes: number[], period = 14): number[] {
+    88→  const n = closes.length;
+    89→  const out: number[] = new Array(n).fill(0);
+    90→  if (n < period * 2) return out;
+    91→  const tr: number[] = new Array(n).fill(0);
+    92→  const plusDM: number[] = new Array(n).fill(0);
+    93→  const minusDM: number[] = new Array(n).fill(0);
+    94→  for (let i = 1; i < n; i++) {
+    95→    const h = highs[i], l = lows[i], pc = closes[i - 1];
+    96→    const up = h - highs[i - 1], dn = lows[i - 1] - l;
+    97→    tr[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    98→    plusDM[i] = up > dn && up > 0 ? up : 0;
+    99→    minusDM[i] = dn > up && dn > 0 ? dn : 0;
+   100→  }
+   101→  // Wilder smoothing
+   102→  let trS = 0, pS = 0, mS = 0;
+   103→  for (let i = 1; i <= period; i++) { trS += tr[i]; pS += plusDM[i]; mS += minusDM[i]; }
+   104→  const dx: number[] = new Array(n).fill(0);
+   105→  for (let i = period + 1; i < n; i++) {
+   106→    trS = trS - trS / period + tr[i];
+   107→    pS = pS - pS / period + plusDM[i];
+   108→    mS = mS - mS / period + minusDM[i];
+   109→    const pDI = trS > 0 ? 100 * pS / trS : 0;
+   110→    const mDI = trS > 0 ? 100 * mS / trS : 0;
+   111→    dx[i] = (pDI + mDI) > 0 ? 100 * Math.abs(pDI - mDI) / (pDI + mDI) : 0;
+   112→  }
+   113→  // ADX = Wilder smoothing of DX
+   114→  let adx = 0;
+   115→  for (let i = period + 1; i <= period * 2 && i < n; i++) adx += dx[i];
+   116→  adx /= period;
+   117→  out[Math.min(period * 2, n - 1)] = adx;
+   118→  for (let i = period * 2 + 1; i < n; i++) { adx = (adx * (period - 1) + dx[i]) / period; out[i] = adx; }
+   119→  return out;
+   120→}
+   121→
+   122→// ── Strategies ──
+   123→
+   124→function openPosition(trades: BacktestTrade[], pos: { entryTime: number; entryPrice: number } | null, candles: Candle[], i: number, feeRate: number): { entryTime: number; entryPrice: number; fee: number } | null {
+   125→  if (pos) return null;
+   126→  const fee = candles[i].close * feeRate;
+   127→  return { entryTime: candles[i].time, entryPrice: candles[i].close, fee };
+   128→}
+   129→
+   130→function closeTrade(pos: { entryTime: number; entryPrice: number; fee: number }, candles: Candle[], i: number, feeRate: number): BacktestTrade {
+   131→  const exitPrice = candles[i].close;
+   132→  const exitFee = exitPrice * feeRate;
+   133→  // PnL per unit = exitPrice - entryPrice, minus fees (fees are per unit)
+   134→  const pnlPerUnit = exitPrice - pos.entryPrice - pos.fee - exitFee;
+   135→  const pnlPct = (pnlPerUnit / pos.entryPrice) * 100;
+   136→  return { entryTime: pos.entryTime, exitTime: candles[i].time, entryPrice: pos.entryPrice, exitPrice, side: "long", pnl: pnlPerUnit, pnlPct, entryFee: pos.fee, exitFee };
+   137→}
+   138→
+   139→// ── ATR (Average True Range) — for volatility-adaptive position sizing ──
+   140→
+   141→export function calcATR(candles: Candle[], period = 14): number {
+   142→  if (candles.length < period + 1) return 0;
+   143→  const trs: number[] = [];
+   144→  for (let i = 1; i < candles.length; i++) {
+   145→    const h = candles[i].high, l = candles[i].low, pc = candles[i - 1].close;
+   146→    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+   147→  }
+   148→  // Wilder's smoothing
+   149→  let atr = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
+   150→  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
+   151→  return atr;
+   152→}
+   153→
+   154→// ── Strategy comparison: run all strategies on same candles, rank them ──
+   155→
+   156→export interface StrategyComparison {
+   157→  strategy: StrategyName;
+   158→  trades: number; netProfit: number; profitFactor: number; winRate: number;
+   159→  maxDrawdown: number; sharpeRatio: number; sortinoRatio: number;
+   160→  totalFees: number;
+   161→  monteCarloBust: number | null; // null if <10 trades
+   162→  monteCarloProfit: number | null;
+   163→  verdict: string;
+   164→  rank: number;
+   165→}
+   166→
+   167→// Effective trial count via eigenvalue participation ratio (Lopez de Prado)
+   168→// N_eff = (sum λ)² / sum λ² = (trace(C))² / trace(C²)
+   169→// For correlation matrix: trace(C) = N, trace(C²) = sum of all C[i,j]²
+   170→function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, candleCount?: number): { trials: number; participationRatio: number; avgCorrEstimate: number; avgCorrelation: number; description: string } {
+   171→  if (nStrategies < 2 || equityCurves.length < 2) return { trials: Math.max(1, nStrategies * 25), participationRatio: nStrategies, avgCorrEstimate: nStrategies, avgCorrelation: 0, description: "Too few strategies" };
+   172→  const N = nStrategies;
+   173→  const nCandles = candleCount || Math.max(...equityCurves.map(e => e.length));
+   174→
+   175→  // P1 FIX: Event-time alignment — compute correlation ONLY on bars where
+   176→  // at least one strategy has a trade. This avoids the sparse-trade problem
+   177→  // where flat equity between trades produces zero returns and artifactual
+   178→  // low correlation.
+   179→  const alignedEquity: number[][] = equityCurves.map(eq => {
+   180→    if (eq.length === 0) return Array(nCandles).fill(0);
+   181→    const filled: number[] = [];
+   182→    const step = nCandles / eq.length;
+   183→    for (let i = 0; i < nCandles; i++) {
+   184→      const srcIdx = Math.min(eq.length - 1, Math.floor(i / step));
+   185→      filled.push(eq[srcIdx]);
+   186→    }
+   187→    return filled;
+   188→  });
+   189→  // Per-candle returns
+   190→  const rawReturns: number[][] = alignedEquity.map(eq => {
+   191→    const ret: number[] = [];
+   192→    for (let i = 1; i < eq.length; i++) if (eq[i - 1] > 0) ret.push((eq[i] - eq[i - 1]) / eq[i - 1]);
+   193→    return ret;
+   194→  });
+   195→  // Event-time filter: keep only bars where at least one strategy has non-zero return
+   196→  const eventMask: boolean[] = [];
+   197→  for (let i = 0; i < rawReturns[0]?.length ?? 0; i++) {
+   198→    let anyNonZero = false;
+   199→    for (let s = 0; s < N; s++) {
+   200→      if (Math.abs(rawReturns[s]?.[i] ?? 0) > 1e-10) { anyNonZero = true; break; }
+   201→    }
+   202→    eventMask.push(anyNonZero);
+   203→  }
+   204→  const eventCount = eventMask.filter(Boolean).length;
+   205→  const returns: number[][] = rawReturns.map(r => r.filter((_, i) => eventMask[i]));
+   206→  const corr: number[][] = Array(N).fill(0).map(() => Array(N).fill(0));
+   207→  let offDiagSum = 0, offDiagCount = 0;
+   208→  for (let i = 0; i < N; i++) {
+   209→    for (let j = 0; j < N; j++) {
+   210→      if (i === j) { corr[i][j] = 1; continue; }
+   211→      const ri = returns[i], rj = returns[j];
+   212→      const len = Math.min(ri.length, rj.length);
+   213→      if (len < 2) { corr[i][j] = 0; continue; }
+   214→      const mi = ri.slice(0, len).reduce((a, b) => a + b, 0) / len;
+   215→      const mj = rj.slice(0, len).reduce((a, b) => a + b, 0) / len;
+   216→      let cov = 0, vi = 0, vj = 0;
+   217→      for (let k = 0; k < len; k++) { const di = ri[k] - mi, dj = rj[k] - mj; cov += di * dj; vi += di * di; vj += dj * dj; }
+   218→      corr[i][j] = (vi > 0 && vj > 0) ? cov / Math.sqrt(vi * vj) : 0;
+   219→      offDiagSum += corr[i][j]; offDiagCount++;
+   220→    }
+   221→  }
+   222→  // Method 1: Participation ratio N_eff = (trace)² / trace(C²)
+   223→  let sumSquared = 0;
+   224→  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) sumSquared += corr[i][j] * corr[i][j];
+   225→  const participationRatio = sumSquared > 0 ? (N * N) / sumSquared : N;
+   226→  // Method 2: Average correlation estimator N_eff = N / (1 + (N-1) * ρ_avg)
+   227→  const avgCorr = offDiagCount > 0 ? offDiagSum / offDiagCount : 0;
+   228→  const avgCorrEstimate = N / (1 + (N - 1) * avgCorr);
+   229→  // Block correlation: group by strategy type
+   230→  // Trend-following: sma_cross, macd_trend, donchian_breakout, trend_filter_sma
+   231→  // Mean-reversion: rsi_reversal, bollinger_breakout, stochastic_reversal, mean_reversion
+   232→  // Confluence: multi_confluence
+   233→  // Compute average within-block correlation for trend-following block
+   234→  const trendIdx = [0, 3, 7, 8]; // sma_cross, macd_trend, trend_filter_sma, donchian_breakout
+   235→  let trendCorrSum = 0, trendCorrCount = 0;
+   236→  for (const i of trendIdx) for (const j of trendIdx) if (i < j) { trendCorrSum += corr[i][j]; trendCorrCount++; }
+   237→  const trendBlockCorr = trendCorrCount > 0 ? trendCorrSum / trendCorrCount : 0;
+   238→  // Use the more conservative (lower) of the two estimates
+   239→  const conservativeEff = Math.min(participationRatio, avgCorrEstimate);
+   240→  const effectiveTrials = Math.max(1, Math.round(conservativeEff * 25));
+   241→  return {
+   242→    trials: effectiveTrials,
+   243→    participationRatio: Math.round(participationRatio * 10) / 10,
+   244→    avgCorrEstimate: Math.round(avgCorrEstimate * 10) / 10,
+   245→    avgCorrelation: Math.round(avgCorr * 1000) / 1000,
+   246→    description: `Event-time aligned (${eventCount} active bars / ${nCandles} total) | Participation ratio: ${participationRatio.toFixed(1)} | Avg-corr: ${avgCorrEstimate.toFixed(1)} (ρ_avg=${avgCorr.toFixed(3)}) | Trend block ρ=${trendBlockCorr.toFixed(3)} | Conservative N_eff=${conservativeEff.toFixed(1)} → ${effectiveTrials} trials`,
+   247→  };
+   248→}
+   249→
+   250→// CSCV (Combinatorial Symmetric Cross-Validation) for PBO
+   251→// Lopez de Prado method: split data into N subsets, for each combination
+   252→// of N-1 train + 1 test, check if best in-sample is best out-of-sample.
+   253→export function computeCSCV(candles: Candle[], config: Omit<BacktestConfig, "strategy">, nSubsets = 8): { pbo: number; combinations: number; description: string } {
+   254→  const strategies: StrategyName[] = ["sma_cross", "rsi_reversal", "bollinger_breakout", "macd_trend", "stochastic_reversal", "mean_reversion", "multi_confluence", "trend_filter_sma", "donchian_breakout"];
+   255→  if (candles.length < nSubsets * 20) return { pbo: 50, combinations: 0, description: "Not enough data for CSCV" };
+   256→
+   257→  const subsetSize = Math.floor(candles.length / nSubsets);
+   258→  let bestInSampleNotBestOOS = 0;
+   259→  let totalCombos = 0;
+   260→
+   261→  for (let testIdx = 0; testIdx < nSubsets; testIdx++) {
+   262→    const testStart = testIdx * subsetSize;
+   263→    const testEnd = testIdx === nSubsets - 1 ? candles.length : (testIdx + 1) * subsetSize;
+   264→    const testCandles = candles.slice(testStart, testEnd);
+   265→    const trainCandles = [...candles.slice(0, testStart), ...candles.slice(testEnd)];
+   266→
+   267→    if (trainCandles.length < 30 || testCandles.length < 10) continue;
+   268→
+   269→    // Run all strategies on train and test
+   270→    const trainResults = strategies.map(s => ({ s, r: runBacktest(trainCandles, { ...config, strategy: s }) }));
+   271→    const testResults = strategies.map(s => ({ s, r: runBacktest(testCandles, { ...config, strategy: s }) }));
+   272→
+   273→    // Find best in-sample (by net profit)
+   274→    const bestInSample = trainResults.reduce((best, cur) => cur.r.netProfit > best.r.netProfit ? cur : best);
+   275→    // Find best out-of-sample (by net profit)
+   276→    const bestOOS = testResults.reduce((best, cur) => cur.r.netProfit > best.r.netProfit ? cur : best);
+   277→
+   278→    if (bestInSample.s !== bestOOS.s) bestInSampleNotBestOOS++;
+   279→    totalCombos++;
+   280→  }
+   281→
+   282→  const pbo = totalCombos > 0 ? (bestInSampleNotBestOOS / totalCombos) * 100 : 50;
+   283→  return {
+   284→    pbo,
+   285→    combinations: totalCombos,
+   286→    description: `CSCV: ${bestInSampleNotBestOOS}/${totalCombos} combinations where best in-sample ≠ best out-of-sample → PBO ${pbo.toFixed(0)}%`,
+   287→  };
+   288→}
+   289→
+   290→export function compareStrategies(candles: Candle[], config: Omit<BacktestConfig, "strategy">): StrategyComparison[] {
+   291→  const strategies: StrategyName[] = ["sma_cross", "rsi_reversal", "bollinger_breakout", "macd_trend", "stochastic_reversal", "mean_reversion", "multi_confluence", "trend_filter_sma", "donchian_breakout"];
+   292→  // Buy & Hold benchmark — just hold for the full period
+   293→  const buyHold = candles.length >= 2 ? (() => {
+   294→    const first = candles[0].close, last = candles[candles.length - 1].close;
+   295→    const pnl = (last - first) / first; // fraction
+   296→    const netProfit = config.initialCapital * pnl;
+   297→    const pnlPct = pnl * 100;
+   298→    // drawdown of buy & hold
+   299→    let peak = candles[0].close, maxDD = 0;
+   300→    for (const c of candles) { if (c.close > peak) peak = c.close; const dd = (peak - c.close) / peak * 100; if (dd > maxDD) maxDD = dd; }
+   301→    return { netProfit, pnlPct, maxDrawdown: maxDD, trades: 1, profitFactor: pnl > 0 ? 999 : 0, winRate: pnl > 0 ? 100 : 0, sharpeRatio: 0, sortinoRatio: 0, totalFees: 0, monteCarloBust: 0, monteCarloProfit: pnl > 0 ? 100 : 0, verdict: pnl > 0 ? "Benchmark" : "Reject", rank: 0 };
+   302→  })() : null;
+   303→
+   304→  // Save equity curves for correlation-based effective trial count
+   305→  const equityCurves: number[][] = [];
+   306→  const results: StrategyComparison[] = strategies.map(s => {
+   307→    const r = runBacktest(candles, { ...config, strategy: s });
+   308→    // Save equity curve values for correlation computation
+   309→    equityCurves.push(r.equity.map(e => e.value));
+   310→    return {
+   311→      strategy: s, trades: r.tradeCount, netProfit: r.netProfit, profitFactor: isFinite(r.profitFactor) ? r.profitFactor : 999,
+   312→      winRate: r.winRate, maxDrawdown: r.maxDrawdown, sharpeRatio: r.sharpeRatio, sortinoRatio: r.sortinoRatio,
+   313→      totalFees: r.totalFees, monteCarloBust: r.monteCarlo?.bustProbability ?? null, monteCarloProfit: r.monteCarlo?.profitProbability ?? null,
+   314→      verdict: r.verdict, rank: 0,
+   315→    };
+   316→  });
+   317→  // add buy & hold as a benchmark row
+   318→  if (buyHold) results.push({ strategy: "buy_hold" as StrategyName, ...buyHold, rank: 0 });
+   319→
+   320→  // P3: Deflated Sharpe Ratio — with CORRELATION-BASED effective trial count
+   321→  const strategySharpes = results.filter(r => r.strategy !== "buy_hold").map(r => r.sharpeRatio);
+   322→  const N_strategies = strategySharpes.length;
+   323→  // Compute effective trials via dual estimator on CANDLE-ALIGNED returns
+   324→  const effTrialsInfo = computeEffectiveTrials(equityCurves, N_strategies, candles.length);
+   325→  const effectiveTrials = effTrialsInfo.trials;
+   326→
+   327→  const bestSharpe = Math.max(...strategySharpes, 0);
+   328→  const expectedMax = effectiveTrials > 1 ? Math.sqrt(2 * Math.log(effectiveTrials)) : 0;
+   329→  const meanSharpe = strategySharpes.reduce((a, b) => a + b, 0) / Math.max(1, N_strategies);
+   330→  const varSharpe = strategySharpes.reduce((a, b) => a + (b - meanSharpe) ** 2, 0) / Math.max(1, N_strategies);
+   331→  const stdSharpe = Math.sqrt(varSharpe);
+   332→  const deflatedSharpe = stdSharpe > 0 ? bestSharpe - expectedMax * stdSharpe : bestSharpe;
+   333→  const pbo = deflatedSharpe < 0 ? 50 + Math.min(50, Math.abs(deflatedSharpe) * 20) : Math.max(0, 50 - deflatedSharpe * 20);
+   334→
+   335→  // rank by: profitFactor (primary), then sharpe, then lower bust probability
+   336→  results.sort((a, b) => {
+   337→    const aScore = (a.profitFactor > 0 ? Math.log(a.profitFactor) : -10) + a.sharpeRatio - (a.monteCarloBust ?? 50) / 50;
+   338→    const bScore = (b.profitFactor > 0 ? Math.log(b.profitFactor) : -10) + b.sharpeRatio - (b.monteCarloBust ?? 50) / 50;
+   339→    return bScore - aScore;
+   340→  });
+   341→  results.forEach((r, i) => r.rank = i + 1);
+   342→
+   343→  // Attach deflated Sharpe info to the best non-buy_hold strategy
+   344→  const bestNonBH = results.find(r => r.strategy !== "buy_hold");
+   345→  if (bestNonBH) {
+   346→    (bestNonBH as any).__deflatedSharpe = deflatedSharpe;
+   347→    (bestNonBH as any).__pbo = pbo;
+   348→    (bestNonBH as any).__trialsCount = effectiveTrials;
+   349→    (bestNonBH as any).__nStrategies = N_strategies;
+   350→    (bestNonBH as any).__effTrialsInfo = effTrialsInfo;
+   351→  }
+   352→
+   353→  return results;
+   354→}
+   355→
+   356→// Export deflated Sharpe info for the compare API
+   357→export function getDeflatedSharpeInfo(results: StrategyComparison[]): { deflatedSharpe: number; pbo: number; trials: number; nStrategies: number; effTrialsInfo: any } | null {
+   358→  const best = results.find(r => r.strategy !== "buy_hold" && (r as any).__deflatedSharpe !== undefined);
+   359→  if (!best) return null;
+   360→  return {
+   361→    deflatedSharpe: (best as any).__deflatedSharpe,
+   362→    pbo: (best as any).__pbo,
+   363→    trials: (best as any).__trialsCount,
+   364→    nStrategies: (best as any).__nStrategies,
+   365→    effTrialsInfo: (best as any).__effTrialsInfo,
+   366→  };
+   367→}
+   368→
+   369→// ── Parameter grid search: find optimal SL/TP for a strategy ──
+   370→
+   371→export interface GridSearchResult {
+   372→  stopLoss: number; takeProfit: number;
+   373→  netProfit: number; profitFactor: number; winRate: number; maxDrawdown: number;
+   374→  trades: number; sharpeRatio: number; monteCarloBust: number | null;
+   375→}
+   376→
+   377→export function gridSearch(candles: Candle[], strategy: StrategyName, baseConfig: Omit<BacktestConfig, "stopLossPct" | "takeProfitPct">, slRange: number[] = [0.01, 0.02, 0.03, 0.05, 0.08], tpRange: number[] = [0.02, 0.03, 0.05, 0.08, 0.12]): GridSearchResult[] {
+   378→  const results: GridSearchResult[] = [];
+   379→  for (const sl of slRange) {
+   380→    for (const tp of tpRange) {
+   381→      const r = runBacktest(candles, { ...baseConfig, strategy, stopLossPct: sl, takeProfitPct: tp });
+   382→      results.push({
+   383→        stopLoss: sl, takeProfit: tp, netProfit: r.netProfit, profitFactor: isFinite(r.profitFactor) ? r.profitFactor : 999,
+   384→        winRate: r.winRate, maxDrawdown: r.maxDrawdown, trades: r.tradeCount, sharpeRatio: r.sharpeRatio,
+   385→        monteCarloBust: r.monteCarlo?.bustProbability ?? null,
+   386→      });
+   387→    }
+   388→  }
+   389→  // sort by profitFactor desc
+   390→  results.sort((a, b) => b.profitFactor - a.profitFactor);
+   391→  return results;
+   392→}
+   393→
+   394→// ── Walk-Forward Analysis — train/test split, slide forward, detect overfit ──
+   395→
+   396→export interface WalkForwardSegment {
+   397→  segment: number;
+   398→  trainStart: number; trainEnd: number;
+   399→  testStart: number; testEnd: number;
+   400→  trainTrades: number; trainNetProfit: number; trainPF: number;
+   401→  testTrades: number; testNetProfit: number; testPF: number;
+   402→  consistent: boolean; // test performance within 50% of train
+   403→  testProfitable: boolean; // test segment net profit > 0
+   404→}
+   405→
+   406→export interface WalkForwardResult {
+   407→  segments: WalkForwardSegment[];
+   408→  consistentSegments: number;
+   409→  totalSegments: number;
+   410→  consistencyScore: number; // % PF-consistent
+   411→  profitabilityScore: number; // % of test segments with positive net profit (softer metric)
+   412→  overfitRisk: "low" | "medium" | "high"; // based on profitabilityScore: low=>70%, high<40%
+   413→  summary: string;
+   414→}
+   415→
+   416→export function walkForward(candles: Candle[], strategy: StrategyName, config: Omit<BacktestConfig, "strategy">, segments = 4, purgePct = 0.05): WalkForwardResult {
+   417→  const segSize = Math.floor(candles.length / segments);
+   418→  // P1: DYNAMIC PURGE — based on label horizon (not hardcoded 1 bar)
+   419→  // For next-hour label: purge = 1 bar. For 4-hour: purge = 4. For daily: purge = 24 (on 1h candles).
+   420→  // Default: 1 bar (next-hour prediction). Can be overridden via config.params.labelHorizon.
+   421→  const labelHorizon = config.params?.labelHorizon ?? 1;
+   422→  // P2: DYNAMIC EMBARGO — scan features for longest lookback (not hardcoded 20)
+   423→  // Features used: RSI(14), SMA(10/20), Bollinger(20), Stochastic(14), MACD(26), ATR(14)
+   424→  // Longest lookback determines embargo size to prevent feature leakage.
+   425→  const featureLookbacks = [14, 20, 26, config.params?.period ?? 14]; // RSI, SMA/Bollinger, MACD, strategy-specific
+   426→  const longestLookback = Math.max(...featureLookbacks);
+   427→  const purgeSize = Math.max(labelHorizon, Math.floor(segSize * purgePct));
+   428→  const embargoSize = longestLookback;
+   429→  const segs: WalkForwardSegment[] = [];
+   430→
+   431→  for (let i = 0; i < segments; i++) {
+   432→    const segStart = i * segSize;
+   433→    const segEnd = i === segments - 1 ? candles.length : (i + 1) * segSize;
+   434→    // Train: first 70% of segment
+   435→    const trainEnd = segStart + Math.floor((segEnd - segStart) * 0.7);
+   436→    // PURGE: skip `purgeSize` bars (label horizon leakage)
+   437→    // EMBARGO: skip additional `embargoSize` bars (feature lookback leakage)
+   438→    const testStart = trainEnd + purgeSize + embargoSize;
+   439→    const trainCandles = candles.slice(segStart, trainEnd);
+   440→    const testCandles = candles.slice(testStart, segEnd);
+   441→
+   442→    if (trainCandles.length < 15 || testCandles.length < 5) continue;
+   443→
+   444→    const trainRes = runBacktest(trainCandles, { ...config, strategy });
+   445→    const testRes = runBacktest(testCandles, { ...config, strategy });
+   446→
+   447→    const trainPF = isFinite(trainRes.profitFactor) ? trainRes.profitFactor : 999;
+   448→    const testPF = isFinite(testRes.profitFactor) ? testRes.profitFactor : 999;
+   449→    const consistent = trainPF > 0 && testPF > 0 && testPF >= trainPF * 0.5;
+   450→    const testProfitable = testRes.netProfit > 0;
+   451→
+   452→    segs.push({
+   453→      segment: i + 1,
+   454→      trainStart: trainCandles[0]?.time || 0, trainEnd: trainCandles[trainCandles.length - 1]?.time || 0,
+   455→      testStart: testCandles[0]?.time || 0, testEnd: testCandles[testCandles.length - 1]?.time || 0,
+   456→      trainTrades: trainRes.tradeCount, trainNetProfit: trainRes.netProfit, trainPF,
+   457→      testTrades: testRes.tradeCount, testNetProfit: testRes.netProfit, testPF,
+   458→      consistent, testProfitable,
+   459→    });
+   460→  }
+   461→
+   462→  const consistentCount = segs.filter(s => s.consistent).length;
+   463→  const profitableCount = segs.filter(s => s.testProfitable).length;
+   464→  const pfScore = segs.length > 0 ? (consistentCount / segs.length) * 100 : 0;
+   465→  const profScore = segs.length > 0 ? (profitableCount / segs.length) * 100 : 0;
+   466→  // overfit risk based on profitability score (softer, more practical)
+   467→  const overfitRisk: "low" | "medium" | "high" = profScore >= 70 ? "low" : profScore >= 40 ? "medium" : "high";
+   468→
+   469→  return {
+   470→    segments: segs,
+   471→    consistentSegments: consistentCount,
+   472→    totalSegments: segs.length,
+   473→    consistencyScore: pfScore,
+   474→    profitabilityScore: profScore,
+   475→    overfitRisk,
+   476→    summary: `${profitableCount}/${segs.length} test segments profitable (${profScore.toFixed(0)}%) · ${consistentCount}/${segs.length} PF-consistent (${pfScore.toFixed(0)}%) — overfit: ${overfitRisk}`,
+   477→  };
+   478→}
+   479→
+   480→// SMA Crossover (trend-following)
+   481→function smaCross(candles: Candle[], fast: number, slow: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   482→  const trades: BacktestTrade[] = [];
+   483→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   484→  const closes = candles.map(c => c.close);
+   485→  for (let i = Math.max(fast, slow); i < closes.length; i++) {
+   486→    const sf = sma(closes, fast, i), ss = sma(closes, slow, i);
+   487→    const pf = sma(closes, fast, i - 1), ps = sma(closes, slow, i - 1);
+   488→    if (!sf || !ss || !pf || !ps) continue;
+   489→    const golden = sf > ss && pf <= ps;
+   490→    const death = sf < ss && pf >= ps;
+   491→    if (pos) {
+   492→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   493→      if (pnlPct <= -sl || pnlPct >= tp || death) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   494→    } else if (golden) { pos = openPosition(trades, pos, candles, i, fee); }
+   495→  }
+   496→  return trades;
+   497→}
+   498→
+   499→// RSI Reversal (mean-reversion)
+   500→function rsiReversal(candles: Candle[], period: number, oversold: number, overbought: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   501→  const trades: BacktestTrade[] = [];
+   502→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   503→  const closes = candles.map(c => c.close);
+   504→  const rsi = rsiArr(closes, period);
+   505→  for (let i = period + 1; i < closes.length; i++) {
+   506→    if (pos) {
+   507→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   508→      if (pnlPct <= -sl || pnlPct >= tp || rsi[i] >= overbought) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   509→    } else if (rsi[i] < oversold && rsi[i - 1] >= oversold) { pos = openPosition(trades, pos, candles, i, fee); }
+   510→  }
+   511→  return trades;
+   512→}
+   513→
+   514→// Bollinger Breakout (breakout)
+   515→function bollingerBreakout(candles: Candle[], period: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   516→  const trades: BacktestTrade[] = [];
+   517→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   518→  const closes = candles.map(c => c.close);
+   519→  for (let i = period; i < closes.length; i++) {
+   520→    const m = sma(closes, period, i); if (!m) continue;
+   521→    const sd = stddev(closes, period, i);
+   522→    const upper = m + 2 * sd, lower = m - 2 * sd;
+   523→    if (pos) {
+   524→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   525→      if (pnlPct <= -sl || pnlPct >= tp || closes[i] < m) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   526→    } else if (closes[i] > upper) { pos = openPosition(trades, pos, candles, i, fee); }
+   527→  }
+   528→  return trades;
+   529→}
+   530→
+   531→// MACD Trend (momentum)
+   532→function macdTrend(candles: Candle[], sl: number, tp: number, fee: number): BacktestTrade[] {
+   533→  const trades: BacktestTrade[] = [];
+   534→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   535→  const closes = candles.map(c => c.close);
+   536→  const hist = macdHist(closes);
+   537→  for (let i = 27; i < closes.length; i++) {
+   538→    if (pos) {
+   539→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   540→      if (pnlPct <= -sl || pnlPct >= tp || hist[i] < 0) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   541→    } else if (hist[i] > 0 && hist[i - 1] <= 0) { pos = openPosition(trades, pos, candles, i, fee); }
+   542→  }
+   543→  return trades;
+   544→}
+   545→
+   546→// Stochastic Reversal (mean-reversion)
+   547→function stochasticReversal(candles: Candle[], period: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   548→  const trades: BacktestTrade[] = [];
+   549→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   550→  const closes = candles.map(c => c.close);
+   551→  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
+   552→  for (let i = period + 1; i < closes.length; i++) {
+   553→    const k = stochastic(highs, lows, closes, period, i);
+   554→    const kPrev = stochastic(highs, lows, closes, period, i - 1);
+   555→    if (pos) {
+   556→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   557→      if (pnlPct <= -sl || pnlPct >= tp || k > 80) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   558→    } else if (k < 20 && kPrev < 20 && k > kPrev) { pos = openPosition(trades, pos, candles, i, fee); }
+   559→  }
+   560→  return trades;
+   561→}
+   562→
+   563→// Mean Reversion (z-score based) — ported from trading-strategies MeanReversionStrategy
+   564→function meanReversion(candles: Candle[], period: number, entryZ: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   565→  const trades: BacktestTrade[] = [];
+   566→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   567→  const closes = candles.map(c => c.close);
+   568→  for (let i = period; i < closes.length; i++) {
+   569→    const m = sma(closes, period, i); if (!m) continue;
+   570→    const sd = stddev(closes, period, i);
+   571→    if (sd === 0) continue;
+   572→    const z = (closes[i] - m) / sd;
+   573→    if (pos) {
+   574→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   575→      // exit when price reverts to mean, or SL/TP
+   576→      if (pnlPct <= -sl || pnlPct >= tp || closes[i] >= m) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   577→    } else if (z < -entryZ) { pos = openPosition(trades, pos, candles, i, fee); }
+   578→  }
+   579→  return trades;
+   580→}
+   581→
+   582→// Multi-Indicator Confluence — ported from trading-strategies MultiIndicatorConfluenceStrategy
+   583→// Scores RSI + MACD + BB + SMA signals; entry when score >= 3
+   584→function multiConfluence(candles: Candle[], sl: number, tp: number, fee: number): BacktestTrade[] {
+   585→  const trades: BacktestTrade[] = [];
+   586→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   587→  const closes = candles.map(c => c.close);
+   588→  const rsi = rsiArr(closes, 14);
+   589→  const hist = macdHist(closes);
+   590→  for (let i = 27; i < closes.length; i++) {
+   591→    let score = 0;
+   592→    // RSI: oversold (< 35) = +1
+   593→    if (rsi[i] < 35) score++;
+   594→    // MACD: histogram positive = +1
+   595→    if (hist[i] > 0) score++;
+   596→    // SMA: price above SMA20 = +1 (uptrend context for reversal)
+   597→    const s20 = sma(closes, 20, i);
+   598→    if (s20 && closes[i] > s20) score++;
+   599→    // Bollinger: price at/below lower band = +1
+   600→    const sd = stddev(closes, 20, i);
+   601→    if (s20 && sd > 0 && closes[i] <= s20 - 2 * sd) score++;
+   602→    if (pos) {
+   603→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   604→      if (pnlPct <= -sl || pnlPct >= tp || score <= 1) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   605→    } else if (score >= 3) { pos = openPosition(trades, pos, candles, i, fee); }
+   606→  }
+   607→  return trades;
+   608→}
+   609→
+   610→// Trend-Filter SMA — SMA cross but ONLY enter when ADX > threshold (strong trend)
+   611→// Filters out choppy/ranging markets where SMA cross whipsaws. Designed for walk-forward robustness.
+   612→function trendFilterSma(candles: Candle[], fast: number, slow: number, adxThreshold: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   613→  const trades: BacktestTrade[] = [];
+   614→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   615→  const closes = candles.map(c => c.close);
+   616→  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
+   617→  const adx = adxArr(highs, lows, closes, 14);
+   618→  for (let i = Math.max(fast, slow, 30); i < closes.length; i++) {
+   619→    const sf = sma(closes, fast, i), ss = sma(closes, slow, i);
+   620→    const pf = sma(closes, fast, i - 1), ps = sma(closes, slow, i - 1);
+   621→    if (!sf || !ss || !pf || !ps) continue;
+   622→    const golden = sf > ss && pf <= ps;
+   623→    const death = sf < ss && pf >= ps;
+   624→    const trending = adx[i] >= adxThreshold;
+   625→    if (pos) {
+   626→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   627→      if (pnlPct <= -sl || pnlPct >= tp || death) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   628→    } else if (golden && trending) { pos = openPosition(trades, pos, candles, i, fee); }
+   629→  }
+   630→  return trades;
+   631→}
+   632→
+   633→// Donchian Breakout — buy when price breaks above N-period high (turtle strategy)
+   634→// Classic trend-following, volatility-aware. Exit when price breaks below N-period low.
+   635→function donchianBreakout(candles: Candle[], entryPeriod: number, exitPeriod: number, sl: number, tp: number, fee: number): BacktestTrade[] {
+   636→  const trades: BacktestTrade[] = [];
+   637→  let pos: { entryTime: number; entryPrice: number; fee: number } | null = null;
+   638→  const closes = candles.map(c => c.close);
+   639→  const highs = candles.map(c => c.high), lows = candles.map(c => c.low);
+   640→  for (let i = entryPeriod; i < closes.length; i++) {
+   641→    // entry: price breaks above N-period high (excluding current candle)
+   642→    const entryHigh = Math.max(...highs.slice(i - entryPeriod, i));
+   643→    const exitLow = Math.min(...lows.slice(Math.max(0, i - exitPeriod), i));
+   644→    if (pos) {
+   645→      const pnlPct = (closes[i] - pos.entryPrice) / pos.entryPrice;
+   646→      // exit: SL, TP, or price breaks below exit-period low
+   647→      if (pnlPct <= -sl || pnlPct >= tp || closes[i] < exitLow) { trades.push(closeTrade(pos, candles, i, fee)); pos = null; }
+   648→    } else if (closes[i] > entryHigh) { pos = openPosition(trades, pos, candles, i, fee); }
+   649→  }
+   650→  return trades;
+   651→}
+   652→
+   653→// ── Backtest result with FULL metrics ──
+   654→
+   655→export interface MonteCarloResult {
+   656→  simulations: number;
+   657→  bustProbability: number;      // % of sims that hit bust threshold
+   658→  bustThreshold: number;         // the -% used
+   659→  medianMaxDrawdown: number;
+   660→  p95MaxDrawdown: number;        // 95th percentile max drawdown
+   661→  medianFinalEquity: number;
+   662→  p5FinalEquity: number;         // 5th percentile (worst case)
+   663→  p95FinalEquity: number;        // 95th percentile (best case)
+   664→  profitProbability: number;     // % of sims that ended profitable
+   665→}
+   666→
+   667→export interface BacktestResult {
+   668→  trades: BacktestTrade[];
+   669→  netProfit: number; profitFactor: number; maxDrawdown: number;
+   670→  winRate: number; avgTrade: number; tradeCount: number;
+   671→  avgWin: number; avgLoss: number; sharpeRatio: number;
+   672→  longPerformance: number; shortPerformance: number;
+   673→  equity: { time: number; value: number }[];
+   674→  verdict: string;
+   675→  totalFees: number;
+   676→  sortinoRatio: number;
+   677→  calmarRatio: number;
+   678→  monteCarlo: MonteCarloResult | null;
+   679→}
+   680→
+   681→export interface BacktestConfig {
+   682→  strategy: StrategyName; initialCapital: number; pair: string;
+   683→  stopLossPct: number; takeProfitPct: number; params: Record<string, number>;
+   684→  feeRate?: number;       // taker fee (default 0.003 = 0.3% INDODAX)
+   685→  makerFeeRate?: number; // maker fee (default 0 = 0% INDODAX limit order)
+   686→  spreadPct?: number;    // bid-ask spread as % (default 0.001 = 0.1%)
+   687→  slippagePct?: number;  // slippage as % (default 0.0005 = 0.05%)
+   688→  useRealisticFees?: boolean; // if true, apply maker/taker/spread/slippage
+   689→}
+   690→
+   691→// Compute realistic execution cost: taker fee + spread + slippage
+   692→function executionCost(price: number, feeRate: number, spreadPct: number, slippagePct: number): number {
+   693→  return price * (feeRate + spreadPct + slippagePct);
+   694→}
+   695→
+   696→export function runBacktest(candles: Candle[], config: BacktestConfig): BacktestResult {
+   697→  const fee = config.feeRate ?? 0.003;
+   698→  const spreadPct = config.spreadPct ?? 0.001;    // 0.1% spread
+   699→  const slippagePct = config.slippagePct ?? 0.0005; // 0.05% slippage
+   700→  const realistic = config.useRealisticFees !== false; // default true
+   701→  // Total cost per side: taker fee + spread/2 + slippage
+   702→  const costPerSide = realistic ? fee + spreadPct / 2 + slippagePct : fee;
+   703→  const sl = config.stopLossPct, tp = config.takeProfitPct;
+   704→  let trades: BacktestTrade[] = [];
+   705→
+   706→  switch (config.strategy) {
+   707→    case "sma_cross": trades = smaCross(candles, config.params.fast || 5, config.params.slow || 20, sl, tp, costPerSide); break;
+   708→    case "rsi_reversal": trades = rsiReversal(candles, config.params.period || 14, config.params.oversold || 35, config.params.overbought || 70, sl, tp, costPerSide); break;
+   709→    case "bollinger_breakout": trades = bollingerBreakout(candles, config.params.period || 20, sl, tp, costPerSide); break;
+   710→    case "macd_trend": trades = macdTrend(candles, sl, tp, costPerSide); break;
+   711→    case "stochastic_reversal": trades = stochasticReversal(candles, config.params.period || 14, sl, tp, costPerSide); break;
+   712→    case "mean_reversion": trades = meanReversion(candles, config.params.period || 20, config.params.entryZ || 2, sl, tp, costPerSide); break;
+   713→    case "multi_confluence": trades = multiConfluence(candles, sl, tp, costPerSide); break;
+   714→    case "trend_filter_sma": trades = trendFilterSma(candles, config.params.fast || 5, config.params.slow || 20, config.params.adxThreshold || 25, sl, tp, costPerSide); break;
+   715→    case "donchian_breakout": trades = donchianBreakout(candles, config.params.entryPeriod || 20, config.params.exitPeriod || 10, sl, tp, costPerSide); break;
+   716→    default: trades = smaCross(candles, 5, 20, sl, tp, fee);
+   717→  }
+   718→
+   719→  const wins = trades.filter(t => t.pnl > 0);
+   720→  const losses = trades.filter(t => t.pnl <= 0);
+   721→  const netProfit = trades.reduce((a, t) => a + t.pnl, 0);
+   722→  const totalFees = trades.reduce((a, t) => a + t.entryFee + t.exitFee, 0);
+   723→  const avgWin = wins.length > 0 ? wins.reduce((a, t) => a + t.pnl, 0) / wins.length : 0;
+   724→  const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a, t) => a + t.pnl, 0) / losses.length) : 0;
+   725→  const profitFactor = avgLoss > 0 ? avgWin / avgLoss : wins.length > 0 ? Infinity : 0;
+   726→
+   727→  // equity curve + drawdown (FIXED: cap at 100%, handle negative equity)
+   728→  let equity = config.initialCapital; let peak = equity; let maxDD = 0;
+   729→  const equityCurve = trades.map(t => {
+   730→    equity += t.pnl;
+   731→    if (equity > peak) peak = equity;
+   732→    // drawdown only meaningful when equity positive; cap at 100% (blown account)
+   733→    const dd = peak > 0 ? Math.max(0, (peak - equity) / peak) * 100 : 100;
+   734→    if (dd > maxDD) maxDD = dd;
+   735→    return { time: t.exitTime, value: equity };
+   736→  });
+   737→
+   738→  // returns for Sharpe + Sortino
+   739→  const returns: number[] = [];
+   740→  for (let i = 1; i < equityCurve.length; i++) {
+   741→    const prev = equityCurve[i - 1].value;
+   742→    if (prev > 0) returns.push((equityCurve[i].value - prev) / prev);
+   743→  }
+   744→  const avgRet = returns.length > 0 ? returns.reduce((a, b) => a + b, 0) / returns.length : 0;
+   745→  const stdDev = returns.length > 0 ? Math.sqrt(returns.reduce((a, b) => a + (b - avgRet) ** 2, 0) / returns.length) : 0;
+   746→  const sharpe = stdDev > 0 ? (avgRet / stdDev) * Math.sqrt(252) : 0;
+   747→  // Sortino: only downside deviation
+   748→  const downsideReturns = returns.filter(r => r < 0);
+   749→  const downsideDev = downsideReturns.length > 0 ? Math.sqrt(downsideReturns.reduce((a, b) => a + b * b, 0) / downsideReturns.length) : 0;
+   750→  const sortino = downsideDev > 0 ? (avgRet / downsideDev) * Math.sqrt(252) : 0;
+   751→  // Calmar: annualized return / max drawdown (approx: netProfit/capital annualized)
+   752→  const annualReturn = (netProfit / config.initialCapital) * (252 / Math.max(1, trades.length));
+   753→  const calmar = maxDD > 0 ? Math.abs(annualReturn) / (maxDD / 100) : 0;
+   754→
+   755→  const longTrades = trades.filter(t => t.side === "long");
+   756→  const shortTrades = trades.filter(t => t.side === "short");
+   757→
+   758→  // Monte Carlo (only if enough trades)
+   759→  const mc = trades.length >= 10 ? runMonteCarlo(trades, config.initialCapital, 1000, 0.20) : null;
+   760→
+   761→  return {
+   762→    trades, netProfit, profitFactor, maxDrawdown: Math.min(maxDD, 100),
+   763→    winRate: trades.length > 0 ? (wins.length / trades.length) * 100 : 0,
+   764→    avgTrade: trades.length > 0 ? netProfit / trades.length : 0,
+   765→    tradeCount: trades.length, avgWin, avgLoss, sharpeRatio: sharpe, sortinoRatio: sortino, calmarRatio: calmar,
+   766→    longPerformance: longTrades.reduce((a, t) => a + t.pnl, 0),
+   767→    shortPerformance: shortTrades.reduce((a, t) => a + t.pnl, 0),
+   768→    equity: equityCurve, totalFees,
+   769→    monteCarlo: mc,
+   770→    verdict: assessVerdict(trades.length, profitFactor, Math.min(maxDD, 100), wins.length / Math.max(1, trades.length)),
+   771→  };
+   772→}
+   773→
+   774→// ── Monte Carlo analysis (ported from jesse + quantstats methodology) ──
+   775→// Shuffles trade order N times, recomputes equity curve, measures bust probability
+   776→// and drawdown distribution. Reveals if profitability is from trade ORDER luck.
+   777→
+   778→export function runMonteCarlo(trades: BacktestTrade[], initialCapital: number, sims = 1000, bustThreshold = 0.20): MonteCarloResult {
+   779→  const pnls = trades.map(t => t.pnl);
+   780→  const busts: boolean[] = [];
+   781→  const maxDDs: number[] = [];
+   782→  const finalEquities: number[] = [];
+   783→
+   784→  for (let s = 0; s < sims; s++) {
+   785→    // Fisher-Yates shuffle
+   786→    const shuffled = [...pnls];
+   787→    for (let i = shuffled.length - 1; i > 0; i--) {
+   788→      const j = Math.floor(Math.random() * (i + 1));
+   789→      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+   790→    }
+   791→    let eq = initialCapital; let peak = eq; let maxDD = 0; let busted = false;
+   792→    for (const pnl of shuffled) {
+   793→      eq += pnl;
+   794→      if (eq > peak) peak = eq;
+   795→      const dd = peak > 0 ? Math.max(0, (peak - eq) / peak) : 1;
+   796→      if (dd > maxDD) maxDD = dd;
+   797→      // bust: equity drops below (1 - bustThreshold) * initialCapital
+   798→      if (eq <= initialCapital * (1 - bustThreshold)) { busted = true; break; }
+   799→    }
+   800→    busts.push(busted);
+   801→    maxDDs.push(maxDD * 100);
+   802→    finalEquities.push(eq);
+   803→  }
+   804→
+   805→  maxDDs.sort((a, b) => a - b);
+   806→  finalEquities.sort((a, b) => a - b);
+   807→  const pct = (arr: number[], p: number) => arr[Math.min(arr.length - 1, Math.floor(arr.length * p))];
+   808→  const profitCount = finalEquities.filter(e => e > initialCapital).length;
+   809→
+   810→  return {
+   811→    simulations: sims,
+   812→    bustProbability: (busts.filter(Boolean).length / sims) * 100,
+   813→    bustThreshold: bustThreshold * 100,
+   814→    medianMaxDrawdown: pct(maxDDs, 0.5),
+   815→    p95MaxDrawdown: pct(maxDDs, 0.95),
+   816→    medianFinalEquity: pct(finalEquities, 0.5),
+   817→    p5FinalEquity: pct(finalEquities, 0.05),
+   818→    p95FinalEquity: pct(finalEquities, 0.95),
+   819→    profitProbability: (profitCount / sims) * 100,
+   820→  };
+   821→}
+   822→
+   823→// ── Risk Manager flags (from loop/08-risk-manager.md) ──
+   824→
+   825→export interface RiskFlags {
+   826→  red: string[]; yellow: string[]; green: string[];
+   827→  verdict: "Reject" | "Watchlist" | "Incubate" | "Candidate" | "Production candidate";
+   828→}
+   829→
+   830→export function assessRisk(result: BacktestResult, strategyName: string): RiskFlags {
+   831→  const red: string[] = [], yellow: string[] = [], green: string[] = [];
+   832→  if (result.tradeCount < 30) red.push("Less than 30 trades in backtest window");
+   833→  if (result.maxDrawdown > 50) red.push("Max drawdown > 50% — unviable risk");
+   834→  const sortedPnl = result.trades.map(t => t.pnl).sort((a, b) => b - a);
+   835→  if (sortedPnl.length > 0 && sortedPnl[0] > result.netProfit * 0.3 && result.netProfit > 0) red.push("Net profit driven by single outlier trade (>30% of total P&L)");
+   836→  if (result.profitFactor === Infinity && result.tradeCount < 50) red.push("Profit factor infinity on small sample — likely overfit");
+   837→  if (result.monteCarlo && result.monteCarlo.bustProbability > 30) red.push(`Monte Carlo bust probability ${result.monteCarlo.bustProbability.toFixed(0)}% (>30%) — trade order luck dependent`);
+   838→
+   839→  if (result.profitFactor >= 1.0 && result.profitFactor <= 1.2) yellow.push("Profit factor 1.0–1.2 (marginal edge)");
+   840→  if (result.maxDrawdown >= 30 && result.maxDrawdown <= 50) yellow.push("Max drawdown 30–50%");
+   841→  if (result.tradeCount >= 30 && result.tradeCount <= 80) yellow.push("Trade count 30–80 (small sample)");
+   842→  if (result.winRate > 85 && strategyName.includes("sma")) yellow.push("Win rate >85% on trend system (probably curve-fit)");
+   843→  if (result.winRate < 15 && strategyName.includes("rsi")) yellow.push("Win rate <15% on mean-reversion system (probably broken)");
+   844→  if (result.monteCarlo && result.monteCarlo.bustProbability > 10 && result.monteCarlo.bustProbability <= 30) yellow.push(`Monte Carlo bust probability ${result.monteCarlo.bustProbability.toFixed(0)}% (10-30%)`);
+   845→
+   846→  if (result.profitFactor > 1.4) green.push("Profit factor > 1.4");
+   847→  if (result.maxDrawdown < 25) green.push("Max drawdown < 25%");
+   848→  if (result.tradeCount > 150) green.push("Trade count > 150");
+   849→  if (result.sharpeRatio > 1.0) green.push("Sharpe ratio > 1.0");
+   850→  if (result.sortinoRatio > 1.5) green.push("Sortino ratio > 1.5");
+   851→  if (result.monteCarlo && result.monteCarlo.bustProbability < 5 && result.netProfit > 0) green.push(`Monte Carlo bust probability <5% — robust to trade order`);
+   852→  if (result.monteCarlo && result.monteCarlo.profitProbability > 80) green.push("Monte Carlo profit probability >80%");
+   853→
+   854→  const verdict = red.length > 0 ? "Reject" : yellow.length > 2 ? "Watchlist" : yellow.length > 0 ? "Incubate" : green.length >= 3 ? "Production candidate" : "Candidate";
+   855→  return { red, yellow, green, verdict };
+   856→}
+   857→
+   858→function assessVerdict(trades: number, pf: number, dd: number, winRate: number): string {
+   859→  if (trades < 30 || dd > 50) return "Reject";
+   860→  if (pf > 1.4 && dd < 25 && trades > 150) return "Production candidate";
+   861→  if (pf > 1.2 && dd < 35) return "Candidate";
+   862→  if (pf > 1.0) return "Incubate";
+   863→  return "Watchlist";
+   864→}
+   865→
+   866→// ── Position Optimizer (from loop/07-position-optimizer.md) ──
+   867→
+   868→export interface PositionModels {
+   869→  fixedRisk: { sizePct: number; riskAmount: number };
+   870→  fixedLeverage: { leverage: number; sizePct: number; liquidationRisk: string };
+   871→  kellyFraction: { kellyPct: number; sizes: { fraction: string; sizePct: number }[] };
+   872→  volAdjusted: { sizePct: number; atrRatio: number };
+   873→  drawdownAware: { sizePct: number; rules: string[] };
+   874→}
+   875→
+   876→export function optimizePositions(
+   877→  capital: number, entryPrice: number, stopLossPrice: number,
+   878→  winRate: number, rewardRiskRatio: number, atr: number
+   879→): PositionModels {
+   880→  const riskAmount = capital * 0.02;
+   881→  // CORRECT Kelly Criterion: K = W - (1-W)/R
+   882→  // where W = win rate (fraction), R = avgWin/avgLoss (payoff ratio)
+   883→  // rewardRiskRatio param should be R = avgWin/avgLoss from actual backtest
+   884→  const R = rewardRiskRatio > 0 ? rewardRiskRatio : 1;
+   885→  const kellyPct = winRate - (1 - winRate) / R;
+   886→  const kellySizes = [0.10, 0.25, 0.50, 0.75, 1.00].map(f => ({ fraction: `${(f * 100)}% Kelly`, sizePct: Math.max(0, kellyPct * f * 100) }));
+   887→  const atrRatio = atr / entryPrice;
+   888→  const volSize = Math.max(0.5, Math.min(5, 2 / Math.max(0.001, atrRatio * 100)));
+   889→  const ddRules = ["Reduce size by 50% after 5% drawdown", "Reduce size by 75% after 10% drawdown", "Stop trading after 20% drawdown", "Restore normal size after equity makes a new high"];
+   890→
+   891→  return {
+   892→    fixedRisk: { sizePct: (riskAmount / capital) * 100, riskAmount },
+   893→    fixedLeverage: { leverage: 3, sizePct: 6, liquidationRisk: `3x leverage: liquidation at ~${(entryPrice * 0.67).toLocaleString("id-ID")} (-33%)` },
+   894→    kellyFraction: { kellyPct: Math.max(0, kellyPct * 100), sizes: kellySizes },
+   895→    volAdjusted: { sizePct: volSize, atrRatio },
+   896→    drawdownAware: { sizePct: volSize * 0.7, rules: ddRules },
+   897→  };
+   898→}
+   899→
+   900→// ── Reporting format ──
+   901→
+   902→export function generateReport(pair: string, config: BacktestConfig, result: BacktestResult, risk: RiskFlags, positions: PositionModels): string {
+   903→  const mc = result.monteCarlo;
+   904→  return `# Trader Dev Research Report — INDODAX
+   905→## Strategy
+   906→${config.strategy} — SL ${config.stopLossPct * 100}%, TP ${config.takeProfitPct * 100}%, Fee ${(config.feeRate ?? 0.003) * 100}% taker
+   907→## Results (fee-adjusted)
+   908→Net profit: ${result.netProfit.toFixed(0)} IDR | Total fees paid: ${result.totalFees.toFixed(0)} IDR
+   909→Profit factor: ${isFinite(result.profitFactor) ? result.profitFactor.toFixed(2) : "∞"} | Win rate: ${result.winRate.toFixed(1)}%
+   910→Max drawdown: ${result.maxDrawdown.toFixed(1)}% | Sharpe: ${result.sharpeRatio.toFixed(2)} | Sortino: ${result.sortinoRatio.toFixed(2)} | Calmar: ${result.calmarRatio.toFixed(2)}
+   911→Trades: ${result.tradeCount} | Avg win: ${result.avgWin.toFixed(0)} | Avg loss: ${result.avgLoss.toFixed(0)}
+   912→## Monte Carlo (1000 simulations, bust @ -20%)
+   913→Bust probability: ${mc ? mc.bustProbability.toFixed(1) + "%" : "N/A"} | Profit probability: ${mc ? mc.profitProbability.toFixed(1) + "%" : "N/A"}
+   914→Median max drawdown: ${mc ? mc.medianMaxDrawdown.toFixed(1) + "%" : "N/A"} | 95th pct drawdown: ${mc ? mc.p95MaxDrawdown.toFixed(1) + "%" : "N/A"}
+   915→## Risk Assessment
+   916→RED: ${risk.red.length ? risk.red.join("; ") : "None"} | YELLOW: ${risk.yellow.length ? risk.yellow.join("; ") : "None"} | GREEN: ${risk.green.length ? risk.green.join("; ") : "None"}
+   917→## Verdict: ${result.verdict}`;
+   918→}
+   919→
