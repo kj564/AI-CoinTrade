@@ -70,6 +70,7 @@ interface BacktestResult {
   monteCarlo: MonteCarloResult | null;
   feeScenarios?: FeeScenario[];
   feeBreakdown?: FeeBreakdown;
+  realisticLimitAnalysis?: RealisticLimitAnalysis;
 }
 interface FeeScenario {
   name: string; description: string;
@@ -81,6 +82,15 @@ interface FeeBreakdown {
   takerFeeRate: number; makerFeeRate: number; spreadPct: number; slippagePct: number;
   costPerSideTaker: number; costPerSideMaker: number; costPerSideHybrid: number;
   savingsMakerVsTakerPct: number; savingsHybridVsTakerPct: number; note: string;
+}
+interface RealisticLimitAnalysis {
+  totalLimitOrders: number; filledOrders: number; missedOrders: number;
+  fillProbability: number; fillProbabilityPct: number; avgWaitBarsToFill: number;
+  fullFills: number; partialFills: number; partialFillRate: number; avgFillFraction: number;
+  avgAdverseSelectionPct: number; adverseSelectionRate: number;
+  realisticMakerNetProfit: number; realisticMakerProfitFactor: number; realisticMakerWinRate: number;
+  netProfitVsPureMaker: number; executionCostPct: number;
+  description: string;
 }
 interface RiskFlags { red: string[]; yellow: string[]; green: string[]; verdict: string }
 interface PositionModels {
@@ -1005,6 +1015,49 @@ export function TradingDashboard() {
                               </p>
                             </div>
 
+                            {/* ── Stability Selection (Meinshausen & Bühlmann 2010) — NEW ── */}
+                            {signal.ml.stabilitySelection && signal.ml.stabilitySelection.length > 0 && (
+                              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.03] p-3">
+                                <div className="mb-2 flex items-center gap-1.5">
+                                  <Sigma className="h-3 w-3 text-emerald-400" />
+                                  <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">Stability Selection <Badge className="ml-1 border border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[7px] font-bold text-emerald-300">NEW</Badge></span>
+                                  {signal.ml.stabilityParams && (
+                                    <span className="text-[8px] text-slate-600">· {signal.ml.stabilityParams.nIterations}× bootstrap · top-{signal.ml.stabilityParams.topK} selection</span>
+                                  )}
+                                </div>
+                                <div className="space-y-1">
+                                  {signal.ml.stabilitySelection.map((s: any) => (
+                                    <div key={s.feature} className="flex items-center gap-2 text-[9px]">
+                                      <span className="w-20 shrink-0 text-slate-400">{s.feature}</span>
+                                      <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-800/60">
+                                        {/* Threshold line at 70% (stable cutoff) */}
+                                        <div className="absolute inset-y-0 left-[70%] w-[1px] bg-amber-400/40" />
+                                        <div className={cn("absolute inset-y-0 left-0",
+                                          s.verdict === "stable" ? "bg-emerald-500/60" :
+                                          s.verdict === "borderline" ? "bg-amber-500/50" :
+                                          "bg-rose-500/40"
+                                        )} style={{ width: `${s.selectionPct.toFixed(1)}%` }} />
+                                      </div>
+                                      <span className="w-12 shrink-0 text-right tabular-nums text-slate-300">{s.selectionPct.toFixed(0)}%</span>
+                                      <Badge className={cn("border px-1 py-0 text-[7px] font-bold shrink-0",
+                                        s.verdict === "stable" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" :
+                                        s.verdict === "borderline" ? "border-amber-500/30 bg-amber-500/10 text-amber-300" :
+                                        "border-rose-500/30 bg-rose-500/10 text-rose-300")}>
+                                        {s.verdict}
+                                      </Badge>
+                                    </div>
+                                  ))}
+                                </div>
+                                <p className="mt-2 text-[9px] leading-relaxed text-slate-500">
+                                  {signal.ml.stabilityParams?.description || "Subsample-bootstrap × 50 iterations."}
+                                  <br />
+                                  <span className="text-slate-400">Stable (≥70% selected):</span> reliably useful across resamples — survives multiple-testing pressure.
+                                  <br />
+                                  <span className="text-slate-400">Unstable (&lt;40%):</span> only looked important on the full sample by chance.
+                                </p>
+                              </div>
+                            )}
+
                             {/* ── MDI + MDA importance ranking ── */}
                             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                               <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
@@ -1060,9 +1113,9 @@ export function TradingDashboard() {
                                   <div className="mb-1 text-[9px] font-bold text-slate-400">Dynamic ±2×ATR / 6h <Badge className="ml-1 border border-amber-500/30 bg-amber-500/10 px-1 py-0 text-[7px] font-bold text-amber-300">NEW</Badge></div>
                                   {signal.ml.dynamicTripleBarrier && (
                                     <div className="space-y-0.5 text-[9px] tabular-nums">
-                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.upPct.toFixed(1)}%</span></div>
-                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.downPct.toFixed(1)}%</span></div>
-                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.timeoutPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.upPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.dynamicTripleBarrier.upPctCiLo * 100).toFixed(1)}-{(signal.ml.dynamicTripleBarrier.upPctCiHi * 100).toFixed(1)}%]</span></span></div>
+                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.downPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.dynamicTripleBarrier.downPctCiLo * 100).toFixed(1)}-{(signal.ml.dynamicTripleBarrier.downPctCiHi * 100).toFixed(1)}%]</span></span></div>
+                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.dynamicTripleBarrier.timeoutPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.dynamicTripleBarrier.timeoutPctCiLo * 100).toFixed(1)}-{(signal.ml.dynamicTripleBarrier.timeoutPctCiHi * 100).toFixed(1)}%]</span></span></div>
                                       <div className="flex justify-between text-[8px] text-slate-600"><span>avg barrier</span><span>{(signal.ml.dynamicTripleBarrier.avgUpBarrierPct * 100).toFixed(2)}%</span></div>
                                     </div>
                                   )}
@@ -1544,6 +1597,13 @@ export function TradingDashboard() {
                                 <div><div className="text-[8px] text-slate-500">max ρ</div><div className="font-bold tabular-nums text-slate-300">{block.maxCorrelation.toFixed(2)}</div></div>
                                 <div><div className="text-[8px] text-slate-500">min ρ</div><div className="font-bold tabular-nums text-slate-300">{block.minCorrelation.toFixed(2)}</div></div>
                               </div>
+                              {/* P4: Effective N per block */}
+                              <div className="mt-1 rounded bg-orange-500/[0.08] px-1.5 py-0.5 text-[8px]">
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Effective N</span>
+                                  <span className={cn("font-bold tabular-nums", block.effectiveNPct < 50 ? "text-rose-400" : block.effectiveNPct < 80 ? "text-amber-400" : "text-emerald-400")}>{block.effectiveN.toFixed(1)} / {block.size} <span className="text-slate-600">({block.effectiveNPct.toFixed(0)}%)</span></span>
+                                </div>
+                              </div>
                               <p className="mt-1 text-[8px] leading-relaxed text-slate-600">{block.interpretation}</p>
                             </div>
                           ))}
@@ -1685,6 +1745,109 @@ export function TradingDashboard() {
                         )}
                         <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
                           INDODAX fee structure: <b>taker 0.3%</b> (market order, immediate fill) vs <b>maker 0%</b> (limit order, provides liquidity). Realistic execution = hybrid (limit entry + market exit). Stop-loss/take-profit exits MUST be market orders because they need immediate fill. Entry can be limit if patient.
+                        </p>
+                      </div>
+                    </Card>
+                  )}
+
+                  {/* P1-3: Realistic Limit Order Execution Analysis (fill probability + partial fill + adverse selection) */}
+                  {btResult.result.realisticLimitAnalysis && (
+                    <Card className="border-rose-500/20 bg-rose-500/[0.03]">
+                      <div className="p-5">
+                        <div className="mb-3 flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-rose-500/15"><Target className="h-4 w-4 text-rose-400" /></div>
+                            <div>
+                              <h4 className="text-sm font-bold">Realistic Limit Execution <Badge className="ml-1 border border-rose-500/30 bg-rose-500/10 px-1 py-0 text-[8px] font-bold text-rose-300">NEW</Badge></h4>
+                              <div className="text-[10px] text-slate-500">Fill probability + partial fill + adverse selection — the real cost of maker execution</div>
+                            </div>
+                          </div>
+                          <Badge className={cn("border px-1.5 py-0 text-[9px] font-bold",
+                            btResult.result.realisticLimitAnalysis.fillProbabilityPct < 50 ? "border-rose-500/30 bg-rose-500/10 text-rose-300" :
+                            btResult.result.realisticLimitAnalysis.fillProbabilityPct < 80 ? "border-amber-500/30 bg-amber-500/10 text-amber-300" :
+                            "border-emerald-500/30 bg-emerald-500/10 text-emerald-300")}>
+                            fill {btResult.result.realisticLimitAnalysis.fillProbabilityPct.toFixed(1)}%
+                          </Badge>
+                        </div>
+
+                        {/* 3 pillars: fill prob, partial fill, adverse selection */}
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                          {/* P1: Fill Probability */}
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><CircleDot className="h-3 w-3 text-blue-400" /><span className="text-[10px] font-bold uppercase text-slate-400">P1: Fill Probability</span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Total limit orders</span><span className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.totalLimitOrders}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Filled</span><span className="font-bold tabular-nums text-emerald-400">{btResult.result.realisticLimitAnalysis.filledOrders}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Missed (no fill in 3 bars)</span><span className="font-bold tabular-nums text-rose-400">{btResult.result.realisticLimitAnalysis.missedOrders}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Fill rate</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.fillProbabilityPct < 50 ? "text-rose-400" : btResult.result.realisticLimitAnalysis.fillProbabilityPct < 80 ? "text-amber-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.fillProbabilityPct.toFixed(1)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Avg wait to fill</span><span className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.avgWaitBarsToFill.toFixed(1)} bars</span></div>
+                            </div>
+                            {/* Visual fill probability bar */}
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className={cn("absolute inset-y-0 left-0", btResult.result.realisticLimitAnalysis.fillProbabilityPct < 50 ? "bg-rose-500/50" : btResult.result.realisticLimitAnalysis.fillProbabilityPct < 80 ? "bg-amber-500/50" : "bg-emerald-500/50")} style={{ width: `${btResult.result.realisticLimitAnalysis.fillProbabilityPct}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Limit order placed at entry close. Fills only if subsequent candle low ≤ limit (within 3 bars). Missed entries = canceled orders.</p>
+                          </div>
+
+                          {/* P2: Partial Fill Modeling */}
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><Layers className="h-3 w-3 text-amber-400" /><span className="text-[10px] font-bold uppercase text-slate-400">P2: Partial Fill</span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Full fills</span><span className="font-bold tabular-nums text-emerald-400">{btResult.result.realisticLimitAnalysis.fullFills}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Partial fills</span><span className="font-bold tabular-nums text-amber-400">{btResult.result.realisticLimitAnalysis.partialFills}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Partial fill rate</span><span className="font-bold tabular-nums text-slate-300">{(btResult.result.realisticLimitAnalysis.partialFillRate * 100).toFixed(1)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Avg fill fraction</span><span className="font-bold tabular-nums text-slate-300">{(btResult.result.realisticLimitAnalysis.avgFillFraction * 100).toFixed(1)}%</span></div>
+                            </div>
+                            {/* Visual: fill fraction */}
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className="absolute inset-y-0 left-0 bg-amber-500/50" style={{ width: `${btResult.result.realisticLimitAnalysis.avgFillFraction * 100}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Fill fraction = volume_at_limit / avg_volume. Small-volume fills = queue ahead of us absorbed most liquidity. Capped at [10%, 100%].</p>
+                          </div>
+
+                          {/* P3: Adverse Selection */}
+                          <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><AlertTriangle className="h-3 w-3 text-rose-400" /><span className="text-[10px] font-bold uppercase text-slate-400">P3: Adverse Selection</span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Adverse selection rate</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.adverseSelectionRate > 0.5 ? "text-rose-400" : "text-amber-400")}>{(btResult.result.realisticLimitAnalysis.adverseSelectionRate * 100).toFixed(1)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Avg next-bar move</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgAdverseSelectionPct < 0 ? "text-rose-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.avgAdverseSelectionPct >= 0 ? "+" : ""}{btResult.result.realisticLimitAnalysis.avgAdverseSelectionPct.toFixed(3)}%</span></div>
+                              <div className="text-[8px] text-slate-600">Negative = price moved against filled buy (adverse).</div>
+                            </div>
+                            {/* Visual: adverse selection rate */}
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className={cn("absolute inset-y-0 left-0", btResult.result.realisticLimitAnalysis.adverseSelectionRate > 0.5 ? "bg-rose-500/50" : "bg-amber-500/40")} style={{ width: `${btResult.result.realisticLimitAnalysis.adverseSelectionRate * 100}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">When limit fills, it's often because price was dropping. Adverse selection = fraction of fills where next-bar move was unfavorable.</p>
+                          </div>
+                        </div>
+
+                        {/* Net economic impact */}
+                        <div className="mt-3 rounded-lg border border-rose-500/20 bg-rose-500/[0.04] p-3">
+                          <div className="mb-2 flex items-center gap-1.5"><Wallet className="h-3 w-3 text-rose-400" /><span className="text-[10px] font-bold uppercase text-slate-400">Net Economic Impact (Realistic vs Theoretical Maker)</span></div>
+                          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                            <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                              <div className="text-[9px] text-slate-500">Realistic Maker P&L</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.realisticMakerNetProfit >= 0 ? "text-emerald-400" : "text-rose-400")}>{fmtIDR(btResult.result.realisticLimitAnalysis.realisticMakerNetProfit)}</div>
+                            </div>
+                            <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                              <div className="text-[9px] text-slate-500">Realistic Win Rate</div>
+                              <div className="font-bold tabular-nums text-slate-200">{btResult.result.realisticLimitAnalysis.realisticMakerWinRate.toFixed(1)}%</div>
+                            </div>
+                            <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                              <div className="text-[9px] text-slate-500">vs Pure Maker (theoretical)</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.netProfitVsPureMaker >= 0 ? "text-emerald-400" : "text-rose-400")}>{btResult.result.realisticLimitAnalysis.netProfitVsPureMaker >= 0 ? "+" : ""}{fmtIDR(btResult.result.realisticLimitAnalysis.netProfitVsPureMaker)}</div>
+                            </div>
+                            <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                              <div className="text-[9px] text-slate-500">Execution Cost %</div>
+                              <div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.executionCostPct < 0 ? "text-rose-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.executionCostPct >= 0 ? "+" : ""}{btResult.result.realisticLimitAnalysis.executionCostPct.toFixed(1)}%</div>
+                              <div className="text-[8px] text-slate-600">% of pure-maker profit lost to realism</div>
+                            </div>
+                          </div>
+                          <p className="mt-2 text-[9px] leading-relaxed text-slate-500">{btResult.result.realisticLimitAnalysis.description}</p>
+                        </div>
+
+                        <p className="mt-3 text-[10px] leading-relaxed text-slate-500">
+                          Pure-maker P&L assumed all entries filled at limit price. Realistic limit execution pays 3 penalties: (1) <b>fill probability</b> — limit only fills if price touches, so some entries are missed entirely; (2) <b>partial fills</b> — even when filled, only part of the order executes (queue position); (3) <b>adverse selection</b> — fills happen because price is moving against you. Combined, these can turn a "theoretically profitable maker strategy" into a losing one.
                         </p>
                       </div>
                     </Card>

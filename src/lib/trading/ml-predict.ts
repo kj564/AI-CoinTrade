@@ -38,12 +38,17 @@ export interface MLPrediction {
   mdiImportance: { feature: string; importance: number; rank: number; interpretation: string }[];
   mdaImportance: { feature: string; importance: number; ciLo: number; ciHi: number; significant: boolean; rank: number }[];
   featureSelection: { feature: string; waldSig: boolean; permSig: boolean; mdiRank: number; mdaRank: number; waldRank: number; combinedScore: number; verdict: "useful" | "borderline" | "noise"; recommendation: string }[];
+  // P6: Stability selection (Meinshausen & Bühlmann 2010) — bootstrap the model B times,
+  // record how often each feature is "selected" (|coefficient| > threshold OR top-k by importance).
+  // Stable features are reliably useful across resamples; unstable ones are noise.
+  stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[];
+  stabilityParams: { nIterations: number; selectionThreshold: number; topK: number; description: string };
   lrStat: number;       // P3: Likelihood Ratio test statistic
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
   // P6: Dynamic triple-barrier — barriers scaled by rolling ATR (volatility-adaptive)
-  dynamicTripleBarrier: { kUp: number; kDown: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number; avgUpBarrierPct: number; avgDownBarrierPct: number; description: string } | null;
+  dynamicTripleBarrier: { kUp: number; kDown: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number; avgUpBarrierPct: number; avgDownBarrierPct: number; upPctCiLo: number; upPctCiHi: number; downPctCiLo: number; downPctCiHi: number; timeoutPctCiLo: number; timeoutPctCiHi: number; description: string } | null;
   // P7: Return attribution sample weighting — combine uniqueness with |return| magnitude
   returnAttribution: { avgUniqueness: number; avgReturnAbs: number; avgCombinedWeight: number; minWeight: number; maxWeight: number; description: string };
   metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[]; aucROCLift: number; prAUCLift: number; aucEffectSize: number; prEffectSize: number; f1EffectSize: number; calibratedCalibrationPerRegime: Record<string, any[]>; dynamicBarrierMetaModel?: any } | null; // P1: meta-labeling model
@@ -448,6 +453,96 @@ function computeMDI(features: number[][], labels: number[], nTrees = 20, maxDept
   result.sort((a, b) => b.importance - a.importance);
   result.forEach((r, i) => r.rank = i + 1);
   return result;
+}
+
+// P6: Stability Selection (Meinshausen & Bühlmann 2010, J. R. Stat. Soc. B 72(4))
+// Subsample-bootstrap B times, train model, record whether each feature is "selected".
+// Selection criterion: feature is in top-K by |coefficient| (default K=3 of 8 features).
+// Stable feature = selected in ≥ π_threshold (default 0.7) of iterations.
+// This catches features that look good by chance on the full sample but rarely
+// appear important on resamples — the gold standard for "really useful" features.
+function computeStabilitySelection(
+  features: number[][], labels: number[],
+  nIterations = 50, topK = 3, piThreshold = 0.7
+): { stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[]; stabilityParams: { nIterations: number; selectionThreshold: number; topK: number; description: string } } {
+  const d = features[0]?.length || 0;
+  const n = features.length;
+  if (n < 10 || d === 0) {
+    return {
+      stabilitySelection: FEATURE_NAMES.slice(0, d).map((f) => ({ feature: f, selectionFrequency: 0, selectionPct: 0, rank: 0, verdict: "unstable" as const })),
+      stabilityParams: { nIterations: 0, selectionThreshold: piThreshold, topK, description: "Insufficient samples for stability selection." },
+    };
+  }
+  const selectionCount: number[] = new Array(d).fill(0);
+
+  for (let b = 0; b < nIterations; b++) {
+    // Subsample (without replacement) 50% of data — standard stability selection protocol
+    const subsampleSize = Math.floor(n / 2);
+    const indices: number[] = [];
+    const used = new Set<number>();
+    while (indices.length < subsampleSize) {
+      const idx = Math.floor(Math.random() * n);
+      if (!used.has(idx)) { used.add(idx); indices.push(idx); }
+    }
+    const subFeatures = indices.map(i => features[i]);
+    const subLabels = indices.map(i => labels[i]);
+    // Quick-train logistic regression (50 iterations for speed)
+    const means: number[] = new Array(d).fill(0);
+    const stds: number[] = new Array(d).fill(1);
+    for (let j = 0; j < d; j++) {
+      for (let i = 0; i < subsampleSize; i++) means[j] += subFeatures[i][j];
+      means[j] /= subsampleSize;
+      let v = 0;
+      for (let i = 0; i < subsampleSize; i++) v += (subFeatures[i][j] - means[j]) ** 2;
+      v /= subsampleSize;
+      stds[j] = Math.sqrt(v) || 1;
+    }
+    const stdFeatures = subFeatures.map(row => row.map((v, j) => (v - means[j]) / stds[j]));
+    const w = new Array(d).fill(0);
+    let bias = 0;
+    for (let iter = 0; iter < 50; iter++) {
+      const grad = new Array(d).fill(0);
+      let gradB = 0;
+      for (let i = 0; i < subsampleSize; i++) {
+        const z = bias + stdFeatures[i].reduce((a, x, j) => a + x * w[j], 0);
+        const pred = sigmoid(z);
+        const err = pred - subLabels[i];
+        for (let j = 0; j < d; j++) grad[j] += err * stdFeatures[i][j];
+        gradB += err;
+      }
+      for (let j = 0; j < d; j++) w[j] -= 0.01 * grad[j] / subsampleSize;
+      bias -= 0.01 * gradB / subsampleSize;
+    }
+    // Find top-K features by |coefficient|
+    const ranked = w.map((weight, j) => ({ j, absW: Math.abs(weight) }))
+      .sort((a, b) => b.absW - a.absW)
+      .slice(0, topK);
+    for (const r of ranked) selectionCount[r.j]++;
+  }
+
+  // Compute stability metrics
+  const stabilitySelection = FEATURE_NAMES.map((feature, j) => {
+    const freq = selectionCount[j] / nIterations;
+    const verdict: "stable" | "borderline" | "unstable" = freq >= piThreshold ? "stable" : freq >= 0.4 ? "borderline" : "unstable";
+    return {
+      feature,
+      selectionFrequency: freq,
+      selectionPct: freq * 100,
+      rank: 0,
+      verdict,
+    };
+  }).sort((a, b) => b.selectionFrequency - a.selectionFrequency);
+  stabilitySelection.forEach((s, i) => s.rank = i + 1);
+
+  return {
+    stabilitySelection,
+    stabilityParams: {
+      nIterations,
+      selectionThreshold: piThreshold,
+      topK,
+      description: `Subsample (50% without replacement) × ${nIterations} iterations. Feature "selected" if in top-${topK} by |coefficient|. Stable if selected ≥ ${(piThreshold * 100).toFixed(0)}% of iterations.`,
+    },
+  };
 }
 
 // Train logistic regression with STANDARDIZED features + p-values
@@ -1123,6 +1218,13 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   const tbDynDown = tbDynOutcomes.filter(o => o === -1).length;
   const tbDynTimeout = tbDynLabels.filter(l => l === 0).length;
   const tbDynAvgBarrierPct = tbDynBarrierPcts.length > 0 ? tbDynBarrierPcts.reduce((a, b) => a + b, 0) / tbDynBarrierPcts.length : 0;
+  // P7: Wilson 95% CI for dynamic barrier hit rates (uncertainty quantification)
+  const dynUpRate = tbDynTotal > 0 ? tbDynUp / tbDynTotal : 0;
+  const dynDownRate = tbDynTotal > 0 ? tbDynDown / tbDynTotal : 0;
+  const dynTimeoutRate = tbDynTotal > 0 ? tbDynTimeout / tbDynTotal : 0;
+  const dynUpCI = wilsonCI(dynUpRate, tbDynTotal);
+  const dynDownCI = wilsonCI(dynDownRate, tbDynTotal);
+  const dynTimeoutCI = wilsonCI(dynTimeoutRate, tbDynTotal);
   const dynamicTripleBarrier = {
     kUp: tbDynKUp, kDown: tbDynKDown, maxBars: tbDynMaxBars,
     labels: tbDynLabels,
@@ -1132,7 +1234,10 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     timeoutPct: tbDynTotal > 0 ? (tbDynTimeout / tbDynTotal) * 100 : 0,
     avgUpBarrierPct: tbDynAvgBarrierPct,
     avgDownBarrierPct: tbDynAvgBarrierPct, // symmetric
-    description: `Dynamic ±${tbDynKUp}×ATR(14) barriers, max ${tbDynMaxBars}h. Avg barrier ${(tbDynAvgBarrierPct * 100).toFixed(2)}% (vs fixed ${tbUpBarrier * 100}%). Timeout ${tbDynTotal > 0 ? ((tbDynTimeout / tbDynTotal) * 100).toFixed(1) : "0"}%.`,
+    upPctCiLo: dynUpCI.lo, upPctCiHi: dynUpCI.hi,
+    downPctCiLo: dynDownCI.lo, downPctCiHi: dynDownCI.hi,
+    timeoutPctCiLo: dynTimeoutCI.lo, timeoutPctCiHi: dynTimeoutCI.hi,
+    description: `Dynamic ±${tbDynKUp}×ATR(14) barriers, max ${tbDynMaxBars}h. Avg barrier ${(tbDynAvgBarrierPct * 100).toFixed(2)}% (vs fixed ${tbUpBarrier * 100}%). Timeout ${tbDynTotal > 0 ? ((tbDynTimeout / tbDynTotal) * 100).toFixed(1) : "0"}% [Wilson 95% CI ${(dynTimeoutCI.lo * 100).toFixed(1)}-${(dynTimeoutCI.hi * 100).toFixed(1)}%].`,
   };
 
   // P7: Return attribution sample weighting
@@ -1166,6 +1271,8 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
 
   // P5: MDI (Mean Decrease Impurity) via CART ensemble + MDA (permutation importance alias)
   const mdiImportance = computeMDI(featureList, labels, 20, 4);
+  // P6: Stability selection — bootstrap subsampling × 50 iterations
+  const { stabilitySelection, stabilityParams } = computeStabilitySelection(featureList, labels, 50, 3, 0.7);
   // MDA = permutation importance (same algorithm), add rank
   const mdaImportance = model.permutationImportance
     .slice().sort((a, b) => b.importance - a.importance)
@@ -1250,6 +1357,8 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     mdiImportance,
     mdaImportance,
     featureSelection,
+    stabilitySelection,
+    stabilityParams,
     aucROC: model.aucROC,
     aucPR: model.aucPR,
     lrStat: model.lrStat,

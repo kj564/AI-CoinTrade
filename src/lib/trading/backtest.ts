@@ -172,6 +172,8 @@ export interface BlockStats {
   maxCorrelation: number;
   minCorrelation: number;
   pairs: number;            // number of strategy pairs analyzed
+  effectiveN: number;       // P4: effective independent strategies in block = size / (1 + (size-1)*avg_ρ)
+  effectiveNPct: number;    // P4: % of nominal strategies that are "independent"
   interpretation: string;   // human-readable verdict on intra-block redundancy
 }
 export interface BlockCorrelationAnalysis {
@@ -184,7 +186,7 @@ export interface BlockCorrelationAnalysis {
   description: string;
 }
 function emptyBlock(): BlockStats {
-  return { name: "", size: 0, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, interpretation: "empty" };
+  return { name: "", size: 0, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: 0, effectiveNPct: 0, interpretation: "empty" };
 }
 
 // Effective trial count via eigenvalue participation ratio (Lopez de Prado)
@@ -270,14 +272,21 @@ function computeEffectiveTrials(equityCurves: number[][], nStrategies: number, c
   const revIdx = [1, 2, 4, 5].filter(i => i < N);
   const confIdx = [6].filter(i => i < N);
   const blockStats = (idx: number[], name: string): BlockStats => {
-    if (idx.length < 2) return { name, size: idx.length, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, interpretation: "singleton or empty block" };
+    if (idx.length < 2) return { name, size: idx.length, avgCorrelation: 0, maxCorrelation: 0, minCorrelation: 0, pairs: 0, effectiveN: idx.length, effectiveNPct: 100, interpretation: "singleton or empty block" };
     const corrs: number[] = [];
     for (const i of idx) for (const j of idx) if (i < j) corrs.push(corr[i][j]);
     const avg = corrs.reduce((a, b) => a + b, 0) / corrs.length;
     const max = Math.max(...corrs);
     const min = Math.min(...corrs);
-    const interpretation = avg > 0.7 ? "very high intra-block correlation — effectively 1 strategy" : avg > 0.4 ? "high intra-block correlation — strategies are redundant" : avg > 0.2 ? "moderate intra-block correlation" : avg > 0 ? "low intra-block correlation — strategies are independent" : "no intra-block correlation";
-    return { name, size: idx.length, avgCorrelation: avg, maxCorrelation: max, minCorrelation: min, pairs: corrs.length, interpretation };
+    // P4: Effective N per block = size / (1 + (size-1) * avg_ρ)
+    // For independent strategies (ρ=0): N_eff = size
+    // For perfectly correlated (ρ=1): N_eff = 1
+    // For ρ=0.5: N_eff = size / (1 + (size-1)*0.5)
+    const size = idx.length;
+    const effectiveN = avg >= 0.999 ? 1 : size / (1 + (size - 1) * Math.max(0, avg));
+    const effectiveNPct = size > 0 ? (effectiveN / size) * 100 : 0;
+    const interpretation = avg > 0.7 ? `very high intra-block correlation — effectively 1 strategy (N_eff=${effectiveN.toFixed(1)})` : avg > 0.4 ? `high intra-block correlation — strategies redundant (N_eff=${effectiveN.toFixed(1)} of ${size})` : avg > 0.2 ? `moderate intra-block correlation (N_eff=${effectiveN.toFixed(1)} of ${size})` : avg > 0 ? `low intra-block correlation — strategies independent (N_eff=${effectiveN.toFixed(1)} of ${size})` : `no intra-block correlation (N_eff=${effectiveN.toFixed(1)} of ${size})`;
+    return { name, size, avgCorrelation: avg, maxCorrelation: max, minCorrelation: min, pairs: corrs.length, effectiveN, effectiveNPct, interpretation };
   };
   // Cross-block correlation: average pairwise correlation between strategies in DIFFERENT blocks
   const crossCorrs: number[] = [];
@@ -773,6 +782,37 @@ export interface BacktestResult {
   // P3: Maker fee modeling — 3 execution scenarios
   feeScenarios: FeeScenario[];
   feeBreakdown: FeeBreakdown;
+  // P1-3: Realistic limit order execution — fill probability + partial fill + adverse selection
+  realisticLimitAnalysis: RealisticLimitAnalysis;
+}
+
+// P1-3: Realistic limit order execution analysis
+// Models the fact that limit orders don't always fill (fill probability),
+// may only partially fill (partial fill modeling), and when they do fill,
+// it's often because price moved AGAINST the trader (adverse selection).
+export interface RealisticLimitAnalysis {
+  // P1: Fill probability — fraction of limit entries that actually filled
+  totalLimitOrders: number;
+  filledOrders: number;
+  missedOrders: number;
+  fillProbability: number;       // 0-1
+  fillProbabilityPct: number;    // 0-100
+  avgWaitBarsToFill: number;     // how long until fill (avg)
+  // P2: Partial fill modeling
+  fullFills: number;
+  partialFills: number;
+  partialFillRate: number;       // fraction of fills that were partial
+  avgFillFraction: number;       // 0-1, average fraction of order filled
+  // P3: Adverse selection — when limit fills, price often keeps moving against you
+  avgAdverseSelectionPct: number;     // avg return 1 bar after fill (negative = adverse)
+  adverseSelectionRate: number;       // fraction of fills where price moved against trader next bar
+  // Net economic impact
+  realisticMakerNetProfit: number;    // PnL with realistic limit execution
+  realisticMakerProfitFactor: number;
+  realisticMakerWinRate: number;
+  netProfitVsPureMaker: number;       // difference: realistic - pure maker (the cost of execution realism)
+  executionCostPct: number;           // % of pure-maker profit lost to fill/miss/adverse selection
+  description: string;
 }
 
 export interface BacktestConfig {
@@ -788,6 +828,178 @@ export interface BacktestConfig {
 // Compute realistic execution cost: taker fee + spread + slippage
 function executionCost(price: number, feeRate: number, spreadPct: number, slippagePct: number): number {
   return price * (feeRate + spreadPct + slippagePct);
+}
+
+// P1-3: Realistic limit order execution simulator
+// Given the trades produced by a strategy (which assumed market entry at close),
+// simulate what would happen if we instead placed a LIMIT order at the close price.
+//
+// Realistic behaviors modeled:
+//   P1. Fill probability: limit only fills if subsequent candles' low/high cross the limit
+//   P2. Partial fill: fill fraction depends on volume at limit price vs avg volume
+//   P3. Adverse selection: when limit fills, price often continues against trader
+//
+// Parameters:
+//   candles: full candle series (used to look up post-entry price action)
+//   trades: trades produced by the strategy (assumed market-entry baseline)
+//   makerFeeRate: maker fee per side (0% INDODAX)
+//   takerFeeRate: taker fee per side (0.3% INDODAX) — applied to exits since SL/TP must be market
+//   maxWaitBars: how many bars to wait for limit fill before canceling (default 3)
+//   adverseSelectionBars: how many bars after fill to measure adverse selection (default 1)
+function simulateRealisticLimitExecution(
+  candles: Candle[],
+  trades: BacktestTrade[],
+  makerFeeRate: number,
+  takerFeeRate: number,
+  maxWaitBars = 3,
+  adverseSelectionBars = 1
+): RealisticLimitAnalysis {
+  if (trades.length === 0) {
+    return {
+      totalLimitOrders: 0, filledOrders: 0, missedOrders: 0,
+      fillProbability: 0, fillProbabilityPct: 0, avgWaitBarsToFill: 0,
+      fullFills: 0, partialFills: 0, partialFillRate: 0, avgFillFraction: 0,
+      avgAdverseSelectionPct: 0, adverseSelectionRate: 0,
+      realisticMakerNetProfit: 0, realisticMakerProfitFactor: 0, realisticMakerWinRate: 0,
+      netProfitVsPureMaker: 0, executionCostPct: 0,
+      description: "No trades to analyze.",
+    };
+  }
+  // Build time→index map for O(1) candle lookup
+  const timeToIdx = new Map<number, number>();
+  for (let i = 0; i < candles.length; i++) timeToIdx.set(candles[i].time, i);
+  // Average volume for partial-fill heuristic
+  const avgVolume = candles.reduce((a, c) => a + c.volume, 0) / Math.max(1, candles.length);
+
+  let filledCount = 0;
+  let missedCount = 0;
+  let fullFills = 0;
+  let partialFills = 0;
+  let totalWaitBars = 0;
+  let totalFillFraction = 0;
+  const adverseSelectionReturns: number[] = [];
+  const realisticPnls: number[] = [];
+
+  for (const trade of trades) {
+    const entryIdx = timeToIdx.get(trade.entryTime);
+    if (entryIdx === undefined || entryIdx + maxWaitBars + adverseSelectionBars >= candles.length) {
+      // Can't analyze — treat as missed
+      missedCount++;
+      continue;
+    }
+    // P1: Place BUY limit at the close (assume strategy went long; all our strategies are long-only)
+    // Limit fills if any subsequent candle's low ≤ limitPrice
+    const limitPrice = candles[entryIdx].close;
+    let fillIdx = -1;
+    for (let j = 1; j <= maxWaitBars; j++) {
+      const futureCandle = candles[entryIdx + j];
+      // Buy limit fills if low touches limit price
+      if (futureCandle.low <= limitPrice) {
+        fillIdx = entryIdx + j;
+        break;
+      }
+    }
+    if (fillIdx === -1) {
+      // P1: Limit never filled within wait window — order canceled, entry missed
+      missedCount++;
+      continue;
+    }
+    filledCount++;
+    totalWaitBars += (fillIdx - entryIdx);
+
+    // P2: Partial fill modeling — fill fraction based on volume at limit price vs avg
+    // Heuristic: if the filling candle's volume is much smaller than average,
+    // assume partial fill (queue ahead of us absorbed most volume).
+    const fillCandle = candles[fillIdx];
+    const volRatio = avgVolume > 0 ? fillCandle.volume / avgVolume : 1;
+    // Fill fraction: 100% if volume ≥ avg, scaled down if volume < avg
+    // volRatio > 1: full fill (volume was sufficient)
+    // volRatio < 0.3: only 30% filled (queue absorbed most)
+    // volRatio < 0.1: severe partial — only 10% filled
+    const fillFraction = Math.max(0.1, Math.min(1, volRatio));
+    totalFillFraction += fillFraction;
+    if (fillFraction >= 0.99) fullFills++;
+    else partialFills++;
+
+    // P3: Adverse selection — measure return `adverseSelectionBars` after fill
+    // If price moved further down after fill, that's adverse selection
+    // (we got filled because price was dropping, and it kept dropping).
+    const postFillPrice = candles[Math.min(candles.length - 1, fillIdx + adverseSelectionBars)].close;
+    const adverseReturn = (postFillPrice - limitPrice) / limitPrice; // negative = adverse for buy
+    adverseSelectionReturns.push(adverseReturn);
+
+    // Compute realistic PnL for this trade:
+    // - Entry at limitPrice (maker fee, no spread/slippage)
+    // - Exit at trade.exitPrice (taker fee — SL/TP must be market orders)
+    // - Scale by fillFraction (partial fills reduce position size)
+    // - If we missed the entry, that trade is excluded (already counted in missedCount)
+    // Find exit index to check if SL/TP would still trigger at the original exit time
+    const exitIdx = timeToIdx.get(trade.exitTime);
+    if (exitIdx === undefined) continue;
+    // Exit price: use original exitPrice (assume SL/TP triggers same way from entry)
+    // But entry is now at fillIdx, so exit candle is shifted by (fillIdx - entryIdx)
+    // Conservative: use original exit candle (might be earlier than realistic)
+    const entryFee = limitPrice * makerFeeRate;
+    const exitFee = trade.exitPrice * takerFeeRate;
+    const pnlPerUnit = trade.exitPrice - limitPrice - entryFee - exitFee;
+    const realisticPnl = pnlPerUnit * fillFraction;
+    realisticPnls.push(realisticPnl);
+  }
+
+  // Aggregate stats
+  const fillProbability = trades.length > 0 ? filledCount / trades.length : 0;
+  const partialFillRate = filledCount > 0 ? partialFills / filledCount : 0;
+  const avgFillFraction = filledCount > 0 ? totalFillFraction / filledCount : 0;
+  const avgWaitBarsToFill = filledCount > 0 ? totalWaitBars / filledCount : 0;
+  const avgAdverseSelectionPct = adverseSelectionReturns.length > 0
+    ? (adverseSelectionReturns.reduce((a, b) => a + b, 0) / adverseSelectionReturns.length) * 100
+    : 0;
+  // Adverse selection rate: fraction of fills where price moved against trader next bar
+  // For buy limit: against trader = price went down (adverseReturn < 0)
+  const adverseSelectionRate = adverseSelectionReturns.length > 0
+    ? adverseSelectionReturns.filter(r => r < 0).length / adverseSelectionReturns.length
+    : 0;
+  // Realistic PnL stats
+  const realisticMakerNetProfit = realisticPnls.reduce((a, b) => a + b, 0);
+  const rWins = realisticPnls.filter(p => p > 0);
+  const rLosses = realisticPnls.filter(p => p <= 0);
+  const rAvgWin = rWins.length > 0 ? rWins.reduce((a, b) => a + b, 0) / rWins.length : 0;
+  const rAvgLoss = rLosses.length > 0 ? Math.abs(rLosses.reduce((a, b) => a + b, 0) / rLosses.length) : 0;
+  const realisticMakerProfitFactor = rAvgLoss > 0 ? rAvgWin / rAvgLoss : rWins.length > 0 ? Infinity : 0;
+  const realisticMakerWinRate = realisticPnls.length > 0 ? (rWins.length / realisticPnls.length) * 100 : 0;
+
+  // Pure-maker net profit (theoretical — assumes all entries filled at limit price)
+  const pureMakerNetProfit = trades.reduce((a, t) => {
+    const entryFee = t.entryPrice * makerFeeRate;
+    const exitFee = t.exitPrice * makerFeeRate;
+    return a + (t.exitPrice - t.entryPrice - entryFee - exitFee);
+  }, 0);
+  const netProfitVsPureMaker = realisticMakerNetProfit - pureMakerNetProfit;
+  // Execution cost as % of pure-maker profit (the "tax" of execution realism)
+  const executionCostPct = pureMakerNetProfit !== 0
+    ? (netProfitVsPureMaker / Math.abs(pureMakerNetProfit)) * 100
+    : 0;
+
+  return {
+    totalLimitOrders: trades.length,
+    filledOrders: filledCount,
+    missedOrders: missedCount,
+    fillProbability,
+    fillProbabilityPct: fillProbability * 100,
+    avgWaitBarsToFill,
+    fullFills,
+    partialFills,
+    partialFillRate,
+    avgFillFraction,
+    avgAdverseSelectionPct,
+    adverseSelectionRate,
+    realisticMakerNetProfit,
+    realisticMakerProfitFactor: isFinite(realisticMakerProfitFactor) ? realisticMakerProfitFactor : 999,
+    realisticMakerWinRate,
+    netProfitVsPureMaker,
+    executionCostPct,
+    description: `Realistic limit execution: ${filledCount}/${trades.length} filled (${(fillProbability * 100).toFixed(1)}%), ${missedCount} missed. Partial fill rate ${(partialFillRate * 100).toFixed(1)}% (avg ${(avgFillFraction * 100).toFixed(1)}% of order filled). Adverse selection rate ${(adverseSelectionRate * 100).toFixed(1)}% (avg next-bar move ${avgAdverseSelectionPct.toFixed(3)}%). Realistic maker P&L ${realisticMakerNetProfit.toFixed(0)} vs pure-maker ${pureMakerNetProfit.toFixed(0)} (${executionCostPct >= 0 ? "+" : ""}${executionCostPct.toFixed(1)}% impact).`,
+  };
 }
 
 export function runBacktest(candles: Candle[], config: BacktestConfig): BacktestResult {
@@ -935,6 +1147,11 @@ export function runBacktest(candles: Candle[], config: BacktestConfig): Backtest
     note: "INDODAX: maker 0% (limit), taker 0.3% (market). Realistic = hybrid (limit entry + market exit).",
   };
 
+  // P1-3: Realistic limit order execution — fill probability, partial fill, adverse selection
+  const realisticLimitAnalysis = simulateRealisticLimitExecution(
+    candles, trades, makerFee, fee, 3, 1
+  );
+
   return {
     trades, netProfit, profitFactor, maxDrawdown: Math.min(maxDD, 100),
     winRate: trades.length > 0 ? (wins.length / trades.length) * 100 : 0,
@@ -946,6 +1163,7 @@ export function runBacktest(candles: Candle[], config: BacktestConfig): Backtest
     monteCarlo: mc,
     feeScenarios,
     feeBreakdown,
+    realisticLimitAnalysis,
     verdict: assessVerdict(trades.length, profitFactor, Math.min(maxDD, 100), wins.length / Math.max(1, trades.length)),
   };
 }
