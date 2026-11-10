@@ -1,0 +1,61 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getTicker } from "@/lib/indodax";
+import { runBacktest, assessRisk, optimizePositions, generateReport, type BacktestConfig } from "@/lib/trading/backtest";
+import { loadCandles, type Timeframe } from "@/lib/trading/candles";
+import { fetchLastNDays } from "@/lib/trading/ccxt-provider";
+
+export const runtime = "nodejs";
+export const maxDuration = 60;
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { pair, strategy, initialCapital, stopLossPct, takeProfitPct, params } = body;
+    if (!pair) return NextResponse.json({ error: "pair required" }, { status: 400 });
+
+    const tf = (params?.timeframe || "1h") as Timeframe;
+    const feeRate = params?.feeRate ?? 0.003; // INDODAX taker 0.3%
+
+    // Load real historical candles from DB
+    let candles = await loadCandles(pair, tf, 3000);
+
+    // If not enough, backfill from INDODAX via direct fetch (tradingview endpoint)
+    if (candles.length < 50) {
+      const days = tf === "1h" ? 90 : tf === "1m" ? 2 : tf === "1d" ? 365 : 90;
+      await fetchLastNDays(pair, tf, days);
+      candles = await loadCandles(pair, tf, 3000);
+    }
+
+    if (candles.length < 10) {
+      return NextResponse.json({ error: `Not enough real candle data (${candles.length} ${tf} candles).` }, { status: 400 });
+    }
+
+    const source = candles.length >= 50 ? "historical" : "recent";
+    const btInput = candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }));
+
+    const config: BacktestConfig = {
+      strategy: strategy || "sma_cross",
+      initialCapital: initialCapital || 10000000,
+      pair,
+      stopLossPct: stopLossPct || 0.03,
+      takeProfitPct: takeProfitPct || 0.05,
+      params: params || {},
+      feeRate,
+    };
+    const result = runBacktest(btInput, config);
+    const risk = assessRisk(result, config.strategy);
+    const firstEntry = result.trades[0]?.entryPrice || parseFloat((await getTicker(pair))?.last || "0");
+    // Compute actual R = avgWin/avgLoss for correct Kelly Criterion
+    const actualR = result.avgLoss > 0 ? result.avgWin / result.avgLoss : result.avgWin > 0 ? 999 : 1;
+    const positions = optimizePositions(config.initialCapital, firstEntry, firstEntry * 0.97, result.winRate / 100, actualR, 0);
+    const report = generateReport(pair, config, result, risk, positions);
+
+    return NextResponse.json({
+      success: true, result, risk, positions, report, config,
+      dataSource: { source, timeframe: tf, candleCount: candles.length, windowDays: Math.round((candles[candles.length - 1]?.time - candles[0]?.time) / 86400), feeRate },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "Backtest failed";
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
+}

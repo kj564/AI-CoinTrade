@@ -1,0 +1,343 @@
+{
+  "id": "benchmark-bees-pesticides",
+  "title": "Bella Bee and the Bitter Mist",
+  "topic": "A bees and pesticides storybook — benchmark",
+  "style": "paper-cutout",
+  "resolution": "1080p",
+  "voice": "tongtong",
+  "music": true,
+  "sceneCount": 5,
+  "scenes": [
+    {
+      "id": "scene-0",
+      "index": 0,
+      "title": "A Buzzing Garden",
+      "narration": "Bella the honeybee woke to a golden morning, dancing from sunflower to sunflower, sipping sweet nectar.",
+      "visualPrompt": "A joyful honeybee flying between tall bright sunflowers in a sunlit paper-cutout garden, warm golden morning light, paper-cutout collage illustration, layered green rolling hills, warm round sun, soft clay and felt textures, hand-cut paper shapes, child craft storybook art, gentle paper shadows, textured paper grain, warm cream background, charming and cozy, no text, no watermark, no photorealism",
+      "imageUrl": "/story-assets/bees-scene-0-1794044048774.png",
+      "audioUrl": "/story-assets/bees-scene-0-1794044018175.wav",
+      "durationSec": 6,
+      "props": [
+        {
+          "id": "prop-0-0",
+          "name": "honeybee",
+          "emoji": "🐝",
+          "placement": "center",
+          "entrance": "pop",
+          "delay": 200,
+          "spriteAssetId": "honeybee-base",
+          "spriteTitle": "Honeybee",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/honeybee-base.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/honeybee-base-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/honeybee-base-preview.glb",
+          "polyforkAssetId": "honeybee-base"
+        },
+        {
+          "id": "prop-0-1",
+          "name": "sunflower",
+          "emoji": "🌻",
+          "placement": "left",
+          "entrance": "grow",
+          "delay": 400,
+          "spriteAssetId": "sunflower-80ce15",
+          "spriteTitle": "Sunflower",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/sunflower-80ce15.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/sunflower-80ce15-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/sunflower-80ce15-preview.glb",
+          "polyforkAssetId": "sunflower-80ce15"
+        },
+        {
+          "id": "prop-0-2",
+          "name": "sun",
+          "emoji": "☀️",
+          "placement": "top",
+          "entrance": "fade",
+          "delay": 0,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: sun",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Sun body - a sphere\n    sun = s3d.sphere(\"sun\", 120)\n    \n    # Sun rays - triangular shapes extruded from the sphere\n    ray_profile = s3d.poly([(0, 0), (15, 0), (20, 10), (15, 20), (0, 20)])\n    rays = []\n    for angle in range(0, 360, 30):\n        frame = s3d.Frame((0, 0, 0), (0, 0, 1), (1, 0, 0)).turn(rz=angle)\n        ray = s3d.extrude(\"ray\", ray_profile, 60, on=frame)\n        rays.append(s3d.at(ray, on=s3d.bbox(sun, \"+Z\")))\n    \n    # Combine sun and rays\n    s3d.join(sun, *rays)\n    \n    # Add a simple face to make it recognizable\n    eye1 = s3d.at(s3d.sphere(\"eye1\", 15), x=-30, y=-20, z=30)\n    eye2 = s3d.at(s3d.sphere(\"eye2\", 15), x=30, y=-20, z=30)\n    mouth = s3d.at(s3d.cylinder(\"mouth\", 40, 10, d2=20), x=0, y=30, z=30, rx=90)\n    \n    s3d.join(sun, eye1, eye2, mouth)\n    \n    # Add a stand to make it hand-held\n    stand = s3d.at(s3d.box(\"stand\", 20, 20, 100), x=0, y=0, z=-100)\n    s3d.join(sun, stand)\n    \n    return sun\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"sun.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-0-2.mjs",
+          "programUrl": "/download/sand3d-props/bees-0-2.mjs"
+        }
+      ],
+      "mood": "joyful",
+      "palette": [
+        "#E8B547",
+        "#F2B233",
+        "#7A9B6E"
+      ]
+    },
+    {
+      "id": "scene-1",
+      "index": 1,
+      "title": "The Sweet Hive",
+      "narration": "She carried the nectar home to the hive, tucking it into the honeycomb to feed her sisters.",
+      "visualPrompt": "A cozy wooden beehive with golden honeycomb cells inside, a little bee entering, warm afternoon paper-cutout scene, paper-cutout collage illustration, layered green rolling hills, warm round sun, soft clay and felt textures, hand-cut paper shapes, child craft storybook art, gentle paper shadows, textured paper grain, warm cream background, charming and cozy, no text, no watermark, no photorealism",
+      "imageUrl": "/story-assets/bees-scene-1-1794044132631.png",
+      "audioUrl": "/story-assets/bees-scene-1-1794044100698.wav",
+      "durationSec": 6,
+      "props": [
+        {
+          "id": "prop-1-0",
+          "name": "beehive",
+          "emoji": "🏠",
+          "placement": "center",
+          "entrance": "grow",
+          "delay": 200,
+          "spriteAssetId": "beehive-2e70bf",
+          "spriteTitle": "Beehive",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/beehive-2e70bf.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/beehive-2e70bf-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/beehive-2e70bf-preview.glb",
+          "polyforkAssetId": "beehive-2e70bf"
+        },
+        {
+          "id": "prop-1-1",
+          "name": "honeycomb",
+          "emoji": "🍯",
+          "placement": "left",
+          "entrance": "pop",
+          "delay": 600,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: honeycomb",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Create hexagonal cells\n    def hex_cell(d):\n        points = []\n        for i in range(6):\n            angle = i * 60\n            x = d * 0.5 * s3d.math.cos(s3d.math.radians(angle))\n            y = d * 0.5 * s3d.math.sin(s3d.math.radians(angle))\n            points.append((x, y))\n        return s3d.poly(points)\n\n    # Build honeycomb pattern\n    cell = s3d.extrude(\"cell\", hex_cell(20), 15)\n    honeycomb = s3d.assembly(\"honeycomb\")\n    \n    # Arrange cells in honeycomb pattern\n    rows = 4\n    cols = 5\n    for row in range(rows):\n        for col in range(cols):\n            # Offset every other row\n            x_offset = 17.32 if row % 2 == 1 else 0\n            x = col * 34.64 + x_offset\n            y = row * 30\n            honeycomb.attach(\"cell\", s3d.at(s3d.copy(cell), x=x, y=y))\n\n    # Add honey droplet\n    droplet = s3d.at(s3d.sphere(\"droplet\", 12), x=0, y=-40, z=5)\n    s3d.material(droplet, \"glossy_plastic\", color=\"#FFD700\", opacity=0.8)\n    honeycomb.attach(\"droplet\", droplet)\n\n    # Add handle\n    handle = s3d.at(s3d.box(\"handle\", 60, 10, 5), x=0, y=-60, z=20)\n    s3d.material(handle, \"wood\", color=\"#8B4513\")\n    honeycomb.attach(\"handle\", handle)\n\n    return honeycomb\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"honeycomb.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-1-1.mjs",
+          "programUrl": "/download/sand3d-props/bees-1-1.mjs"
+        },
+        {
+          "id": "prop-1-2",
+          "name": "honeybee",
+          "emoji": "🐝",
+          "placement": "right",
+          "entrance": "slide-left",
+          "delay": 1000,
+          "spriteAssetId": "honeybee-base",
+          "spriteTitle": "Honeybee",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/honeybee-base.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/honeybee-base-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/honeybee-base-preview.glb",
+          "polyforkAssetId": "honeybee-base"
+        }
+      ],
+      "mood": "cozy",
+      "palette": [
+        "#E8B547",
+        "#C7634A",
+        "#F2B233"
+      ]
+    },
+    {
+      "id": "scene-2",
+      "index": 2,
+      "title": "The Bitter Mist",
+      "narration": "Then a farmer came with a pesticide sprayer, and a bitter mist drifted across the blooms.",
+      "visualPrompt": "A tense paper-cutout scene of a farmer walking through a field spraying a grey chemical mist over flowers, muted cool tones, droplets drifting, paper-cutout collage illustration, layered green rolling hills, warm round sun, soft clay and felt textures, hand-cut paper shapes, child craft storybook art, gentle paper shadows, textured paper grain, warm cream background, charming and cozy, no text, no watermark, no photorealism",
+      "imageUrl": "/story-assets/bees-scene-2-1794044239075.png",
+      "audioUrl": "/story-assets/bees-scene-2-1794044174479.wav",
+      "durationSec": 7,
+      "props": [
+        {
+          "id": "prop-2-0",
+          "name": "pesticide sprayer",
+          "emoji": "🧴",
+          "placement": "center",
+          "entrance": "pop",
+          "delay": 300,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: pesticide sprayer",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Main tank body\n    tank = s3d.extrude(\"tank\", s3d.rect(40, 60, r=8), 80)\n    \n    # Nozzle attachment\n    nozzle_base = s3d.at(s3d.cylinder(\"nozzle_base\", 20, 15), on=tank.face(\"+Z\"), z=80)\n    \n    # Nozzle tip\n    nozzle = s3d.extrude(\"nozzle\", s3d.rect(10, 15), 30)\n    s3d.at(nozzle, on=nozzle_base.face(\"+Z\"), x=-5, y=0)\n    \n    # Spray trigger\n    trigger = s3d.at(s3d.box(\"trigger\", 30, 8, 15), on=tank.face(\"-X\"), x=-40, y=0, z=40)\n    s3d.fillet(trigger, 2, edges=\"+Y-Z +Y+Z\")\n    \n    # Handle\n    handle = s3d.at(s3d.extrude(\"handle\", s3d.rect(25, 15, r=5), 50), on=tank.face(\"-X\"), x=-40, y=0, z=60)\n    s3d.fillet(handle, 3, edges=\"top\")\n    \n    # Pressure pump\n    pump = s3d.at(s3d.cylinder(\"pump\", 25, 30), on=tank.face(\"-X\"), x=-40, y=0, z=30)\n    s3d.fillet(pump, 2, edges=\"top bottom\")\n    \n    # Assembly\n    sprayer = s3d.assembly(\"pesticide_sprayer\", tank, nozzle_base, nozzle, trigger, handle, pump)\n    return sprayer\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"pesticide_sprayer.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-2-0.mjs",
+          "programUrl": "/download/sand3d-props/bees-2-0.mjs"
+        },
+        {
+          "id": "prop-2-1",
+          "name": "tractor",
+          "emoji": "🚜",
+          "placement": "left",
+          "entrance": "slide-right",
+          "delay": 600,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: tractor",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Main body\n    body = s3d.extrude(\"body\", s3d.rect(120, 60, r=8), 40)\n    \n    # Cab\n    cab = s3d.at(s3d.box(\"cab\", 50, 40, 35), x=-20, y=10, z=40)\n    \n    # Hood\n    hood = s3d.at(s3d.box(\"hood\", 40, 35, 25), x=20, y=12.5, z=15)\n    \n    # Wheels\n    front_wheel = s3d.at(s3d.cylinder(\"front_wheel\", 25, 8), x=-40, y=0, z=8)\n    rear_wheel = s3d.at(s3d.cylinder(\"rear_wheel\", 35, 10), x=40, y=0, z=10)\n    \n    # Steering wheel\n    steering = s3d.at(s3d.cylinder(\"steering\", 8, 5), on=cab.face(\"front\"), z=10)\n    \n    # Exhaust stack\n    exhaust = s3d.at(s3d.cylinder(\"exhaust\", 6, 15), x=30, y=0, z=40)\n    \n    # Combine all parts\n    tractor = s3d.assembly(\"tractor\", body, cab, hood, front_wheel, rear_wheel, steering, exhaust)\n    \n    return tractor\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"tractor.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-2-1.mjs",
+          "programUrl": "/download/sand3d-props/bees-2-1.mjs"
+        },
+        {
+          "id": "prop-2-2",
+          "name": "cloud",
+          "emoji": "☁️",
+          "placement": "top",
+          "entrance": "fade",
+          "delay": 0,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: cloud",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Main cloud body - soft puffy shape\n    cloud_body = s3d.extrude(\"cloud_body\", s3d.poly([(0, 0), (60, 0), (80, 20), (60, 40), (30, 50), (0, 40), (-20, 20)], fillet=8), 20)\n    \n    # Add smaller cloud bumps for texture\n    bump1 = s3d.at(s3d.sphere(\"bump1\", 25), x=-30, y=15, z=10)\n    bump2 = s3d.at(s3d.sphere(\"bump2\", 20), x=40, y=-10, z=15)\n    bump3 = s3d.at(s3d.sphere(\"bump3\", 18), x=20, y=30, z=5)\n    \n    # Assemble the cloud\n    cloud = s3d.group(\"cloud\", cloud_body, bump1, bump2, bump3)\n    \n    # Add a simple handle for holding\n    handle = s3d.at(s3d.extrude(\"handle\", s3d.rect(10, 40), 30), on=s3d.bbox(cloud, \"-Z\"), z=25)\n    s3d.fillet(handle, 2, edges=\"all\")\n    \n    # Final assembly with handle\n    cloud_prop = s3d.assembly(\"cloud_prop\", cloud, handle)\n    \n    # Apply a soft white material\n    s3d.material(cloud_prop, \"glossy_plastic\", color=\"#f0f8ff\", opacity=0.9)\n    s3d.material(handle, \"plastic\", color=\"#dcdcdc\")\n    \n    return cloud_prop\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"cloud.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-2-2.mjs",
+          "programUrl": "/download/sand3d-props/bees-2-2.mjs"
+        }
+      ],
+      "mood": "tense",
+      "palette": [
+        "#9AA0A6",
+        "#6B7280",
+        "#C7634A"
+      ]
+    },
+    {
+      "id": "scene-3",
+      "index": 3,
+      "title": "The Quiet Flowers",
+      "narration": "The flowers drooped, the nectar dried up, and Bella could find no sweetness anywhere.",
+      "visualPrompt": "A sad paper-cutout scene of wilted drooping flowers in a quiet field, a small bee searching, muted brown and grey tones, a single fallen petal, paper-cutout collage illustration, layered green rolling hills, warm round sun, soft clay and felt textures, hand-cut paper shapes, child craft storybook art, gentle paper shadows, textured paper grain, warm cream background, charming and cozy, no text, no watermark, no photorealism",
+      "imageUrl": "/story-assets/bees-scene-3-1794044316005.png",
+      "audioUrl": "/story-assets/bees-scene-3-1794044284039.wav",
+      "durationSec": 6,
+      "props": [
+        {
+          "id": "prop-3-0",
+          "name": "wilted flower",
+          "emoji": "🥀",
+          "placement": "center",
+          "entrance": "grow",
+          "delay": 200,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: wilted flower",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Stem\n    stem = s3d.extrude(\"stem\", s3d.rect(4, 4), 80)\n    stem = s3d.transform(stem, ry=15)\n    \n    # Wilted petals\n    petal = s3d.extrude(\"petal\", s3d.ellipse(20, 10), 2)\n    petal = s3d.transform(petal, ry=30)\n    \n    # Flower head assembly\n    flower_head = s3d.group(\"flower_head\")\n    for i in range(5):\n        angle = i * 72\n        petal_rotated = s3d.transform(s3d.copy(petal), rz=angle)\n        petal_rotated = s3d.at(petal_rotated, z=2)\n        s3d.join(flower_head, petal_rotated)\n    \n    # Center\n    center = s3d.sphere(\"center\", 8)\n    s3d.join(flower_head, center)\n    \n    # Attach flower head to stem\n    s3d.attach(stem, \"flower_head\", s3d.at(flower_head, on=stem.face(\"top\")))\n    \n    # Base\n    base = s3d.extrude(\"base\", s3d.rect(40, 40, r=5), 5)\n    s3d.join(base, stem)\n    \n    return s3d.assembly(\"wilted_flower\", base)\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"out.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-3-0.mjs",
+          "programUrl": "/download/sand3d-props/bees-3-0.mjs"
+        },
+        {
+          "id": "prop-3-1",
+          "name": "droplet",
+          "emoji": "💧",
+          "placement": "left",
+          "entrance": "slide-up",
+          "delay": 800,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: droplet",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Main droplet body\n    droplet = s3d.revolve(\"droplet\", [(0, 0), (0, 40), (30, 60), (60, 60), (60, 0)], angle=360)\n    \n    # Add a small base for stability\n    base = s3d.extrude(\"base\", s3d.rect(70, 70, r=5), 5)\n    s3d.at(base, z=-2.5)\n    \n    # Combine droplet and base\n    s3d.join(droplet, base)\n    \n    # Add a small hole for hanging\n    s3d.hole(droplet, 3, on=s3d.bbox(droplet, \"+Y-Z\"))\n    \n    return droplet\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"droplet.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-3-1.mjs",
+          "programUrl": "/download/sand3d-props/bees-3-1.mjs"
+        },
+        {
+          "id": "prop-3-2",
+          "name": "honeybee",
+          "emoji": "🐝",
+          "placement": "right",
+          "entrance": "fade",
+          "delay": 1200,
+          "spriteAssetId": "honeybee-base",
+          "spriteTitle": "Honeybee",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/honeybee-base.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/honeybee-base-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/honeybee-base-preview.glb",
+          "polyforkAssetId": "honeybee-base"
+        }
+      ],
+      "mood": "sad",
+      "palette": [
+        "#8B7355",
+        "#A0522D",
+        "#C7634A"
+      ]
+    },
+    {
+      "id": "scene-4",
+      "index": 4,
+      "title": "A Kinder Garden",
+      "narration": "The farmer learned, and switched to ladybugs and gentle ways — and the bees came buzzing back.",
+      "visualPrompt": "A hopeful paper-cutout scene of a bright garden blooming again, ladybugs on leaves, bees returning to sunflowers, a watering can, warm golden light, paper-cutout collage illustration, layered green rolling hills, warm round sun, soft clay and felt textures, hand-cut paper shapes, child craft storybook art, gentle paper shadows, textured paper grain, warm cream background, charming and cozy, no text, no watermark, no photorealism",
+      "imageUrl": "/story-assets/bees-scene-4-1794044387184.png",
+      "audioUrl": "/story-assets/bees-scene-4-1794044357439.wav",
+      "durationSec": 7,
+      "props": [
+        {
+          "id": "prop-4-0",
+          "name": "sunflower",
+          "emoji": "🌻",
+          "placement": "center",
+          "entrance": "pop",
+          "delay": 200,
+          "spriteAssetId": "sunflower-80ce15",
+          "spriteTitle": "Sunflower",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/sunflower-80ce15.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/sunflower-80ce15-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/sunflower-80ce15-preview.glb",
+          "polyforkAssetId": "sunflower-80ce15"
+        },
+        {
+          "id": "prop-4-1",
+          "name": "ladybug",
+          "emoji": "🐞",
+          "placement": "left",
+          "entrance": "grow",
+          "delay": 600,
+          "spriteUrl": null,
+          "spriteTitle": "sand3d: ladybug",
+          "propSource": "sand3d",
+          "sand3dProgram": "import sand3d as s3d\n\ndef build():\n    # Ladybug body (red sphere)\n    body = s3d.sphere(\"body\", 30)\n    s3d.material(body, kind=\"plastic\", color=\"#cc0000\", roughness=0.3)\n    \n    # Ladybug head (smaller sphere)\n    head = s3d.sphere(\"head\", 15)\n    s3d.material(head, kind=\"plastic\", color=\"#cc0000\", roughness=0.3)\n    s3d.at(head, on=body.face(\"+Z\"), x=15)\n    \n    # Eyes (black spheres)\n    eye = s3d.sphere(\"eye\", 4)\n    s3d.material(eye, kind=\"plastic\", color=\"#000000\")\n    left_eye = s3d.at(eye, on=head.face(\"+X\"), x=5, y=3)\n    right_eye = s3d.transform(s3d.copy(eye), mirror=\"x\")\n    \n    # Spots (black circles)\n    spot = s3d.extrude(\"spot\", s3d.circle(6), 1)\n    s3d.material(spot, kind=\"plastic\", color=\"#000000\")\n    spot1 = s3d.at(spot, on=body.face(\"+Y\"), x=-10, z=5)\n    spot2 = s3d.at(s3d.copy(spot), on=body.face(\"-Y\"), x=-10, z=5)\n    spot3 = s3d.at(s3d.copy(spot), on=body.face(\"+Z\"), x=0, z=-10)\n    \n    # Wings (transparent ovals)\n    wing = s3d.extrude(\"wing\", s3d.ellipse(25, 15), 2)\n    s3d.material(wing, kind=\"plastic\", color=\"#ffffff\", opacity=0.7)\n    left_wing = s3d.at(wing, on=body.face(\"+Z\"), x=5, z=-5, ry=30)\n    right_wing = s3d.transform(s3d.copy(left_wing), mirror=\"x\")\n    \n    # Legs (thin cylinders)\n    leg = s3d.cylinder(\"leg\", 1, 10)\n    s3d.material(leg, kind=\"plastic\", color=\"#000000\")\n    leg1 = s3d.at(leg, on=body.face(\"-Y\"), x=-15, z=10, y=-15)\n    leg2 = s3d.at(s3d.copy(leg), on=body.face(\"-Y\"), x=0, z=10, y=-15)\n    leg3 = s3d.at(s3d.copy(leg), on=body.face(\"-Y\"), x=15, z=10, y=-15)\n    \n    return s3d.assembly(\"ladybug\", body, head, left_eye, right_eye, spot1, spot2, spot3, left_wing, right_wing, leg1, leg2, leg3)\n\nif __name__ == \"__main__\":\n    s3d.export(build(), \"ladybug.glb\")",
+          "sand3dFile": "/download/sand3d-props/bees-4-1.mjs",
+          "programUrl": "/download/sand3d-props/bees-4-1.mjs"
+        },
+        {
+          "id": "prop-4-2",
+          "name": "honeybee",
+          "emoji": "🐝",
+          "placement": "right",
+          "entrance": "slide-left",
+          "delay": 1000,
+          "spriteAssetId": "honeybee-base",
+          "spriteTitle": "Honeybee",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/honeybee-base.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/honeybee-base-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/honeybee-base-preview.glb",
+          "polyforkAssetId": "honeybee-base"
+        },
+        {
+          "id": "prop-4-3",
+          "name": "watering can",
+          "emoji": "🚿",
+          "placement": "top",
+          "entrance": "fade",
+          "delay": 0,
+          "spriteAssetId": "watering-can-b22758",
+          "spriteTitle": "Watering Can",
+          "propSource": "polyfork",
+          "moduleUrl": "https://polyfork.dev/cdn/watering-can-b22758.mjs",
+          "paramsUrl": "https://polyfork.dev/cdn/watering-can-b22758-params.json",
+          "glbUrl": "https://polyfork.dev/cdn/watering-can-b22758-preview.glb",
+          "polyforkAssetId": "watering-can-b22758"
+        }
+      ],
+      "mood": "hopeful",
+      "palette": [
+        "#E8B547",
+        "#C7634A",
+        "#7A9B6E"
+      ]
+    }
+  ],
+  "status": "ready",
+  "createdAt": "2026-11-07T09:40:32.938Z",
+  "updatedAt": "2026-11-07T10:21:40.933Z",
+  "benchmark": true,
+  "propSummary": {
+    "polyfork": 8,
+    "sand3d": 8,
+    "emoji": 0
+  }
+}

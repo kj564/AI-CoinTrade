@@ -1,0 +1,103 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model StorybookProject {
+  id          String   @id @default(cuid())
+  title       String
+  topic       String
+  script      String?
+  style       String   @default("paper-cutout")
+  resolution  String   @default("1080p")
+  voice       String   @default("tongtong")
+  music       Boolean  @default(true)
+  sceneCount  Int      @default(5)
+  scenesJson  String   // JSON-serialized Scene[]
+  status      String   @default("draft") // draft | planned | rendering | done
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ── Trading bot models ──
+
+model Candle {
+  id        String   @id @default(cuid())
+  pair      String
+  timeframe String   // 1m | 5m | 15m | 1h | 1d
+  time      Int      // unix seconds, bucket start
+  open      Float
+  high      Float
+  low       Float
+  close     Float
+  volume    Float
+  createdAt DateTime @default(now())
+  @@unique([pair, timeframe, time])
+  @@index([pair, timeframe, time])
+}
+
+model Position {
+  id         String    @id @default(cuid())
+  pair       String
+  side       String    @default("long")
+  entryPrice Float
+  amount     Float
+  amountIdr  Float
+  stopLoss   Float
+  takeProfit Float
+  strategy   String
+  signalScore Int      @default(0)
+  status     String    @default("open") // open | closed
+  exitPrice  Float?
+  exitTime   DateTime?
+  pnl        Float?
+  pnlPct     Float?
+  orderId    String?
+  mode       String    @default("paper") // paper | live
+  openedAt   DateTime  @default(now())
+  closedAt   DateTime?
+  @@index([pair, status])
+  @@index([openedAt])
+}
+
+model BotConfig {
+  id          String   @id @default("singleton")
+  enabled     Boolean  @default(false)
+  mode        String   @default("paper") // paper | live
+  pair        String   @default("btc_idr")
+  strategy    String   @default("sma_cross")
+  capitalIdr  Float    @default(1000000)
+  riskPct     Float    @default(2)
+  stopLossPct Float    @default(3)
+  takeProfitPct Float  @default(5)
+  intervalSec Int      @default(300)
+  apiKey      String?
+  secretKey   String?
+  telegramToken String?
+  telegramChatId String?
+  updatedAt   DateTime @updatedAt
+}
+
+model BotLog {
+  id        String   @id @default(cuid())
+  ts        DateTime @default(now())
+  level     String   // info | warn | error | trade
+  message   String
+  pair      String?
+  meta      String?
+}
