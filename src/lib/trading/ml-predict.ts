@@ -38,7 +38,7 @@ export interface MLPrediction {
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
-  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]> } | null; // P1: meta-labeling model
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]>; isotonicBrier: number; plattBrier: number; isotonicOosF1: number; plattOosF1: number; isotonicThreshold: number; plattThreshold: number; nestedCVF1: number; nestedCVResults: any[] } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -52,6 +52,68 @@ function wilsonCI(observed: number, n: number, z = 1.96): { lo: number; hi: numb
   const center = (p + z * z / (2 * n)) / denom;
   const spread = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom;
   return { lo: Math.max(0, center - spread), hi: Math.min(1, center + spread) };
+}
+
+// Isotonic regression calibration — fixes miscalibration from class weighting
+// Maps raw probabilities to calibrated probabilities using monotonic fitting
+function isotonicCalibrate(rawProbs: number[], labels: number[]): (p: number) => number {
+  // Sort by raw probability
+  const sorted = rawProbs.map((p, i) => ({ p, label: labels[i] })).sort((a, b) => a.p - b.p);
+  // Pool Adjacent Violators (PAVA) algorithm
+  const blocks: { value: number; weight: number }[] = [];
+  for (const { p, label } of sorted) {
+    blocks.push({ value: label, weight: 1 });
+    // Merge blocks while violating monotonicity
+    while (blocks.length >= 2 && blocks[blocks.length - 2].value > blocks[blocks.length - 1].value) {
+      const right = blocks.pop()!;
+      const left = blocks.pop()!;
+      const totalW = left.weight + right.weight;
+      blocks.push({ value: (left.value * left.weight + right.value * right.weight) / totalW, weight: totalW });
+    }
+  }
+  // Build lookup: for each block, store the calibrated probability and the raw range
+  const lookup: { rawLo: number; rawHi: number; calibrated: number }[] = [];
+  let idx = 0;
+  for (const block of blocks) {
+    const blockSize = block.weight;
+    const rawLo = sorted[idx]?.p ?? 0;
+    const rawHi = sorted[idx + blockSize - 1]?.p ?? 1;
+    lookup.push({ rawLo, rawHi, calibrated: block.value });
+    idx += blockSize;
+  }
+  // Return interpolation function
+  return (p: number) => {
+    if (p <= lookup[0].rawLo) return lookup[0].calibrated;
+    for (let i = 0; i < lookup.length; i++) {
+      if (p >= lookup[i].rawLo && p <= lookup[i].rawHi) return lookup[i].calibrated;
+      if (i < lookup.length - 1 && p > lookup[i].rawHi && p < lookup[i + 1].rawLo) {
+        // Interpolate between blocks
+        const t = (p - lookup[i].rawHi) / (lookup[i + 1].rawLo - lookup[i].rawHi);
+        return lookup[i].calibrated * (1 - t) + lookup[i + 1].calibrated * t;
+      }
+    }
+    return lookup[lookup.length - 1].calibrated;
+  };
+}
+
+// Platt scaling — logistic regression on (raw_prob, label) to calibrate
+function plattCalibrate(rawProbs: number[], labels: number[]): (p: number) => number {
+  // Fit: P(y=1 | raw) = sigmoid(a * raw + b)
+  let a = 0, b = 0;
+  const lr = 0.01;
+  for (let iter = 0; iter < 200; iter++) {
+    let gradA = 0, gradB = 0;
+    for (let i = 0; i < rawProbs.length; i++) {
+      const z = a * rawProbs[i] + b;
+      const pred = sigmoid(z);
+      const err = pred - labels[i];
+      gradA += err * rawProbs[i];
+      gradB += err;
+    }
+    a -= lr * gradA / rawProbs.length;
+    b -= lr * gradB / rawProbs.length;
+  }
+  return (p: number) => sigmoid(a * p + b);
 }
 
 // Weighted logistic regression for meta-labeling (uniqueness-weighted + class balancing)
@@ -716,38 +778,60 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   const metaResult = trainWeightedLogisticRegression(metaFeatures, metaLabels, uniqueness, 0.01, 200);
   const metaAUC = computeAUC(metaFeatures, metaLabels, metaResult.weights, metaResult.bias);
 
-  // P1: Out-of-sample threshold validation
-  // Split data 70/30, find optimal threshold on train, validate on test
+  // P1: Out-of-sample threshold validation with calibration
+  // Split 70/30, train model + calibration on train, validate on test
   const splitIdx = Math.floor(metaFeatures.length * 0.7);
   const trainFeatures = metaFeatures.slice(0, splitIdx);
   const trainLabels = metaLabels.slice(0, splitIdx);
   const trainWeights = uniqueness.slice(0, splitIdx);
   const testFeatures = metaFeatures.slice(splitIdx);
   const testLabels = metaLabels.slice(splitIdx);
+  // Train meta-model on train split
   const trainMeta = trainWeightedLogisticRegression(trainFeatures, trainLabels, trainWeights, 0.01, 200);
-  const testPreds: { prob: number; label: number }[] = [];
+  // Get raw predictions on train set for calibration fitting
+  const trainRawProbs: number[] = [];
+  for (let i = 0; i < trainFeatures.length; i++) {
+    const z = trainMeta.bias + trainFeatures[i].reduce((a, w, j) => a + w * trainMeta.weights[j], 0);
+    trainRawProbs.push(sigmoid(z));
+  }
+  // Fit calibration methods on train data
+  const isotonicFn = isotonicCalibrate(trainRawProbs, trainLabels);
+  const plattFn = plattCalibrate(trainRawProbs, trainLabels);
+  // Apply calibration to test set
+  const testPredsRaw: { prob: number; label: number }[] = [];
+  const testPredsIsotonic: { prob: number; label: number }[] = [];
+  const testPredsPlatt: { prob: number; label: number }[] = [];
   for (let i = 0; i < testFeatures.length; i++) {
-    let z = trainMeta.bias;
-    for (let j = 0; j < testFeatures[i].length; j++) z += testFeatures[i][j] * trainMeta.weights[j];
-    testPreds.push({ prob: sigmoid(z), label: testLabels[i] });
+    const z = trainMeta.bias + testFeatures[i].reduce((a, w, j) => a + w * trainMeta.weights[j], 0);
+    const rawProb = sigmoid(z);
+    testPredsRaw.push({ prob: rawProb, label: testLabels[i] });
+    testPredsIsotonic.push({ prob: isotonicFn(rawProb), label: testLabels[i] });
+    testPredsPlatt.push({ prob: plattFn(rawProb), label: testLabels[i] });
   }
-  testPreds.sort((a, b) => b.prob - a.prob);
-  let oosBestThreshold = 0.5, oosBestF1 = 0, oosBestPrec = 0, oosBestRec = 0;
-  for (let t = 0.05; t <= 0.95; t += 0.05) {
-    let tp = 0, fp = 0, fn = 0;
-    for (const p of testPreds) {
-      const pred = p.prob >= t ? 1 : 0;
-      if (pred === 1 && p.label === 1) tp++;
-      if (pred === 1 && p.label === 0) fp++;
-      if (pred === 0 && p.label === 1) fn++;
+  // Find optimal threshold for each calibration method on test set
+  function findOptimalThreshold(preds: { prob: number; label: number }[]): { threshold: number; f1: number; prec: number; rec: number } {
+    let bestT = 0.5, bestF1 = 0, bestP = 0, bestR = 0;
+    for (let t = 0.05; t <= 0.95; t += 0.05) {
+      let tp = 0, fp = 0, fn = 0;
+      for (const p of preds) {
+        const pred = p.prob >= t ? 1 : 0;
+        if (pred === 1 && p.label === 1) tp++;
+        if (pred === 1 && p.label === 0) fp++;
+        if (pred === 0 && p.label === 1) fn++;
+      }
+      const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+      const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+      const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+      if (f1 > bestF1) { bestF1 = f1; bestT = t; bestP = prec; bestR = rec; }
     }
-    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
-    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
-    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
-    if (f1 > oosBestF1) { oosBestF1 = f1; oosBestThreshold = t; oosBestPrec = prec; oosBestRec = rec; }
+    return { threshold: bestT, f1: bestF1, prec: bestP, rec: bestR };
   }
+  const oosRaw = findOptimalThreshold(testPredsRaw);
+  const oosIsotonic = findOptimalThreshold(testPredsIsotonic);
+  const oosPlatt = findOptimalThreshold(testPredsPlatt);
+  // Apply TRAIN threshold to TEST set (true OOS)
   let oosTP = 0, oosFP = 0, oosFN = 0;
-  for (const p of testPreds) {
+  for (const p of testPredsRaw) {
     const pred = p.prob >= trainMeta.optimalThreshold ? 1 : 0;
     if (pred === 1 && p.label === 1) oosTP++;
     if (pred === 1 && p.label === 0) oosFP++;
@@ -756,6 +840,46 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   const oosPrecAtTrainThreshold = (oosTP + oosFP) > 0 ? oosTP / (oosTP + oosFP) : 0;
   const oosRecAtTrainThreshold = (oosTP + oosFN) > 0 ? oosTP / (oosTP + oosFN) : 0;
   const oosF1AtTrainThreshold = (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) > 0 ? 2 * oosPrecAtTrainThreshold * oosRecAtTrainThreshold / (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) : 0;
+  // Compute Brier score for calibrated predictions (isotonic vs raw)
+  let brierRaw = 0, brierIsotonic = 0, brierPlatt = 0;
+  for (let i = 0; i < testPredsRaw.length; i++) {
+    brierRaw += (testPredsRaw[i].prob - testLabels[i]) ** 2;
+    brierIsotonic += (testPredsIsotonic[i].prob - testLabels[i]) ** 2;
+    brierPlatt += (testPredsPlatt[i].prob - testLabels[i]) ** 2;
+  }
+  brierRaw /= testPredsRaw.length;
+  brierIsotonic /= testPredsIsotonic.length;
+  brierPlatt /= testPredsPlatt.length;
+
+  // P2: Nested CV for threshold optimization (3-fold outer, inner = train threshold)
+  const nFolds = 3;
+  const foldSize = Math.floor(metaFeatures.length / nFolds);
+  const nestedResults: { fold: number; innerThreshold: number; outerF1: number; outerPrec: number; outerRec: number }[] = [];
+  for (let fold = 0; fold < nFolds; fold++) {
+    const outerStart = fold * foldSize;
+    const outerEnd = fold === nFolds - 1 ? metaFeatures.length : (fold + 1) * foldSize;
+    const outerFeatures = metaFeatures.slice(outerStart, outerEnd);
+    const outerLabels = metaLabels.slice(outerStart, outerEnd);
+    const innerFeatures = [...metaFeatures.slice(0, outerStart), ...metaFeatures.slice(outerEnd)];
+    const innerLabels = [...metaLabels.slice(0, outerStart), ...metaLabels.slice(outerEnd)];
+    const innerWeights = [...uniqueness.slice(0, outerStart), ...uniqueness.slice(outerEnd)];
+    // Train on inner, find threshold on inner
+    const innerModel = trainWeightedLogisticRegression(innerFeatures, innerLabels, innerWeights, 0.01, 200);
+    // Apply inner threshold to outer
+    let tp = 0, fp = 0, fn = 0;
+    for (let i = 0; i < outerFeatures.length; i++) {
+      const z = innerModel.bias + outerFeatures[i].reduce((a, w, j) => a + w * innerModel.weights[j], 0);
+      const pred = sigmoid(z) >= innerModel.optimalThreshold ? 1 : 0;
+      if (pred === 1 && outerLabels[i] === 1) tp++;
+      if (pred === 1 && outerLabels[i] === 0) fp++;
+      if (pred === 0 && outerLabels[i] === 1) fn++;
+    }
+    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+    nestedResults.push({ fold: fold + 1, innerThreshold: innerModel.optimalThreshold, outerF1: f1, outerPrec: prec, outerRec: rec });
+  }
+  const nestedAvgF1 = nestedResults.reduce((a, b) => a + b.outerF1, 0) / nFolds;
 
   // P2: Calibration plot per regime for meta-model
   const metaRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
@@ -814,15 +938,23 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
     samples: tbTotal,
     barrierHitRate: tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0,
-    oosThreshold: oosBestThreshold,
-    oosF1: oosBestF1,
-    oosPrecision: oosBestPrec,
-    oosRecall: oosBestRec,
+    oosThreshold: oosRaw.threshold,
+    oosF1: oosRaw.f1,
+    oosPrecision: oosRaw.prec,
+    oosRecall: oosRaw.rec,
     oosF1AtTrainThreshold,
     oosPrecisionAtTrainThreshold: oosPrecAtTrainThreshold,
     oosRecallAtTrainThreshold: oosRecAtTrainThreshold,
     calibrationPerRegime: metaCalibrationPerRegime,
-    description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : metaAUC > 0.6 ? `Meta-model weak OOS (AUC ${metaAUC.toFixed(2)}, F1=${oosF1AtTrainThreshold.toFixed(2)})` : `Meta-model no OOS filtering power (AUC ${metaAUC.toFixed(2)})`,
+    isotonicBrier: brierIsotonic,
+    plattBrier: brierPlatt,
+    isotonicOosF1: oosIsotonic.f1,
+    plattOosF1: oosPlatt.f1,
+    isotonicThreshold: oosIsotonic.threshold,
+    plattThreshold: oosPlatt.threshold,
+    nestedCVF1: nestedAvgF1,
+    nestedCVResults: nestedResults,
+    description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : nestedAvgF1 > 0.15 ? `Meta-model weak OOS (nested CV F1=${nestedAvgF1.toFixed(2)}, isotonic F1=${oosIsotonic.f1.toFixed(2)})` : `Meta-model no OOS value (nested CV F1=${nestedAvgF1.toFixed(2)}, raw F1=${oosRaw.f1.toFixed(2)})`,
   };
 
   return {
