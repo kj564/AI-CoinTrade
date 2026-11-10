@@ -38,6 +38,7 @@ export interface MLPrediction {
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -51,6 +52,84 @@ function wilsonCI(observed: number, n: number, z = 1.96): { lo: number; hi: numb
   const center = (p + z * z / (2 * n)) / denom;
   const spread = z * Math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom;
   return { lo: Math.max(0, center - spread), hi: Math.min(1, center + spread) };
+}
+
+// Weighted logistic regression for meta-labeling (uniqueness-weighted)
+function trainWeightedLogisticRegression(
+  features: number[][], labels: number[], weights: number[],
+  learningRate = 0.01, iterations = 200
+): { weights: number[]; bias: number; accuracy: number; brierScore: number; precision: number; recall: number } {
+  const n = features.length;
+  const d = features[0]?.length || 0;
+  // Standardize
+  const means: number[] = new Array(d).fill(0);
+  const stdDevs: number[] = new Array(d).fill(1);
+  for (let j = 0; j < d; j++) {
+    let wsum = 0, wtotal = 0;
+    for (let i = 0; i < n; i++) { wsum += features[i][j] * weights[i]; wtotal += weights[i]; }
+    means[j] = wsum / Math.max(1e-10, wtotal);
+    let wvar = 0;
+    for (let i = 0; i < n; i++) wvar += weights[i] * (features[i][j] - means[j]) ** 2;
+    wvar /= Math.max(1e-10, wtotal);
+    stdDevs[j] = Math.sqrt(wvar) || 1;
+  }
+  const standardized = features.map(row => row.map((v, j) => (v - means[j]) / stdDevs[j]));
+  const w = new Array(d).fill(0);
+  let b = 0;
+  const totalW = weights.reduce((a, x) => a + x, 0) || 1;
+  for (let iter = 0; iter < iterations; iter++) {
+    const grad = new Array(d).fill(0);
+    let gradB = 0;
+    for (let i = 0; i < n; i++) {
+      const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+      const pred = sigmoid(z);
+      const err = (pred - labels[i]) * weights[i];
+      for (let j = 0; j < d; j++) grad[j] += err * standardized[i][j];
+      gradB += err;
+    }
+    for (let j = 0; j < d; j++) w[j] -= learningRate * grad[j] / totalW;
+    b -= learningRate * gradB / totalW;
+  }
+  // Metrics
+  let correct = 0, brierSum = 0, tp = 0, fp = 0, fn = 0;
+  for (let i = 0; i < n; i++) {
+    const z = b + standardized[i].reduce((a, x, j) => a + x * w[j], 0);
+    const pred = sigmoid(z);
+    const predLabel = pred > 0.5 ? 1 : 0;
+    if (predLabel === labels[i]) correct++;
+    brierSum += (pred - labels[i]) ** 2;
+    if (predLabel === 1 && labels[i] === 1) tp++;
+    if (predLabel === 1 && labels[i] === 0) fp++;
+    if (predLabel === 0 && labels[i] === 1) fn++;
+  }
+  return {
+    weights: w, bias: b,
+    accuracy: n > 0 ? (correct / n) * 100 : 0,
+    brierScore: n > 0 ? brierSum / n : 0.25,
+    precision: (tp + fp) > 0 ? tp / (tp + fp) : 0,
+    recall: (tp + fn) > 0 ? tp / (tp + fn) : 0,
+  };
+}
+
+// AUC-ROC computation
+function computeAUC(features: number[][], labels: number[], weights: number[], bias: number): number {
+  const preds: { prob: number; label: number }[] = [];
+  for (let i = 0; i < features.length; i++) {
+    const z = bias + features[i].reduce((a, w, j) => a + w * weights[j], 0);
+    preds.push({ prob: sigmoid(z), label: labels[i] });
+  }
+  preds.sort((a, b) => b.prob - a.prob);
+  const totalPos = preds.filter(p => p.label === 1).length;
+  const totalNeg = preds.length - totalPos;
+  if (totalPos === 0 || totalNeg === 0) return 0.5;
+  let tp = 0, fp = 0, prevTPR = 0, prevFPR = 0, auc = 0;
+  for (const p of preds) {
+    if (p.label === 1) tp++; else fp++;
+    const tpr = tp / totalPos, fpr = fp / totalNeg;
+    auc += (fpr - prevFPR) * (tpr + prevTPR) / 2;
+    prevTPR = tpr; prevFPR = fpr;
+  }
+  return auc;
 }
 
 // Compute features for a candle at index i
@@ -545,35 +624,68 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   else if (direction === "down") description = `ML model memprediksi harga turun jam depan dengan ${(100 - probabilityPct).toFixed(0)}% probability. Model accuracy: ${model.accuracy.toFixed(0)}% pada ${featureList.length} sampel training.`;
   else description = `ML model uncertain (${probabilityPct.toFixed(0)}% up). Tidak ada sinyal kuat. Model accuracy: ${model.accuracy.toFixed(0)}%.`;
 
-  // P4: Triple-barrier labeling (Lopez de Prado)
-  // Instead of binary "up/down next hour", use three barriers:
-  // Upper: price +X% within N bars → label 1 (profit)
-  // Lower: price -X% within N bars → label -1 (loss)  
-  // Time: neither hit within N bars → label 0 (timeout)
-  const tbUpBarrier = 0.02;   // 2% profit barrier
-  const tbDownBarrier = 0.02; // 2% loss barrier
-  const tbMaxBars = 6;        // 6-hour window
-  const tbLabels: number[] = [];
-  let tbUp = 0, tbDown = 0, tbTimeout = 0;
+  // P1: Meta-labeling (Lopez de Prado) — secondary model on triple-barrier output
+  // Primary model (above) predicts direction. Meta-model predicts whether to ACT on it.
+  // Train on triple-barrier labels: only trade when meta-model says "high probability of profit"
+  // For each sample, compute uniqueness weight = 1 / (number of overlapping windows)
+  // and use it to weight the training
+  const tbUpBarrier = 0.02, tbDownBarrier = 0.02, tbMaxBars = 6;
+  const tbMetaLabels: number[] = []; // 1 if barrier hit (profit or loss), 0 if timeout
+  const tbMetaOutcomes: number[] = []; // +1 if up barrier, -1 if down barrier
+  const uniqueness: number[] = []; // sample uniqueness weight
+  let overlapCount = 0;
   for (let i = 30; i < candles.length - tbMaxBars; i++) {
     const entryPrice = candles[i].close;
-    let label = 0; // timeout
+    let hit = 0, outcome = 0;
     for (let j = 1; j <= tbMaxBars; j++) {
       const ret = (candles[i + j].close - entryPrice) / entryPrice;
-      if (ret >= tbUpBarrier) { label = 1; tbUp++; break; }
-      if (ret <= -tbDownBarrier) { label = -1; tbDown++; break; }
+      if (ret >= tbUpBarrier) { hit = 1; outcome = 1; break; }
+      if (ret <= -tbDownBarrier) { hit = 1; outcome = -1; break; }
     }
-    if (label === 0) tbTimeout++;
-    tbLabels.push(label);
+    tbMetaLabels.push(hit);
+    tbMetaOutcomes.push(outcome);
+    // Uniqueness: count how many other windows overlap this one
+    let overlaps = 0;
+    for (let k = Math.max(30, i - tbMaxBars); k < Math.min(candles.length - tbMaxBars, i + tbMaxBars); k++) {
+      if (k !== i) overlaps++;
+    }
+    uniqueness.push(overlaps > 0 ? 1 / (1 + overlaps) : 1);
+    overlapCount += overlaps;
   }
-  const tbTotal = tbLabels.length;
+  // Meta-model: predict whether a trade would hit a barrier (1) or timeout (0)
+  // This is the "should I trade?" model — higher precision than direction model
+  const metaLabels = tbMetaLabels;
+  const metaFeatures: number[][] = [];
+  for (let i = 30; i < candles.length - tbMaxBars; i++) {
+    const f = computeFeatures(candles, i);
+    if (f) metaFeatures.push([f.rsi, f.macdHist, f.smaRatio, f.stoch, f.obvSlope, f.volRatio, f.atrPct, f.priceMomentum]);
+  }
+  // Weighted logistic regression for meta-model (using uniqueness weights)
+  const metaResult = trainWeightedLogisticRegression(metaFeatures, metaLabels, uniqueness, 0.01, 200);
+  const metaAUC = computeAUC(metaFeatures, metaLabels, metaResult.weights, metaResult.bias);
+  // Triple-barrier stats
+  const tbTotal = tbMetaLabels.length;
+  const tbUp = tbMetaOutcomes.filter(o => o === 1).length;
+  const tbDown = tbMetaOutcomes.filter(o => o === -1).length;
+  const tbTimeout = tbMetaLabels.filter(l => l === 0).length;
   const tripleBarrier = {
     upBarrier: tbUpBarrier, downBarrier: tbDownBarrier, maxBars: tbMaxBars,
-    labels: tbLabels,
+    labels: tbMetaLabels,
     upCount: tbUp, downCount: tbDown, timeoutCount: tbTimeout,
     upPct: tbTotal > 0 ? (tbUp / tbTotal) * 100 : 0,
     downPct: tbTotal > 0 ? (tbDown / tbTotal) * 100 : 0,
     timeoutPct: tbTotal > 0 ? (tbTimeout / tbTotal) * 100 : 0,
+  };
+  const metaModel = {
+    accuracy: metaResult.accuracy,
+    brierScore: metaResult.brierScore,
+    aucROC: metaAUC,
+    precision: metaResult.precision,
+    recall: metaResult.recall,
+    avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
+    samples: tbTotal,
+    barrierHitRate: tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0,
+    description: metaAUC > 0.6 ? "Meta-model can filter trades (AUC > 0.6)" : metaAUC > 0.55 ? "Meta-model weak filtering (AUC 0.55-0.6)" : "Meta-model no filtering power (AUC ≈ 0.5)",
   };
 
   return {
@@ -592,6 +704,7 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     lrDF: model.lrDF,
     lrPValue: model.lrPValue,
     tripleBarrier,
+    metaModel,
     trainingSamples: featureList.length,
     description,
   };
