@@ -101,3 +101,28 @@ model BotLog {
   pair      String?
   meta      String?
 }
+
+// P1 (this round): Historical L2 order book snapshots
+// Periodically fetched from INDODAX depth API and stored for historical backtest calibration.
+// Each snapshot captures the order book structure at a specific point in time.
+model L2Snapshot {
+  id                 String   @id @default(cuid())
+  pair               String   // btc_idr, eth_idr, etc.
+  timestamp          Int      // unix seconds when snapshot was taken
+  topBidPrice        Float
+  topAskPrice        Float
+  realSpreadPct      Float    // (ask - bid) / mid * 100
+  topBidVolume       Float
+  topAskVolume       Float
+  topOfBookImbalance Float    // (bidVol - askVol) / (bidVol + askVol) at top of book
+  totalBidVolume     Float
+  totalAskVolume     Float
+  totalImbalance     Float    // depth-weighted imbalance across all levels
+  bidLevelsCount     Int
+  askLevelsCount     Int
+  bidDepthJson       String   // JSON: [{priceLevelPct, cumulativeVol}, ...]
+  askDepthJson       String   // JSON: [{priceLevelPct, cumulativeVol}, ...]
+  createdAt          DateTime @default(now())
+  @@unique([pair, timestamp])
+  @@index([pair, timestamp])
+}

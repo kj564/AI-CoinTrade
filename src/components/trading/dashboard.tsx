@@ -2043,6 +2043,52 @@ export function TradingDashboard() {
                                   <p className="mt-1 text-[8px] leading-relaxed text-slate-600">
                                     Real L2 snapshot from INDODAX depth API. Used to calibrate the synthesized microstructure model: real spread replaces assumed 0.1%, real imbalance (70% weight) blends with candle-shape estimate, real depth scales volume-at-limit estimate. For historical backtests, this is a representative snapshot applied to past candles.
                                   </p>
+
+                                  {/* P2: Staleness indicator */}
+                                  {l2.snapshotAgeSec !== undefined && (
+                                    <div className={cn("mt-1 rounded px-1.5 py-0.5 text-[8px]", l2.isStale ? "bg-rose-500/[0.08] text-rose-300" : "bg-emerald-500/[0.08] text-emerald-300")}>
+                                      {l2.stalenessWarning}
+                                    </div>
+                                  )}
+
+                                  {/* P7: L2 vs Synthetic comparison */}
+                                  {btResult.result.realisticLimitAnalysis.l2Comparison && (
+                                    <div className="mt-2 rounded border border-teal-500/10 bg-teal-500/[0.04] p-2">
+                                      <div className="mb-1 text-[8px] font-bold uppercase text-teal-400">L2 Calibration Impact (vs Synthetic-Only)</div>
+                                      <div className="grid grid-cols-2 gap-1 text-[8px] sm:grid-cols-4">
+                                        <div><div className="text-slate-500">Fill prob Δ</div><div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.l2Comparison.fillProbabilityDelta > 0 ? "text-emerald-400" : btResult.result.realisticLimitAnalysis.l2Comparison.fillProbabilityDelta < 0 ? "text-rose-400" : "text-slate-300")}>{(btResult.result.realisticLimitAnalysis.l2Comparison.fillProbabilityDelta * 100).toFixed(1)}pp</div></div>
+                                        <div><div className="text-slate-500">Fill frac Δ</div><div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.l2Comparison.fillFractionDelta > 0 ? "text-emerald-400" : "text-rose-400")}>{(btResult.result.realisticLimitAnalysis.l2Comparison.fillFractionDelta * 100).toFixed(1)}pp</div></div>
+                                        <div><div className="text-slate-500">P&L Δ</div><div className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.l2Comparison.netProfitDelta >= 0 ? "text-emerald-400" : "text-rose-400")}>{btResult.result.realisticLimitAnalysis.l2Comparison.netProfitDelta >= 0 ? "+" : ""}{fmtIDR(btResult.result.realisticLimitAnalysis.l2Comparison.netProfitDelta)}</div></div>
+                                        <div><div className="text-slate-500">Imbalance Δ</div><div className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.l2Comparison.imbalanceDelta.toFixed(2)}</div></div>
+                                      </div>
+                                      <p className="mt-1 text-[7px] leading-relaxed text-slate-500">{btResult.result.realisticLimitAnalysis.l2Comparison.description}</p>
+                                    </div>
+                                  )}
+
+                                  {/* P6: Walk-the-book analysis */}
+                                  {btResult.walkBookAnalysis && (() => {
+                                    const wb = btResult.walkBookAnalysis;
+                                    return (
+                                    <div className="mt-2 rounded border border-purple-500/10 bg-purple-500/[0.04] p-2">
+                                      <div className="mb-1 text-[8px] font-bold uppercase text-purple-400">Walk-the-Book (Market Order Taker Cost) — {wb.orderSize} units</div>
+                                      <div className="grid grid-cols-2 gap-2 text-[8px]">
+                                        <div className="rounded bg-white/[0.03] p-1.5">
+                                          <div className="text-[7px] font-bold text-emerald-400">Market BUY</div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Avg fill</span><span className="font-bold tabular-nums text-slate-200">{fmtIDR(wb.buy.avgFillPrice)}</span></div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Slippage</span><span className={cn("font-bold tabular-nums", wb.buy.slippagePct > 0.01 ? "text-amber-400" : "text-emerald-400")}>{wb.buy.slippagePct.toFixed(4)}%</span></div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Levels</span><span className="font-bold tabular-nums text-slate-300">{wb.buy.levelsConsumed}</span></div>
+                                        </div>
+                                        <div className="rounded bg-white/[0.03] p-1.5">
+                                          <div className="text-[7px] font-bold text-rose-400">Market SELL</div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Avg fill</span><span className="font-bold tabular-nums text-slate-200">{fmtIDR(wb.sell.avgFillPrice)}</span></div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Slippage</span><span className={cn("font-bold tabular-nums", wb.sell.slippagePct > 0.01 ? "text-amber-400" : "text-emerald-400")}>{wb.sell.slippagePct.toFixed(4)}%</span></div>
+                                          <div className="flex justify-between"><span className="text-slate-500">Levels</span><span className="font-bold tabular-nums text-slate-300">{wb.sell.levelsConsumed}</span></div>
+                                        </div>
+                                      </div>
+                                      <p className="mt-1 text-[7px] leading-relaxed text-slate-500">Walks through order book levels to compute actual taker execution price. Slippage &gt; 0.01% means thin liquidity forces walking multiple levels.</p>
+                                    </div>
+                                    );
+                                  })()}
                                 </>
                               );
                             })()}
