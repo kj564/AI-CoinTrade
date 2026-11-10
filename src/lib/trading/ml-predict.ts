@@ -29,7 +29,8 @@ export interface MLPrediction {
   brierScore: number;     // P5: Brier score (lower = better calibrated, 0=perfect, 0.25=random)
   calibration: { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]; // reliability curve with Wilson CI
   calibrationPerRegime: Record<string, { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]>; // per-regime calibration with CI
-  featureImportance: { name: string; weight: number; absWeight: number; rank: number }[]; // P2: feature importance
+  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
+  ablation: { feature: string; dropped: number; accuracyDelta: number; description: string }[]; // P3: feature ablation
   description: string;
 }
 
@@ -225,20 +226,78 @@ function trainLogisticRegression(
   const seApprox = Math.sqrt(1 / (n * pHat * (1 - pHat)));
   const zScores: number[] = weights.map(w => Math.abs(seApprox) > 0 ? w / seApprox : 0);
   // Approximate p-value from z-score (two-tailed, normal approximation)
-  const pValues: number[] = zScores.map(z => {
-    // Φ(|z|) approximation via error function
+  const rawPValues: number[] = zScores.map(z => {
     const absZ = Math.abs(z);
-    const p = 1 - 0.5 * (1 + Math.tanh(0.7978 * absZ * (1 + 0.044715 * absZ * absZ))); // tanh approximation of erf
+    const p = 1 - 0.5 * (1 + Math.tanh(0.7978 * absZ * (1 + 0.044715 * absZ * absZ)));
     return Math.max(0, Math.min(1, 2 * p));
   });
+
+  // P1: Multiple-testing correction — Benjamini-Hochberg FDR
+  // Controls False Discovery Rate (expected proportion of false positives among rejected)
+  // Sort p-values, apply BH adjustment: p_adj = p * d / rank
+  const sortedIndices = rawPValues.map((p, i) => ({ p, i })).sort((a, b) => a.p - b.p);
+  const nFeatures = rawPValues.length;
+  const adjustedP: number[] = new Array(nFeatures).fill(0);
+  let prevAdj = 1;
+  for (let k = nFeatures - 1; k >= 0; k--) {
+    const { p, i } = sortedIndices[k];
+    const adj = Math.min(prevAdj, p * nFeatures / (k + 1));
+    adjustedP[i] = Math.min(1, adj);
+    prevAdj = adj;
+  }
+
+  // P2: Confidence interval per coefficient (Wald CI: w ± 1.96 × SE)
+  const ci95: { lo: number; hi: number }[] = weights.map(w => ({
+    lo: w - 1.96 * seApprox,
+    hi: w + 1.96 * seApprox,
+  }));
+
+  // P3: Feature ablation — drop each feature, measure accuracy delta
+  const baselineAccuracy = accuracy;
+  const ablation: { feature: string; dropped: number; accuracyDelta: number; description: string }[] = [];
+  for (let dropIdx = 0; dropIdx < d; dropIdx++) {
+    // Retrain without feature dropIdx
+    const reducedFeatures = standardized.map(row => row.filter((_, j) => j !== dropIdx));
+    const reducedWeights = new Array(d - 1).fill(0);
+    let reducedBias = 0;
+    for (let iter = 0; iter < iterations; iter++) {
+      const grad = new Array(d - 1).fill(0);
+      let gradBias = 0;
+      for (let i = 0; i < n; i++) {
+        const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+        const pred = sigmoid(z);
+        const err = pred - labels[i];
+        for (let j = 0; j < d - 1; j++) grad[j] += err * reducedFeatures[i][j];
+        gradBias += err;
+      }
+      for (let j = 0; j < d - 1; j++) reducedWeights[j] -= learningRate * grad[j] / n;
+      reducedBias -= learningRate * gradBias / n;
+    }
+    let reducedCorrect = 0;
+    for (let i = 0; i < n; i++) {
+      const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+      if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) reducedCorrect++;
+    }
+    const reducedAcc = n > 0 ? (reducedCorrect / n) * 100 : 0;
+    const delta = baselineAccuracy - reducedAcc;
+    ablation.push({
+      feature: FEATURE_NAMES[dropIdx] || `Feature ${dropIdx}`,
+      dropped: dropIdx,
+      accuracyDelta: delta,
+      description: delta > 0.5 ? `Menghapus ${FEATURE_NAMES[dropIdx]} menurunkan akurasi ${delta.toFixed(2)}% → fitur membantu` : delta < -0.5 ? `Menghapus ${FEATURE_NAMES[dropIdx]} menaikkan akurasi ${Math.abs(delta).toFixed(2)}% → fitur merugikan` : `Menghapus ${FEATURE_NAMES[dropIdx]} tidak mengubah akurasi → fitur tidak berpengaruh`,
+    });
+  }
+  ablation.sort((a, b) => b.accuracyDelta - a.accuracyDelta);
+
   const featureImportance = weights.map((w, i) => ({
     name: FEATURE_NAMES[i] || `Feature ${i}`, weight: w, absWeight: Math.abs(w), rank: 0,
-    zScore: zScores[i], pValue: pValues[i], significant: pValues[i] < 0.05,
+    zScore: zScores[i], pValue: rawPValues[i], adjustedPValue: adjustedP[i], significant: adjustedP[i] < 0.05,
+    ciLo: ci95[i].lo, ciHi: ci95[i].hi,
   }))
     .sort((a, b) => b.absWeight - a.absWeight)
     .map((f, i) => ({ ...f, rank: i + 1 }));
 
-  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, stdDevs, pValues, zScores };
+  return { weights, bias, accuracy, brierScore, calibration, calibrationPerRegime, featureImportance, ablation, stdDevs, pValues: rawPValues, adjustedPValues: adjustedP, zScores };
 }
 
 export function predictDirection(candles: Candle[]): MLPrediction | null {
@@ -291,6 +350,7 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     calibration: model.calibration,
     calibrationPerRegime: model.calibrationPerRegime,
     featureImportance: model.featureImportance,
+    ablation: model.ablation,
     trainingSamples: featureList.length,
     description,
   };
