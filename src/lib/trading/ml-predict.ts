@@ -29,8 +29,8 @@ export interface MLPrediction {
   brierScore: number;     // P5: Brier score (lower = better calibrated, 0=perfect, 0.25=random)
   calibration: { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]; // reliability curve with Wilson CI
   calibrationPerRegime: Record<string, { bin: string; predicted: number; observed: number; count: number; ciLo: number; ciHi: number }[]>; // per-regime calibration with CI
-  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number; bootstrapCILo: number; bootstrapCIHi: number; oddsRatio: number; orCILo: number; orCIHi: number; effectSize: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
-  ablation: { feature: string; dropped: number; accuracyDelta: number; description: string }[]; // P3: feature ablation
+  featureImportance: { name: string; weight: number; absWeight: number; rank: number; zScore: number; pValue: number; adjustedPValue: number; significant: boolean; ciLo: number; ciHi: number; bootstrapCILo: number; bootstrapCIHi: number; oddsRatio: number; orCILo: number; orCIHi: number; effectSize: number; probDiff: number; probDiffPct: number; pBase: number }[]; // P2: feature importance with BH-adjusted p-values + Wald CI
+  ablation: { feature: string; dropped: number; accuracyDelta: number; description: string; bsCILo: number; bsCIHi: number; significant: boolean }[]; // P3: feature ablation
   description: string;
 }
 
@@ -253,11 +253,13 @@ function trainLogisticRegression(
   }));
 
   // P3: Feature ablation — drop each feature, measure accuracy delta
+  // P2: Bootstrap CI for ablation — is Δ statistically significant?
   const baselineAccuracy = accuracy;
-  const ablation: { feature: string; dropped: number; accuracyDelta: number; description: string }[] = [];
+  const ablation: { feature: string; dropped: number; accuracyDelta: number; description: string; bsCILo: number; bsCIHi: number; significant: boolean }[] = [];
+  const nBsAblation = 50; // bootstrap iterations for ablation CI
   for (let dropIdx = 0; dropIdx < d; dropIdx++) {
-    // Retrain without feature dropIdx
     const reducedFeatures = standardized.map(row => row.filter((_, j) => j !== dropIdx));
+    // Full ablation (200 iterations)
     const reducedWeights = new Array(d - 1).fill(0);
     let reducedBias = 0;
     for (let iter = 0; iter < iterations; iter++) {
@@ -280,11 +282,40 @@ function trainLogisticRegression(
     }
     const reducedAcc = n > 0 ? (reducedCorrect / n) * 100 : 0;
     const delta = baselineAccuracy - reducedAcc;
+
+    // Bootstrap CI for delta: resample, compute delta each time
+    const bootstrapDeltas: number[] = [];
+    for (let b = 0; b < nBsAblation; b++) {
+      const sampleIdx: number[] = [];
+      for (let i = 0; i < n; i++) sampleIdx.push(Math.floor(Math.random() * n));
+      // Baseline accuracy on bootstrap sample
+      let bsBaseCorrect = 0;
+      for (const i of sampleIdx) {
+        const z = bias + standardized[i].reduce((a, w, j) => a + w * weights[j], 0);
+        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) bsBaseCorrect++;
+      }
+      const bsBaseAcc = (bsBaseCorrect / n) * 100;
+      // Reduced accuracy on bootstrap sample
+      let bsReducedCorrect = 0;
+      for (const i of sampleIdx) {
+        const z = reducedBias + reducedFeatures[i].reduce((a, w, j) => a + w * reducedWeights[j], 0);
+        if ((sigmoid(z) > 0.5 ? 1 : 0) === labels[i]) bsReducedCorrect++;
+      }
+      const bsReducedAcc = (bsReducedCorrect / n) * 100;
+      bootstrapDeltas.push(bsBaseAcc - bsReducedAcc);
+    }
+    bootstrapDeltas.sort((a, b) => a - b);
+    const bsCILo = bootstrapDeltas[Math.floor(nBsAblation * 0.025)] || 0;
+    const bsCIHi = bootstrapDeltas[Math.floor(nBsAblation * 0.975)] || 0;
+    // Significant if CI excludes 0 (both positive or both negative)
+    const sig = (bsCILo > 0 && bsCIHi > 0) || (bsCILo < 0 && bsCIHi < 0);
+
     ablation.push({
       feature: FEATURE_NAMES[dropIdx] || `Feature ${dropIdx}`,
       dropped: dropIdx,
       accuracyDelta: delta,
-      description: delta > 0.5 ? `Menghapus ${FEATURE_NAMES[dropIdx]} menurunkan akurasi ${delta.toFixed(2)}% → fitur membantu` : delta < -0.5 ? `Menghapus ${FEATURE_NAMES[dropIdx]} menaikkan akurasi ${Math.abs(delta).toFixed(2)}% → fitur merugikan` : `Menghapus ${FEATURE_NAMES[dropIdx]} tidak mengubah akurasi → fitur tidak berpengaruh`,
+      bsCILo, bsCIHi, significant: sig,
+      description: delta > 0.5 ? `Menghapus menurunkan akurasi ${delta.toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]` : delta < -0.5 ? `Menghapus menaikkan akurasi ${Math.abs(delta).toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]` : `Tidak mengubah akurasi Δ=${delta.toFixed(2)}% [CI ${bsCILo.toFixed(2)}, ${bsCIHi.toFixed(2)}]`,
     });
   }
   ablation.sort((a, b) => b.accuracyDelta - a.accuracyDelta);
@@ -325,6 +356,23 @@ function trainLogisticRegression(
     return { lo: sorted[loIdx] || 0, hi: sorted[hiIdx] || 0 };
   });
 
+  // P1: Probability difference effect size — how much does P(up) change
+  // when a feature increases by 1 SD? More interpretable than OR.
+  // P_base = sigmoid(bias + sum(w_j * 0)) = sigmoid(bias) (all features at mean, z-score=0)
+  // P_plus1SD_j = sigmoid(bias + w_j) (feature j at +1 SD, others at mean)
+  // ΔP_j = P_plus1SD_j - P_base
+  const pBase = sigmoid(bias);
+  const probDiff: { feature: string; deltaP: number; pBase: number; pPlus1SD: number }[] = [];
+  for (let j = 0; j < d; j++) {
+    const pPlus1SD = sigmoid(bias + weights[j]);
+    probDiff.push({
+      feature: FEATURE_NAMES[j] || `Feature ${j}`,
+      deltaP: pPlus1SD - pBase,
+      pBase,
+      pPlus1SD,
+    });
+  }
+
   const featureImportance = weights.map((w, i) => {
     const oddsRatio = Math.exp(w); // exp(w) = odds ratio for 1-SD increase in standardized feature
     const orCI = { lo: Math.exp(ci95[i].lo), hi: Math.exp(ci95[i].hi) };
@@ -335,6 +383,9 @@ function trainLogisticRegression(
       bootstrapCILo: bootstrapCI[i].lo, bootstrapCIHi: bootstrapCI[i].hi,
       oddsRatio, orCILo: orCI.lo, orCIHi: orCI.hi,
       effectSize: Math.abs(oddsRatio - 1), // |OR - 1| = effect size (0 = no effect, >0.5 = large)
+      probDiff: probDiff[i].deltaP, // ΔP = change in P(up) per 1-SD increase
+      probDiffPct: probDiff[i].deltaP * 100, // as percentage points
+      pBase: pBase,
     };
   })
     .sort((a, b) => b.absWeight - a.absWeight)
