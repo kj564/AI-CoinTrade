@@ -41,12 +41,13 @@ export interface MLPrediction {
   // P6: Stability selection (Meinshausen & Bühlmann 2010) — bootstrap the model B times,
   // record how often each feature is "selected" (|coefficient| > threshold OR top-k by importance).
   // Stable features are reliably useful across resamples; unstable ones are noise.
-  stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[];
+  // P6 (new): Wilson 95% CI on selection frequency (selection count ~ Binomial(B, p))
+  stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; ciLo: number; ciHi: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[];
   stabilityParams: { nIterations: number; selectionThreshold: number; topK: number; description: string };
   lrStat: number;       // P3: Likelihood Ratio test statistic
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
-  tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
+  tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number; upPctCiLo: number; upPctCiHi: number; downPctCiLo: number; downPctCiHi: number; timeoutPctCiLo: number; timeoutPctCiHi: number } | null; // P4: triple-barrier labels
   // P6: Dynamic triple-barrier — barriers scaled by rolling ATR (volatility-adaptive)
   dynamicTripleBarrier: { kUp: number; kDown: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number; avgUpBarrierPct: number; avgDownBarrierPct: number; upPctCiLo: number; upPctCiHi: number; downPctCiLo: number; downPctCiHi: number; timeoutPctCiLo: number; timeoutPctCiHi: number; description: string } | null;
   // P7: Return attribution sample weighting — combine uniqueness with |return| magnitude
@@ -464,12 +465,12 @@ function computeMDI(features: number[][], labels: number[], nTrees = 20, maxDept
 function computeStabilitySelection(
   features: number[][], labels: number[],
   nIterations = 50, topK = 3, piThreshold = 0.7
-): { stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[]; stabilityParams: { nIterations: number; selectionThreshold: number; topK: number; description: string } } {
+): { stabilitySelection: { feature: string; selectionFrequency: number; selectionPct: number; ciLo: number; ciHi: number; rank: number; verdict: "stable" | "borderline" | "unstable" }[]; stabilityParams: { nIterations: number; selectionThreshold: number; topK: number; description: string } } {
   const d = features[0]?.length || 0;
   const n = features.length;
   if (n < 10 || d === 0) {
     return {
-      stabilitySelection: FEATURE_NAMES.slice(0, d).map((f) => ({ feature: f, selectionFrequency: 0, selectionPct: 0, rank: 0, verdict: "unstable" as const })),
+      stabilitySelection: FEATURE_NAMES.slice(0, d).map((f) => ({ feature: f, selectionFrequency: 0, selectionPct: 0, ciLo: 0, ciHi: 0, rank: 0, verdict: "unstable" as const })),
       stabilityParams: { nIterations: 0, selectionThreshold: piThreshold, topK, description: "Insufficient samples for stability selection." },
     };
   }
@@ -520,14 +521,18 @@ function computeStabilitySelection(
     for (const r of ranked) selectionCount[r.j]++;
   }
 
-  // Compute stability metrics
+  // Compute stability metrics with Wilson 95% CI (selection count ~ Binomial(B, p))
   const stabilitySelection = FEATURE_NAMES.map((feature, j) => {
     const freq = selectionCount[j] / nIterations;
+    // Wilson CI for binomial proportion
+    const ci = wilsonCI(freq, nIterations);
     const verdict: "stable" | "borderline" | "unstable" = freq >= piThreshold ? "stable" : freq >= 0.4 ? "borderline" : "unstable";
     return {
       feature,
       selectionFrequency: freq,
       selectionPct: freq * 100,
+      ciLo: ci.lo,
+      ciHi: ci.hi,
       rank: 0,
       verdict,
     };
@@ -540,7 +545,7 @@ function computeStabilitySelection(
       nIterations,
       selectionThreshold: piThreshold,
       topK,
-      description: `Subsample (50% without replacement) × ${nIterations} iterations. Feature "selected" if in top-${topK} by |coefficient|. Stable if selected ≥ ${(piThreshold * 100).toFixed(0)}% of iterations.`,
+      description: `Subsample (50% without replacement) × ${nIterations} iterations. Feature "selected" if in top-${topK} by |coefficient|. Stable if selected ≥ ${(piThreshold * 100).toFixed(0)}% of iterations. Wilson 95% CI on selection frequency.`,
     },
   };
 }
@@ -1185,6 +1190,13 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     upPct: tbTotal > 0 ? (tbUp / tbTotal) * 100 : 0,
     downPct: tbTotal > 0 ? (tbDown / tbTotal) * 100 : 0,
     timeoutPct: tbTotal > 0 ? (tbTimeout / tbTotal) * 100 : 0,
+    // P7 (new): Wilson 95% CIs for fixed barrier hit rates
+    upPctCiLo: wilsonCI(tbTotal > 0 ? tbUp / tbTotal : 0, tbTotal).lo,
+    upPctCiHi: wilsonCI(tbTotal > 0 ? tbUp / tbTotal : 0, tbTotal).hi,
+    downPctCiLo: wilsonCI(tbTotal > 0 ? tbDown / tbTotal : 0, tbTotal).lo,
+    downPctCiHi: wilsonCI(tbTotal > 0 ? tbDown / tbTotal : 0, tbTotal).hi,
+    timeoutPctCiLo: wilsonCI(tbTotal > 0 ? tbTimeout / tbTotal : 0, tbTotal).lo,
+    timeoutPctCiHi: wilsonCI(tbTotal > 0 ? tbTimeout / tbTotal : 0, tbTotal).hi,
   };
 
   // P6: Dynamic triple-barrier — barriers scaled by rolling ATR (volatility-adaptive)

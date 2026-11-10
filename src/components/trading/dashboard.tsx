@@ -91,6 +91,14 @@ interface RealisticLimitAnalysis {
   realisticMakerNetProfit: number; realisticMakerProfitFactor: number; realisticMakerWinRate: number;
   netProfitVsPureMaker: number; executionCostPct: number;
   description: string;
+  // P1 (new): Queue position
+  avgQueueAheadPct: number; queueAdjustedFillRate: number;
+  // P2 (new): Market impact
+  avgMarketImpactPct: number; largeOrderRate: number; worstMarketImpactPct: number;
+  // P3 (new): Latency
+  latencyBars: number; latencyMissedEntries: number; latencyPriceDriftPct: number;
+  // P4 (new): Volume-aware fill
+  avgVolumeAtLimitPct: number; thinMarketRate: number;
 }
 interface RiskFlags { red: string[]; yellow: string[]; green: string[]; verdict: string }
 interface PositionModels {
@@ -1032,13 +1040,15 @@ export function TradingDashboard() {
                                       <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-slate-800/60">
                                         {/* Threshold line at 70% (stable cutoff) */}
                                         <div className="absolute inset-y-0 left-[70%] w-[1px] bg-amber-400/40" />
+                                        {/* CI range indicator (light band) */}
+                                        <div className="absolute inset-y-0 bg-slate-600/30" style={{ left: `${(s.ciLo * 100).toFixed(1)}%`, width: `${((s.ciHi - s.ciLo) * 100).toFixed(1)}%` }} />
                                         <div className={cn("absolute inset-y-0 left-0",
                                           s.verdict === "stable" ? "bg-emerald-500/60" :
                                           s.verdict === "borderline" ? "bg-amber-500/50" :
                                           "bg-rose-500/40"
                                         )} style={{ width: `${s.selectionPct.toFixed(1)}%` }} />
                                       </div>
-                                      <span className="w-12 shrink-0 text-right tabular-nums text-slate-300">{s.selectionPct.toFixed(0)}%</span>
+                                      <span className="w-24 shrink-0 text-right tabular-nums text-slate-300">{s.selectionPct.toFixed(0)}% <span className="text-[7px] text-slate-600">[{(s.ciLo * 100).toFixed(0)}-{(s.ciHi * 100).toFixed(0)}]</span></span>
                                       <Badge className={cn("border px-1 py-0 text-[7px] font-bold shrink-0",
                                         s.verdict === "stable" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" :
                                         s.verdict === "borderline" ? "border-amber-500/30 bg-amber-500/10 text-amber-300" :
@@ -1103,9 +1113,9 @@ export function TradingDashboard() {
                                   <div className="mb-1 text-[9px] font-bold text-slate-400">Fixed ±2% / 6h</div>
                                   {signal.ml.tripleBarrier && (
                                     <div className="space-y-0.5 text-[9px] tabular-nums">
-                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.tripleBarrier.upPct.toFixed(1)}%</span></div>
-                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.tripleBarrier.downPct.toFixed(1)}%</span></div>
-                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.tripleBarrier.timeoutPct.toFixed(1)}%</span></div>
+                                      <div className="flex justify-between"><span className="text-emerald-500/70">↑ up</span><span className="text-slate-300">{signal.ml.tripleBarrier.upPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.tripleBarrier.upPctCiLo * 100).toFixed(1)}-{(signal.ml.tripleBarrier.upPctCiHi * 100).toFixed(1)}%]</span></span></div>
+                                      <div className="flex justify-between"><span className="text-rose-500/70">↓ down</span><span className="text-slate-300">{signal.ml.tripleBarrier.downPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.tripleBarrier.downPctCiLo * 100).toFixed(1)}-{(signal.ml.tripleBarrier.downPctCiHi * 100).toFixed(1)}%]</span></span></div>
+                                      <div className="flex justify-between"><span className="text-slate-500">⏱ timeout</span><span className="text-slate-300">{signal.ml.tripleBarrier.timeoutPct.toFixed(1)}% <span className="text-[8px] text-slate-600">[{(signal.ml.tripleBarrier.timeoutPctCiLo * 100).toFixed(1)}-{(signal.ml.tripleBarrier.timeoutPctCiHi * 100).toFixed(1)}%]</span></span></div>
                                     </div>
                                   )}
                                 </div>
@@ -1597,11 +1607,15 @@ export function TradingDashboard() {
                                 <div><div className="text-[8px] text-slate-500">max ρ</div><div className="font-bold tabular-nums text-slate-300">{block.maxCorrelation.toFixed(2)}</div></div>
                                 <div><div className="text-[8px] text-slate-500">min ρ</div><div className="font-bold tabular-nums text-slate-300">{block.minCorrelation.toFixed(2)}</div></div>
                               </div>
-                              {/* P4: Effective N per block */}
+                              {/* P4: Effective N per block (both methods) */}
                               <div className="mt-1 rounded bg-orange-500/[0.08] px-1.5 py-0.5 text-[8px]">
                                 <div className="flex justify-between">
-                                  <span className="text-slate-500">Effective N</span>
+                                  <span className="text-slate-500">Eff N (avg-ρ)</span>
                                   <span className={cn("font-bold tabular-nums", block.effectiveNPct < 50 ? "text-rose-400" : block.effectiveNPct < 80 ? "text-amber-400" : "text-emerald-400")}>{block.effectiveN.toFixed(1)} / {block.size} <span className="text-slate-600">({block.effectiveNPct.toFixed(0)}%)</span></span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-slate-500">Eff N (eigen)</span>
+                                  <span className={cn("font-bold tabular-nums", block.effectiveNEigenPct < 50 ? "text-rose-400" : block.effectiveNEigenPct < 80 ? "text-amber-400" : "text-emerald-400")}>{block.effectiveNEigen.toFixed(1)} / {block.size} <span className="text-slate-600">({block.effectiveNEigenPct.toFixed(0)}%)</span></span>
                                 </div>
                               </div>
                               <p className="mt-1 text-[8px] leading-relaxed text-slate-600">{block.interpretation}</p>
@@ -1818,6 +1832,65 @@ export function TradingDashboard() {
                               <div className={cn("absolute inset-y-0 left-0", btResult.result.realisticLimitAnalysis.adverseSelectionRate > 0.5 ? "bg-rose-500/50" : "bg-amber-500/40")} style={{ width: `${btResult.result.realisticLimitAnalysis.adverseSelectionRate * 100}%` }} />
                             </div>
                             <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">When limit fills, it's often because price was dropping. Adverse selection = fraction of fills where next-bar move was unfavorable.</p>
+                          </div>
+                        </div>
+
+                        {/* 4 new pillars: queue position, market impact, latency, volume-aware */}
+                        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                          {/* P1 (new): Queue Position */}
+                          <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/[0.03] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><Layers className="h-3 w-3 text-emerald-400" /><span className="text-[10px] font-bold uppercase text-slate-400">Queue Position <Badge className="ml-0.5 border border-emerald-500/30 bg-emerald-500/10 px-1 py-0 text-[7px] font-bold text-emerald-300">NEW</Badge></span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Avg queue ahead</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgQueueAheadPct > 70 ? "text-rose-400" : btResult.result.realisticLimitAnalysis.avgQueueAheadPct > 50 ? "text-amber-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.avgQueueAheadPct.toFixed(0)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Queue-adj fill rate</span><span className="font-bold tabular-nums text-slate-300">{(btResult.result.realisticLimitAnalysis.queueAdjustedFillRate * 100).toFixed(1)}%</span></div>
+                              <div className="text-[8px] text-slate-600">vs raw touch rate</div>
+                            </div>
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className="absolute inset-y-0 left-0 bg-emerald-500/50" style={{ width: `${btResult.result.realisticLimitAnalysis.queueAdjustedFillRate * 100}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Order joins queue at limit price. Random queue position. Fill qty = max(0, vol_at_limit - queue_ahead).</p>
+                          </div>
+
+                          {/* P2 (new): Market Impact */}
+                          <div className="rounded-lg border border-purple-500/20 bg-purple-500/[0.03] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><Zap className="h-3 w-3 text-purple-400" /><span className="text-[10px] font-bold uppercase text-slate-400">Market Impact <Badge className="ml-0.5 border border-purple-500/30 bg-purple-500/10 px-1 py-0 text-[7px] font-bold text-purple-300">NEW</Badge></span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Avg impact</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.avgMarketImpactPct > 0.1 ? "text-amber-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.avgMarketImpactPct.toFixed(4)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Worst impact</span><span className="font-bold tabular-nums text-rose-400">{btResult.result.realisticLimitAnalysis.worstMarketImpactPct.toFixed(4)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Large order rate</span><span className="font-bold tabular-nums text-slate-300">{(btResult.result.realisticLimitAnalysis.largeOrderRate * 100).toFixed(1)}%</span></div>
+                            </div>
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className="absolute inset-y-0 left-0 bg-purple-500/50" style={{ width: `${Math.min(100, btResult.result.realisticLimitAnalysis.avgMarketImpactPct * 1000)}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Square-root law: Δp/p = σ × √(Q/V). Large orders move market against trader. Order = 0.5% of avg volume.</p>
+                          </div>
+
+                          {/* P3 (new): Latency */}
+                          <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.03] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><Clock className="h-3 w-3 text-amber-400" /><span className="text-[10px] font-bold uppercase text-slate-400">Latency <Badge className="ml-0.5 border border-amber-500/30 bg-amber-500/10 px-1 py-0 text-[7px] font-bold text-amber-300">NEW</Badge></span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Latency modeled</span><span className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.latencyBars} bar{btResult.result.realisticLimitAnalysis.latencyBars !== 1 ? "s" : ""}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Missed (drift &gt; -1%)</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.latencyMissedEntries > 0 ? "text-rose-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.latencyMissedEntries}</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Avg price drift</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.latencyPriceDriftPct < 0 ? "text-rose-400" : "text-emerald-400")}>{btResult.result.realisticLimitAnalysis.latencyPriceDriftPct >= 0 ? "+" : ""}{btResult.result.realisticLimitAnalysis.latencyPriceDriftPct.toFixed(3)}%</span></div>
+                            </div>
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className={cn("absolute inset-y-0 left-0", btResult.result.realisticLimitAnalysis.latencyPriceDriftPct < 0 ? "bg-rose-500/50" : "bg-amber-500/40")} style={{ width: `${Math.min(100, Math.abs(btResult.result.realisticLimitAnalysis.latencyPriceDriftPct) * 50)}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Signal at time t → order placed at t+latency. If price dropped &gt;1% during latency, entry is skipped (stale signal).</p>
+                          </div>
+
+                          {/* P4 (new): Volume-aware Fill */}
+                          <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/[0.03] p-3">
+                            <div className="mb-2 flex items-center gap-1.5"><Activity className="h-3 w-3 text-cyan-400" /><span className="text-[10px] font-bold uppercase text-slate-400">Volume-aware Fill <Badge className="ml-0.5 border border-cyan-500/30 bg-cyan-500/10 px-1 py-0 text-[7px] font-bold text-cyan-300">NEW</Badge></span></div>
+                            <div className="space-y-1 text-[9px]">
+                              <div className="flex justify-between"><span className="text-slate-500">Vol at limit (avg)</span><span className="font-bold tabular-nums text-slate-300">{btResult.result.realisticLimitAnalysis.avgVolumeAtLimitPct.toFixed(1)}%</span></div>
+                              <div className="flex justify-between"><span className="text-slate-500">Thin market rate</span><span className={cn("font-bold tabular-nums", btResult.result.realisticLimitAnalysis.thinMarketRate > 0.3 ? "text-rose-400" : "text-emerald-400")}>{(btResult.result.realisticLimitAnalysis.thinMarketRate * 100).toFixed(1)}%</span></div>
+                              <div className="text-[8px] text-slate-600">of avg volume</div>
+                            </div>
+                            <div className="mt-2 relative h-2 w-full overflow-hidden rounded-full bg-slate-800/60">
+                              <div className="absolute inset-y-0 left-0 bg-cyan-500/50" style={{ width: `${Math.min(100, btResult.result.realisticLimitAnalysis.avgVolumeAtLimitPct)}%` }} />
+                            </div>
+                            <p className="mt-1.5 text-[8px] leading-relaxed text-slate-600">Only ~30% of bar volume is at the limit price. Thin markets (&lt;50% avg vol) reduce fill probability.</p>
                           </div>
                         </div>
 
