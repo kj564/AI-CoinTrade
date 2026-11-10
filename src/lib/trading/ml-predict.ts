@@ -38,7 +38,7 @@ export interface MLPrediction {
   lrDF: number;         // P3: degrees of freedom
   lrPValue: number;     // P3: p-value for LR test (model as a whole)
   tripleBarrier: { upBarrier: number; downBarrier: number; maxBars: number; labels: number[]; upCount: number; downCount: number; timeoutCount: number; upPct: number; downPct: number; timeoutPct: number } | null; // P4: triple-barrier labels
-  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string } | null; // P1: meta-labeling model
+  metaModel: { accuracy: number; brierScore: number; aucROC: number; precision: number; recall: number; f1Score: number; prAUC: number; optimalThreshold: number; precisionAtThreshold: number; recallAtThreshold: number; f1AtThreshold: number; avgUniqueness: number; samples: number; barrierHitRate: number; description: string; oosThreshold: number; oosF1: number; oosPrecision: number; oosRecall: number; oosF1AtTrainThreshold: number; oosPrecisionAtTrainThreshold: number; oosRecallAtTrainThreshold: number; calibrationPerRegime: Record<string, any[]> } | null; // P1: meta-labeling model
   description: string;
 }
 
@@ -705,7 +705,6 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     uniqueness.push(overlaps > 0 ? 1 / (1 + overlaps) : 1);
     overlapCount += overlaps;
   }
-  // Meta-model: predict whether a trade would hit a barrier (1) or timeout (0)
   // This is the "should I trade?" model — higher precision than direction model
   const metaLabels = tbMetaLabels;
   const metaFeatures: number[][] = [];
@@ -716,6 +715,77 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
   // Weighted logistic regression for meta-model (using uniqueness weights)
   const metaResult = trainWeightedLogisticRegression(metaFeatures, metaLabels, uniqueness, 0.01, 200);
   const metaAUC = computeAUC(metaFeatures, metaLabels, metaResult.weights, metaResult.bias);
+
+  // P1: Out-of-sample threshold validation
+  // Split data 70/30, find optimal threshold on train, validate on test
+  const splitIdx = Math.floor(metaFeatures.length * 0.7);
+  const trainFeatures = metaFeatures.slice(0, splitIdx);
+  const trainLabels = metaLabels.slice(0, splitIdx);
+  const trainWeights = uniqueness.slice(0, splitIdx);
+  const testFeatures = metaFeatures.slice(splitIdx);
+  const testLabels = metaLabels.slice(splitIdx);
+  const trainMeta = trainWeightedLogisticRegression(trainFeatures, trainLabels, trainWeights, 0.01, 200);
+  const testPreds: { prob: number; label: number }[] = [];
+  for (let i = 0; i < testFeatures.length; i++) {
+    let z = trainMeta.bias;
+    for (let j = 0; j < testFeatures[i].length; j++) z += testFeatures[i][j] * trainMeta.weights[j];
+    testPreds.push({ prob: sigmoid(z), label: testLabels[i] });
+  }
+  testPreds.sort((a, b) => b.prob - a.prob);
+  let oosBestThreshold = 0.5, oosBestF1 = 0, oosBestPrec = 0, oosBestRec = 0;
+  for (let t = 0.05; t <= 0.95; t += 0.05) {
+    let tp = 0, fp = 0, fn = 0;
+    for (const p of testPreds) {
+      const pred = p.prob >= t ? 1 : 0;
+      if (pred === 1 && p.label === 1) tp++;
+      if (pred === 1 && p.label === 0) fp++;
+      if (pred === 0 && p.label === 1) fn++;
+    }
+    const prec = (tp + fp) > 0 ? tp / (tp + fp) : 0;
+    const rec = (tp + fn) > 0 ? tp / (tp + fn) : 0;
+    const f1 = (prec + rec) > 0 ? 2 * prec * rec / (prec + rec) : 0;
+    if (f1 > oosBestF1) { oosBestF1 = f1; oosBestThreshold = t; oosBestPrec = prec; oosBestRec = rec; }
+  }
+  let oosTP = 0, oosFP = 0, oosFN = 0;
+  for (const p of testPreds) {
+    const pred = p.prob >= trainMeta.optimalThreshold ? 1 : 0;
+    if (pred === 1 && p.label === 1) oosTP++;
+    if (pred === 1 && p.label === 0) oosFP++;
+    if (pred === 0 && p.label === 1) oosFN++;
+  }
+  const oosPrecAtTrainThreshold = (oosTP + oosFP) > 0 ? oosTP / (oosTP + oosFP) : 0;
+  const oosRecAtTrainThreshold = (oosTP + oosFN) > 0 ? oosTP / (oosTP + oosFN) : 0;
+  const oosF1AtTrainThreshold = (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) > 0 ? 2 * oosPrecAtTrainThreshold * oosRecAtTrainThreshold / (oosPrecAtTrainThreshold + oosRecAtTrainThreshold) : 0;
+
+  // P2: Calibration plot per regime for meta-model
+  const metaRegimeBins: Record<string, { lo: number; hi: number; preds: number[]; labels: number[] }[]> = {
+    trending: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+    ranging: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+    volatile: Array.from({ length: 10 }, (_, i) => ({ lo: i / 10, hi: (i + 1) / 10, preds: [], labels: [] })),
+  };
+  for (let i = 0; i < metaFeatures.length; i++) {
+    const z = metaResult.bias + metaFeatures[i].reduce((a, w, j) => a + w * metaResult.weights[j], 0);
+    const pred = sigmoid(z);
+    const binIdx = Math.min(9, Math.floor(pred * 10));
+    const feat = metaFeatures[i];
+    const smaRatio = feat[2], atrPct = feat[6];
+    const regime = atrPct > 0.02 ? "volatile" : (smaRatio > 1.005 || smaRatio < 0.995) ? "trending" : "ranging";
+    metaRegimeBins[regime][binIdx].preds.push(pred);
+    metaRegimeBins[regime][binIdx].labels.push(metaLabels[i]);
+  }
+  const metaCalibrationPerRegime: Record<string, any[]> = {};
+  for (const [regime, rb] of Object.entries(metaRegimeBins)) {
+    metaCalibrationPerRegime[regime] = rb.map((b) => {
+      const ci = wilsonCI(b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0, b.preds.length);
+      return {
+        bin: `${(b.lo * 100).toFixed(0)}-${(b.hi * 100).toFixed(0)}%`,
+        predicted: b.preds.length > 0 ? b.preds.reduce((a, x) => a + x, 0) / b.preds.length : 0,
+        observed: b.labels.length > 0 ? b.labels.reduce((a, x) => a + x, 0) / b.labels.length : 0,
+        count: b.preds.length,
+        ciLo: ci.lo, ciHi: ci.hi,
+      };
+    });
+  }
   // Triple-barrier stats
   const tbTotal = tbMetaLabels.length;
   const tbUp = tbMetaOutcomes.filter(o => o === 1).length;
@@ -744,7 +814,15 @@ export function predictDirection(candles: Candle[]): MLPrediction | null {
     avgUniqueness: uniqueness.reduce((a, b) => a + b, 0) / Math.max(1, uniqueness.length),
     samples: tbTotal,
     barrierHitRate: tbTotal > 0 ? (tbUp + tbDown) / tbTotal : 0,
-    description: metaResult.f1AtThreshold > 0.3 ? `Meta-model can filter trades (F1=${metaResult.f1AtThreshold.toFixed(2)} at threshold ${metaResult.optimalThreshold.toFixed(2)})` : metaAUC > 0.6 ? `Meta-model weak (AUC ${metaAUC.toFixed(2)}, F1=${metaResult.f1AtThreshold.toFixed(2)})` : `Meta-model no filtering power (AUC ${metaAUC.toFixed(2)})`,
+    oosThreshold: oosBestThreshold,
+    oosF1: oosBestF1,
+    oosPrecision: oosBestPrec,
+    oosRecall: oosBestRec,
+    oosF1AtTrainThreshold,
+    oosPrecisionAtTrainThreshold: oosPrecAtTrainThreshold,
+    oosRecallAtTrainThreshold: oosRecAtTrainThreshold,
+    calibrationPerRegime: metaCalibrationPerRegime,
+    description: oosF1AtTrainThreshold > 0.3 ? `Meta-model OOS F1=${oosF1AtTrainThreshold.toFixed(2)} (train threshold ${trainMeta.optimalThreshold.toFixed(2)} → test)` : metaAUC > 0.6 ? `Meta-model weak OOS (AUC ${metaAUC.toFixed(2)}, F1=${oosF1AtTrainThreshold.toFixed(2)})` : `Meta-model no OOS filtering power (AUC ${metaAUC.toFixed(2)})`,
   };
 
   return {
