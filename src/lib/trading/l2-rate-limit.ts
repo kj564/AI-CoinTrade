@@ -56,27 +56,31 @@ class RedisRateLimiter implements RateLimiter {
   private available = false;
 
   constructor(redisUrl: string) {
-    // Dynamic import so ioredis isn't required at module load if REDIS_URL unset
-    import("ioredis")
-      .then(({ default: Redis }) => {
-        this.redis = new Redis(redisUrl, {
-          maxRetriesPerRequest: 1,
-          enableReadyCheck: true,
-          retryStrategy: () => null, // don't endlessly retry
-          lazyConnect: true,
-        });
-        this.redis.on("error", (e: Error) => {
-          console.warn("[l2-rate-limit] Redis error, falling back to in-memory:", e.message);
-          this.available = false;
-        });
-        this.redis.on("ready", () => {
-          this.available = true;
-        });
-        this.redis.connect().catch(() => { this.available = false; });
-      })
-      .catch((e) => {
-        console.warn("[l2-rate-limit] ioredis import failed, using in-memory:", e instanceof Error ? e.message : e);
+    // Lazy-load ioredis only when REDIS_URL is set. Uses a guarded require
+    // so the module loads even in ESM contexts where require isn't global.
+    try {
+      const req: any = typeof globalThis !== "undefined" && (globalThis as any).require
+        ? (globalThis as any).require
+        : typeof require !== "undefined" ? require : null;
+      if (!req) throw new Error("require unavailable in this context");
+      const Redis = req("ioredis");
+      this.redis = new Redis(redisUrl, {
+        maxRetriesPerRequest: 1,
+        enableReadyCheck: true,
+        retryStrategy: () => null,
+        lazyConnect: true,
       });
+      this.redis.on("error", (e: Error) => {
+        console.warn("[l2-rate-limit] Redis error, falling back to in-memory:", e.message);
+        this.available = false;
+      });
+      this.redis.on("ready", () => {
+        this.available = true;
+      });
+      this.redis.connect().catch(() => { this.available = false; });
+    } catch (e) {
+      console.warn("[l2-rate-limit] ioredis unavailable, using in-memory:", e instanceof Error ? e.message : e);
+    }
   }
 
   async check(key: string, max: number, windowMs: number): Promise<RateLimitResult> {

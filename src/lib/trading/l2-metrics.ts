@@ -110,6 +110,28 @@ export function formatPrometheusMetrics(summary: L2HealthSummary): string {
   lines.push("# TYPE l2_active_alerts gauge");
   lines.push(metric("l2_active_alerts", {}, summary.alerts.length));
 
+  lines.push("# HELP l2_alerts_by_severity Active alerts by severity level");
+  lines.push("# TYPE l2_alerts_by_severity gauge");
+  for (const sev of ["info", "warn", "error", "critical"] as const) {
+    const count = summary.alerts.filter((a: any) => a.severity === sev).length;
+    lines.push(metric("l2_alerts_by_severity", { severity: sev }, count));
+  }
+
+  // Per-pair circuit breaker metrics (priority #4)
+  lines.push("# HELP l2_pair_circuit_open Whether a per-pair circuit breaker is open (1/0)");
+  lines.push("# TYPE l2_pair_circuit_open gauge");
+  for (const [pair, pcb] of Object.entries(summary.pairCircuitBreakers || {})) {
+    const cb = pcb as any;
+    lines.push(metric("l2_pair_circuit_open", { pair }, cb.open ? 1 : 0));
+  }
+
+  lines.push("# HELP l2_pair_circuit_trips_total Total trips for each per-pair circuit breaker");
+  lines.push("# TYPE l2_pair_circuit_trips_total counter");
+  for (const [pair, pcb] of Object.entries(summary.pairCircuitBreakers || {})) {
+    const cb = pcb as any;
+    lines.push(metric("l2_pair_circuit_trips_total", { pair }, cb.trips));
+  }
+
   lines.push("# HELP l2_persisted_at_timestamp Unix timestamp of last successful DB persist (0=never)");
   lines.push("# TYPE l2_persisted_at_timestamp gauge");
   lines.push(metric("l2_persisted_at_timestamp", {}, summary.persistedAt ?? 0));

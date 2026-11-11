@@ -4,6 +4,17 @@ import { getDepth } from "@/lib/indodax";
 import { validateDepth } from "@/lib/trading/l2-storage";
 import { db } from "@/lib/db";
 
+// Inline channel detection (avoids importing l2-alerts which has createRequire overhead)
+function detectChannels(cfg: { telegramToken?: string | null; telegramChatId?: string | null } | null) {
+  return {
+    telegram: !!(cfg?.telegramToken && cfg?.telegramChatId),
+    slack: !!process.env.L2_ALERT_SLACK_WEBHOOK_URL,
+    discord: !!process.env.L2_ALERT_DISCORD_WEBHOOK_URL,
+    email: !!(process.env.L2_ALERT_SMTP_HOST && process.env.L2_ALERT_EMAIL_TO),
+    webhook: !!process.env.L2_ALERT_WEBHOOK_URL,
+  };
+}
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -30,8 +41,15 @@ export async function GET(req: NextRequest) {
 
     const summary: L2HealthSummary = getL2Health(safeThreshold);
 
+    // Include configured alerting channels (so the UI can show which are active)
+    let configuredChannels = { telegram: false, slack: false, discord: false, email: false, webhook: false };
+    try {
+      const cfg = await db.botConfig.findUnique({ where: { id: "singleton" } });
+      configuredChannels = detectChannels(cfg);
+    } catch { /* ignore */ }
+
     if (!deep) {
-      return NextResponse.json(summary, {
+      return NextResponse.json({ ...summary, configuredChannels }, {
         headers: { "Cache-Control": "no-store, max-age=0" },
       });
     }
@@ -40,7 +58,7 @@ export async function GET(req: NextRequest) {
     const deepCheck = await runDeepCheck();
 
     return NextResponse.json(
-      { ...summary, deepCheck },
+      { ...summary, configuredChannels, deepCheck },
       { headers: { "Cache-Control": "no-store, max-age=0" } },
     );
   } catch (e) {
@@ -55,7 +73,7 @@ interface DeepCheckResult {
   overall: "pass" | "fail";
   checks: {
     name: string;
-    status: "pass" | "fail";
+    status: "pass" | "fail" | "warn";
     durationMs: number;
     detail: string;
   }[];
@@ -89,12 +107,12 @@ async function runDeepCheck(): Promise<DeepCheckResult> {
     checks.push({ name: "indodax_depth_api", status: "fail", durationMs: 0, detail: `Exception: ${e instanceof Error ? e.message : String(e)}` });
   }
 
-  // 2. DB L2Snapshot table readable (writable verified indirectly via count)
+  // 2. DB L2Snapshot table readable (count + latest)
   try {
     const t0 = Date.now();
     const count = await db.l2Snapshot.count();
     const durationMs = Date.now() - t0;
-    checks.push({ name: "db_l2snapshot", status: "pass", durationMs, detail: `${count} snapshots stored · table readable` });
+    checks.push({ name: "db_l2snapshot", status: "pass", durationMs, detail: `${count} snapshots · table readable` });
   } catch (e) {
     checks.push({ name: "db_l2snapshot", status: "fail", durationMs: 0, detail: `DB read failed: ${e instanceof Error ? e.message : String(e)}` });
   }
@@ -108,7 +126,7 @@ async function runDeepCheck(): Promise<DeepCheckResult> {
       name: "monitor_responsive",
       status: "pass",
       durationMs,
-      detail: `status=${state.status} · ${state.totalAttempts} attempts tracked · hydrated`,
+      detail: `status=${state.status} · ${state.totalAttempts} attempts · hydrated · ${state.pairCircuitBreakers ? Object.keys(state.pairCircuitBreakers).length : 0} pair CBs`,
     });
   } catch (e) {
     checks.push({ name: "monitor_responsive", status: "fail", durationMs: 0, detail: `Monitor error: ${e instanceof Error ? e.message : String(e)}` });
@@ -127,7 +145,50 @@ async function runDeepCheck(): Promise<DeepCheckResult> {
     checks.push({ name: "scheduler_liveness", status: "fail", durationMs: 0, detail: `Exception: ${e instanceof Error ? e.message : String(e)}` });
   }
 
-  const overall: "pass" | "fail" = checks.every((c) => c.status === "pass") ? "pass" : "fail";
+  // 5. Persistence state (verify persistedAt is set — indicates DB flush has worked)
+  try {
+    const state = getL2Health();
+    const age = state.persistedAt ? Math.floor(Date.now() / 1000) - state.persistedAt : null;
+    checks.push({
+      name: "persistence_state",
+      status: age !== null && age < 3600 ? "pass" : "warn",
+      durationMs: 0,
+      detail: age !== null ? `Last DB flush ${age}s ago` : "No DB flush yet (will flush on next collection cycle)",
+    });
+  } catch (e) {
+    checks.push({ name: "persistence_state", status: "fail", durationMs: 0, detail: `Exception: ${e instanceof Error ? e.message : String(e)}` });
+  }
+
+  // 6. Alerting channels configured (informational)
+  try {
+    const cfg = await db.botConfig.findUnique({ where: { id: "singleton" } });
+    const channels = detectChannels(cfg);
+    const active = Object.entries(channels).filter(([, v]) => v).map(([k]) => k);
+    checks.push({
+      name: "alerting_channels",
+      status: active.length > 0 ? "pass" : "warn",
+      durationMs: 0,
+      detail: active.length > 0 ? `${active.length} channel(s) configured: ${active.join(", ")}` : "No alerting channels configured (set Telegram in Bot Config or L2_ALERT_* env vars)",
+    });
+  } catch (e) {
+    checks.push({ name: "alerting_channels", status: "fail", durationMs: 0, detail: `Exception: ${e instanceof Error ? e.message : String(e)}` });
+  }
+
+  // 7. Per-pair circuit breaker sanity (no pair should have an open CB in healthy state)
+  try {
+    const state = getL2Health();
+    const openPairs = Object.entries(state.pairCircuitBreakers || {}).filter(([, cb]: any) => cb.open).map(([p]) => p);
+    checks.push({
+      name: "pair_circuit_breakers",
+      status: openPairs.length === 0 ? "pass" : "warn",
+      durationMs: 0,
+      detail: openPairs.length === 0 ? "All per-pair circuit breakers closed" : `${openPairs.length} pair CB(s) open: ${openPairs.join(", ")}`,
+    });
+  } catch (e) {
+    checks.push({ name: "pair_circuit_breakers", status: "fail", durationMs: 0, detail: `Exception: ${e instanceof Error ? e.message : String(e)}` });
+  }
+
+  const overall: "pass" | "fail" = checks.filter((c) => c.status !== "warn").every((c) => c.status === "pass") ? "pass" : "fail";
 
   return {
     overall,

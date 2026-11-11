@@ -18,6 +18,7 @@ import {
   recordSchedulerTick,
   recordCollectionCycle,
   isCircuitOpen,
+  isPairCircuitOpen,
   getL2Health,
   getNewErrorAlerts,
   persistL2Health,
@@ -76,6 +77,13 @@ export function ensureBotScheduler(): { started: boolean; running: boolean } {
       let failCount = 0;
 
       for (const pair of L2_PAIRS) {
+        // Per-pair circuit breaker (#4) — skip pairs whose circuit is open
+        if (isPairCircuitOpen(pair)) {
+          const health = getL2Health();
+          const pcb = health.pairCircuitBreakers[pair];
+          console.warn(`[l2-collector] ${pair}: per-pair circuit OPEN — skipping (trips: ${pcb?.trips ?? 0})`);
+          continue;
+        }
         try {
           const candles = await loadCandles(pair, "1h", 100);
           const avgVol = candles.length > 0 ? candles.reduce((a, c) => a + c.volume, 0) / candles.length : 1000;

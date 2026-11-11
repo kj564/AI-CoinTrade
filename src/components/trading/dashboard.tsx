@@ -1315,9 +1315,20 @@ export function TradingDashboard() {
                                   {l2Health?.persistedAt && (
                                     <span className="rounded bg-teal-500/10 px-1 py-0 text-[7px] font-bold text-teal-300" title={`Monitor state persisted to DB ${formatL2Age(l2Health.persistedAt)} ago`}>DB✓</span>
                                   )}
-                                  <span className={cn("rounded px-1 py-0 text-[7px] font-bold", botCfg?.telegramToken && botCfg?.telegramChatId ? "bg-sky-500/10 text-sky-300" : "bg-slate-500/10 text-slate-500")} title={botCfg?.telegramToken && botCfg?.telegramChatId ? "Telegram alerting configured" : "Telegram not configured (set in Bot Config)"}>
-                                    {botCfg?.telegramToken && botCfg?.telegramChatId ? "TG✓" : "TG—"}
+                                  <span className={cn("rounded px-1 py-0 text-[7px] font-bold", l2Health?.configuredChannels?.telegram ? "bg-sky-500/10 text-sky-300" : "bg-slate-500/10 text-slate-500")} title={l2Health?.configuredChannels?.telegram ? "Telegram alerting configured" : "Telegram not configured (set in Bot Config)"}>
+                                    TG{l2Health?.configuredChannels?.telegram ? "✓" : "—"}
                                   </span>
+                                  {(() => {
+                                    const ch = l2Health?.configuredChannels;
+                                    const channels = [
+                                      ["SL", ch?.slack], ["DC", ch?.discord], ["EM", ch?.email], ["WH", ch?.webhook],
+                                    ] as const;
+                                    return channels.map(([label, on]) => (
+                                      <span key={label} className={cn("rounded px-1 py-0 text-[7px] font-bold", on ? "bg-emerald-500/10 text-emerald-300" : "bg-slate-500/10 text-slate-500")} title={`${label} alerting ${on ? "configured" : "not configured (set L2_ALERT_* env vars)"}`}>
+                                        {label}{on ? "✓" : "—"}
+                                      </span>
+                                    ));
+                                  })()}
                                   <Button size="sm" variant="outline" className="h-5 border-purple-500/30 bg-purple-500/[0.04] px-1.5 text-[8px] text-purple-300 hover:bg-purple-500/10" onClick={runL2DeepCheck} disabled={l2DeepCheckLoading}>
                                     {l2DeepCheckLoading ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Checking…</> : "Deep Check"}
                                   </Button>
@@ -1436,6 +1447,11 @@ export function TradingDashboard() {
                                               <div className="flex justify-between"><span className="text-slate-500">snapshots</span><span className="tabular-nums text-slate-300">{p.lastSnapshotCount}</span></div>
                                               <div className="flex justify-between"><span className="text-slate-500">last retries</span><span className="tabular-nums text-slate-400">{p.lastRetriesUsed}</span></div>
                                               <div className="flex justify-between"><span className="text-slate-500">success rate</span><span className={cn("tabular-nums font-bold", p.totalAttempts > 0 ? (p.totalSuccesses / p.totalAttempts > 0.9 ? "text-emerald-400" : p.totalSuccesses / p.totalAttempts > 0.5 ? "text-amber-400" : "text-rose-400") : "text-slate-500")}>{p.totalAttempts > 0 ? `${((p.totalSuccesses / p.totalAttempts) * 100).toFixed(0)}%` : "—"}<span className="text-slate-600"> ({p.totalAttempts})</span></span></div>
+                                              {(() => {
+                                                const pcb = l2Health.pairCircuitBreakers?.[p.pair];
+                                                if (!pcb) return null;
+                                                return <div className="flex justify-between"><span className="text-slate-500">pair CB</span><span className={cn("tabular-nums font-bold", pcb.open ? "text-rose-400" : "text-emerald-400")}>{pcb.open ? `OPEN (${pcb.trips}t)` : "closed"}{pcb.open && pcb.openUntil ? ` · ${formatL2Age(pcb.openUntil - l2Health.generatedAt)} left` : ""}</span></div>;
+                                              })()}
                                             </div>
                                             {p.lastError && (
                                               <div className="mt-0.5 rounded bg-rose-500/[0.06] px-1 py-0.5 text-[7px] leading-tight text-rose-300/80" title={p.lastError}>
@@ -1455,11 +1471,22 @@ export function TradingDashboard() {
                                         <span className="text-[8px] font-bold uppercase text-amber-400">Alerts ({l2Health.alerts.length})</span>
                                         <button onClick={() => setL2RunbookOpen(true)} className="text-[7px] font-bold text-sky-400 hover:underline">Open Runbook →</button>
                                       </div>
-                                      <div className="max-h-24 space-y-0.5 overflow-y-auto">
+                                      <div className="max-h-28 space-y-0.5 overflow-y-auto">
                                         {l2Health.alerts.map((a: any, i: number) => (
                                           <div key={i} className={cn("flex items-start gap-1 text-[8px]", a.level === "error" ? "text-rose-300" : "text-amber-300")}>
                                             {a.level === "error" ? <XCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" /> : <AlertCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" />}
-                                            <span className="flex-1"><b className="font-mono">[{a.pair}]</b> {a.message}{a.detail ? ` — ${a.detail}` : ""}</span>
+                                            <span className="flex-1">
+                                              <b className="font-mono">[{a.pair}]</b>
+                                              {a.severity && (
+                                                <span className={cn("ml-1 rounded px-0.5 py-0 text-[6px] font-bold uppercase",
+                                                  a.severity === "critical" ? "bg-rose-500/20 text-rose-300"
+                                                  : a.severity === "error" ? "bg-orange-500/20 text-orange-300"
+                                                  : a.severity === "warn" ? "bg-amber-500/20 text-amber-300"
+                                                  : "bg-sky-500/20 text-sky-300"
+                                                )}>{a.severity}</span>
+                                              )}
+                                              {" "}{a.message}{a.detail ? ` — ${a.detail}` : ""}
+                                            </span>
                                             {a.runbook && (
                                               <button onClick={() => setL2RunbookOpen(true)} className="flex-shrink-0 text-[7px] text-sky-400 hover:underline" title={a.runbook}>runbook</button>
                                             )}
@@ -1497,7 +1524,7 @@ export function TradingDashboard() {
                                   })()}
 
                                   <p className="mt-1.5 text-[8px] leading-relaxed text-slate-500">
-                                    Tracks in-process L2 snapshot collection (every 30 ticks ≈ 30 min for 5 pairs). Each fetch uses 3-attempt exponential backoff (500ms → 1s → 2s, jittered). Snapshots are validated before storage. Circuit breaker opens after 3 consecutive 0-success cycles (5-min→30-min cooldown). State persisted to DB survives hot-reload. External alerts fire on new incidents via Telegram + webhook. Status: <b className="text-emerald-300">healthy</b> = no failures &amp; fresh; <b className="text-amber-300">degraded</b> = recent failure or stale; <b className="text-rose-300">down</b> = 3+ consecutive failures, circuit open, or scheduler dead.
+                                    Tracks in-process L2 snapshot collection (every 30 ticks ≈ 30 min for 5 pairs). Each fetch uses 3-attempt exponential backoff (500ms → 1s → 2s, jittered). Snapshots are validated before storage. <b className="text-slate-300">Global circuit breaker</b> opens after 3 consecutive 0-success cycles (5-min→30-min cooldown). <b className="text-slate-300">Per-pair circuit breakers</b> open after 3 consecutive failures for a single pair (1-min→30-min cooldown) — granular cascade protection. State persisted to DB survives hot-reload. <b className="text-slate-300">Multi-channel alerting</b> (Telegram + Slack + Discord + Email + webhook) fires on new incidents with severity-based routing (critical→all, error→TG+Slack+Email, warn→Slack+Discord). Rate-limited (3/60s, memory or Redis backend). Status: <b className="text-emerald-300">healthy</b> = no failures &amp; fresh; <b className="text-amber-300">degraded</b> = recent failure or stale; <b className="text-rose-300">down</b> = 3+ consecutive failures, circuit open, or scheduler dead.
                                   </p>
 
                                   {/* Runbook (collapsible troubleshooting) */}
@@ -1510,12 +1537,16 @@ export function TradingDashboard() {
                                     </CollapsibleTrigger>
                                     <CollapsibleContent className="mt-1 space-y-1.5">
                                       {[
-                                        { id: "runbook-outage", title: "outage — 3+ consecutive failures", steps: ["1. Check /api/l2/health?deep=1 → is indodax_depth_api passing?", "2. If INDODAX API down: wait for recovery (circuit breaker auto-skips).", "3. If API up but collection fails: check dev.log for [l2-collector] errors.", "4. Manual probe: curl -X POST /api/l2/collect?force=1", "5. If persists: INDODAX may have rate-limited the depth endpoint."] },
-                                        { id: "runbook-stale", title: "stale — snapshot older than 2× candle duration", steps: ["1. Check scheduler status in aggregate stats (RUNNING?).", "2. If STOPPED: the in-process scheduler died — restart dev server.", "3. If RUNNING but stale: last collection cycle may have been skipped by circuit breaker.", "4. Click 'Collect Now' to force a fresh snapshot.", "5. Stale snapshots degrade backtest calibration accuracy but don't break live signals."] },
-                                        { id: "runbook-consecutive-failures", title: "consecutive_failures — 1-2 recent failures", steps: ["1. Transient — the retry w/ backoff usually self-heals.", "2. Monitor the per-pair grid; if it escalates to outage (3+), follow the outage runbook.", "3. Check lastError field for the specific failure reason."] },
-                                        { id: "runbook-circuit-open", title: "circuit_open — cascade-failure protection active", steps: ["1. The circuit opened after 3 consecutive 0-success collection cycles.", "2. Collection is auto-skipped until cooldown elapses (5min→30min exponential).", "3. After cooldown, a half-open probe runs ONE cycle.", "4. If probe succeeds → circuit closes. If fails → re-opens with longer cooldown.", "5. To override (debugging): curl -X POST '/api/l2/collect?force=1'"] },
-                                        { id: "runbook-scheduler-dead", title: "scheduler_dead — no tick in 5 min", steps: ["1. The in-process bot scheduler stopped (dev server crash or hot-reload gap).", "2. Restart: the scheduler auto-starts on first page load via ensureBotScheduler().", "3. If persistent: check dev.log for [bot-scheduler] startup errors.", "4. Note: monitor state is DB-persisted, so stats survive the restart."] },
-                                        { id: "runbook-never-collected", title: "never_collected — no snapshot yet", steps: ["1. Normal on first deploy / fresh DB.", "2. Click 'Collect Now' to trigger the first collection.", "3. The scheduler will collect every 30 min going forward."] },
+                                        { id: "runbook-outage", title: "outage — 3+ consecutive failures (severity: error)", steps: ["1. Check /api/l2/health?deep=1 → is indodax_depth_api passing?", "2. If INDODAX API down: wait for recovery (circuit breaker auto-skips).", "3. If API up but collection fails: check dev.log for [l2-collector] errors.", "4. Manual probe: curl -X POST /api/l2/collect?force=1", "5. If persists: INDODAX may have rate-limited the depth endpoint.", "6. Alert routed to: Telegram + Slack + Email (severity=error)."] },
+                                        { id: "runbook-stale", title: "stale — snapshot older than 2x candle duration (severity: warn)", steps: ["1. Check scheduler status in aggregate stats (RUNNING?).", "2. If STOPPED: the in-process scheduler died — restart dev server.", "3. If RUNNING but stale: last collection cycle may have been skipped by circuit breaker.", "4. Click 'Collect Now' to force a fresh snapshot.", "5. Stale snapshots degrade backtest calibration accuracy but don't break live signals.", "6. Alert routed to: Slack + Discord (severity=warn, no email)."] },
+                                        { id: "runbook-consecutive-failures", title: "consecutive_failures — 1-2 recent failures (severity: warn)", steps: ["1. Transient — the retry w/ backoff usually self-heals.", "2. Monitor the per-pair grid; if it escalates to outage (3+), follow the outage runbook.", "3. Check lastError field for the specific failure reason."] },
+                                        { id: "runbook-circuit-open", title: "circuit_open — global cascade protection (severity: critical)", steps: ["1. The global circuit opened after 3 consecutive 0-success collection cycles.", "2. Collection is auto-skipped until cooldown elapses (5min->30min exponential).", "3. After cooldown, a half-open probe runs ONE cycle.", "4. If probe succeeds -> circuit closes. If fails -> re-opens with longer cooldown.", "5. To override (debugging): curl -X POST '/api/l2/collect?force=1'", "6. Alert routed to: ALL configured channels (severity=critical)."] },
+                                        { id: "runbook-circuit-open-pair", title: "circuit_open_pair — per-pair cascade protection (severity: error)", steps: ["1. A single pair's circuit opened after 3 consecutive failures for that pair.", "2. Only that pair's collection is skipped — other pairs continue normally.", "3. Cooldown is shorter (1min->10min) than the global CB.", "4. After cooldown, a half-open probe attempts that pair.", "5. This is granular — investigate the specific pair's lastError."] },
+                                        { id: "runbook-scheduler-dead", title: "scheduler_dead — no tick in 5 min (severity: critical)", steps: ["1. The in-process bot scheduler stopped (dev server crash or hot-reload gap).", "2. Restart: the scheduler auto-starts on first page load via ensureBotScheduler().", "3. If persistent: check dev.log for [bot-scheduler] startup errors.", "4. Note: monitor state is DB-persisted, so stats survive the restart.", "5. Alert routed to: ALL configured channels (severity=critical)."] },
+                                        { id: "runbook-never-collected", title: "never_collected — no snapshot yet (severity: warn)", steps: ["1. Normal on first deploy / fresh DB.", "2. Click 'Collect Now' to trigger the first collection.", "3. The scheduler will collect every 30 min going forward."] },
+                                        { id: "runbook-rate-limited", title: "rate_limited — too many collect calls (429)", steps: ["1. The /api/l2/collect endpoint is rate-limited (3 calls/60s per source).", "2. Wait for the Retry-After period to elapse.", "3. The in-process scheduler is NOT affected — only manual/API calls are limited.", "4. For multi-instance deployments, set REDIS_URL for shared rate limiting.", "5. Backend: check rateLimitBackend in the collect response (memory/redis)."] },
+                                        { id: "runbook-persistence-failed", title: "persistence_failed — DB flush failed", steps: ["1. The in-memory monitor is still accurate (authoritative).", "2. The DB flush failed — check dev.log for [l2-monitor] persistL2Health failed.", "3. Common cause: SQLite locked or DB connection issue.", "4. The next collection cycle will retry the flush automatically.", "5. If persistent: the monitor won't survive hot-reloads until fixed."] },
+                                        { id: "runbook-alerting-delivery-failed", title: "alerting_delivery_failed — external channel failed", steps: ["1. The alert was recorded in the monitor but delivery to a channel failed.", "2. Check dev.log for [l2-alerts] <channel> failed messages.", "3. Telegram: verify BotConfig.telegramToken/ChatId are valid.", "4. Slack/Discord: verify L2_ALERT_*_WEBHOOK_URL env vars are reachable.", "5. Email: verify L2_ALERT_SMTP_* env vars (host/port/user/pass).", "6. The alert is NOT lost — it's in the monitor and will show in the UI."] },
                                       ].map((rb) => (
                                         <div key={rb.id} id={rb.id} className="rounded bg-white/[0.02] p-1.5">
                                           <div className="mb-0.5 text-[8px] font-bold text-sky-300">{rb.title}</div>
@@ -1527,7 +1558,7 @@ export function TradingDashboard() {
                                         </div>
                                       ))}
                                       <div className="rounded bg-sky-500/[0.04] p-1.5 text-[7px] leading-relaxed text-slate-400">
-                                        <b className="text-sky-300">Endpoints:</b> GET /api/l2/health (summary) · GET /api/l2/health?deep=1 (end-to-end check) · GET /api/l2/metrics (Prometheus) · POST /api/l2/collect (manual collect, rate-limited 3/60s) · POST /api/l2/collect?force=1 (override circuit breaker)
+                                        <b className="text-sky-300">Endpoints:</b> GET /api/l2/health (+configuredChannels) · GET /api/l2/health?deep=1 (7 checks: depth API, DB read/write, monitor, scheduler, persistence round-trip, alerting channels, per-pair CBs) · GET /api/l2/metrics (Prometheus, 18 metrics) · POST /api/l2/collect (rate-limited 3/60s, per-pair CB protected) · POST /api/l2/collect?force=1 (override both global + per-pair CB). <b className="text-sky-300">Grafana:</b> import grafana/l2-collector-dashboard.json · <b className="text-sky-300">Env vars:</b> L2_ALERT_SLACK_WEBHOOK_URL, L2_ALERT_DISCORD_WEBHOOK_URL, L2_ALERT_SMTP_HOST/PORT/USER/PASS, L2_ALERT_EMAIL_TO/FROM, L2_ALERT_WEBHOOK_URL, REDIS_URL
                                       </div>
                                     </CollapsibleContent>
                                   </Collapsible>

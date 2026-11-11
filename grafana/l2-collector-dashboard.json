@@ -1,0 +1,179 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "INDODAX L2 Order Book Collector health dashboard. Requires Prometheus scraping /api/l2/metrics.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Collector Status",
+      "description": "1=healthy 2=degraded 3=down",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "1": { "text": "HEALTHY", "color": "green" }, "2": { "text": "DEGRADED", "color": "yellow" }, "3": { "text": "DOWN", "color": "red" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 3 }] }
+        }
+      },
+      "targets": [{ "expr": "l2_collector_status", "refId": "A" }]
+    },
+    {
+      "title": "Global Circuit Breaker",
+      "description": "1=open (cascade protection active)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "CLOSED", "color": "green" }, "1": { "text": "OPEN", "color": "red" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "targets": [{ "expr": "l2_circuit_open", "refId": "A" }]
+    },
+    {
+      "title": "Scheduler Liveness (seconds since last tick)",
+      "description": "Higher = worse. Should be < 60s for a healthy 60s tick interval.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 120 }, { "color": "red", "value": 300 }] }
+        }
+      },
+      "targets": [{ "expr": "l2_collector_scheduler_liveness_seconds", "refId": "A" }]
+    },
+    {
+      "title": "Scheduler Running",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "STOPPED", "color": "red" }, "1": { "text": "RUNNING", "color": "green" } }, "type": "value" }]
+        }
+      },
+      "targets": [{ "expr": "l2_collector_scheduler_running", "refId": "A" }]
+    },
+    {
+      "title": "Active Alerts by Severity",
+      "description": "Critical/Error alerts indicate active incidents.",
+      "type": "bargauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }] }
+        }
+      },
+      "targets": [{ "expr": "l2_alerts_by_severity", "legendFormat": "{{severity}}", "refId": "A" }]
+    },
+    {
+      "title": "Collection Attempts (rate per minute)",
+      "description": "Should show steady ~0.17/min (5 pairs every 30 min). Drops to 0 when circuit open.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        { "expr": "rate(l2_attempts_total[5m]) * 60", "legendFormat": "{{pair}} attempts/min", "refId": "A" },
+        { "expr": "rate(l2_successes_total[5m]) * 60", "legendFormat": "{{pair}} successes/min", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Consecutive Failures per Pair",
+      "description": "Should be 0. ≥3 triggers per-pair circuit breaker + outage alert.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{ "expr": "l2_consecutive_failures", "legendFormat": "{{pair}}", "refId": "A" }],
+      "thresholds": [{ "value": 3, "color": "red" }]
+    },
+    {
+      "title": "Per-Pair Circuit Breaker State",
+      "description": "1 = open (collection for that pair skipped). Granular cascade protection.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "CLOSED", "color": "green" }, "1": { "text": "OPEN", "color": "red" } }, "type": "value" }]
+        }
+      },
+      "targets": [{ "expr": "l2_pair_circuit_open", "legendFormat": "{{pair}}", "refId": "A" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal" }
+    },
+    {
+      "title": "Last Success Age per Pair (seconds)",
+      "description": "Should be < 3600s (1h candle duration). >7200s triggers stale alert.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{ "expr": "l2_last_success_age_seconds", "legendFormat": "{{pair}}", "refId": "A" }],
+      "thresholds": [{ "value": 7200, "color": "red" }, { "value": 3600, "color": "yellow" }]
+    },
+    {
+      "title": "Stored Snapshot Count per Pair",
+      "description": "Grows over time. Used for historical backtest calibration.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{ "expr": "l2_snapshot_count", "legendFormat": "{{pair}}", "refId": "A" }]
+    },
+    {
+      "title": "Circuit Breaker Trips (cumulative)",
+      "description": "Global + per-pair trip counts. High values indicate recurring INDODAX API issues.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "l2_circuit_trips_total", "legendFormat": "global", "refId": "A" },
+        { "expr": "l2_pair_circuit_trips_total", "legendFormat": "{{pair}}", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Last DB Persist",
+      "description": "Unix timestamp of last successful monitor state flush to DB.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 25 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{ "expr": "time() - l2_persisted_at_timestamp", "legendFormat": "seconds since last persist", "refId": "A" }]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["indodax", "l2", "collector", "trading"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "INDODAX L2 Collector Health",
+  "uid": "l2-collector-health",
+  "version": 1,
+  "weekStart": ""
+}

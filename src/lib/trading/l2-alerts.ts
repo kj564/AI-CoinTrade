@@ -20,6 +20,16 @@ import { db } from "@/lib/db";
 import { sendTelegram } from "@/lib/telegram";
 import type { L2Alert, L2HealthSummary } from "./l2-monitor";
 
+// Guarded require for optional native deps (nodemailer). Uses globalThis.require
+// when available (CJS), falls back gracefully in ESM contexts.
+function guardedRequire(name: string): any {
+  const req: any = typeof globalThis !== "undefined" && (globalThis as any).require
+    ? (globalThis as any).require
+    : typeof require !== "undefined" ? require : null;
+  if (!req) throw new Error(`require unavailable — cannot load ${name}`);
+  return req(name);
+}
+
 export type AlertSeverity = "info" | "warn" | "error" | "critical";
 
 export interface AlertChannelConfig {
@@ -245,8 +255,8 @@ async function sendEmail(alerts: L2Alert[], summary: L2HealthSummary, severity: 
   const to = process.env.L2_ALERT_EMAIL_TO;
   if (!host || !to) return false;
   try {
-    // Dynamic import so the module loads even if nodemailer isn't installed
-    const nodemailer = await import("nodemailer");
+    // Lazy-load nodemailer via guarded require (Turbopack-safe)
+    const nodemailer = guardedRequire("nodemailer");
     const port = parseInt(process.env.L2_ALERT_SMTP_PORT || "587", 10);
     const user = process.env.L2_ALERT_SMTP_USER;
     const pass = process.env.L2_ALERT_SMTP_PASS;

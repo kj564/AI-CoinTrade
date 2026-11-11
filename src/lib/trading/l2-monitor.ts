@@ -145,6 +145,16 @@ function freshCircuit(): CircuitBreakerState {
   };
 }
 
+function freshPairCircuit(): PairCircuitBreakerState {
+  return {
+    open: false,
+    openedAt: null,
+    openUntil: null,
+    trips: 0,
+    currentCooldownSec: PAIR_CB_BASE_COOLDOWN_SEC,
+  };
+}
+
 function getState(): MonitorState {
   if (!globalForMonitor.__l2Monitor) {
     const pairs = new Map<string, PairHealth>();
@@ -170,6 +180,7 @@ function getState(): MonitorState {
       schedulerRunning: false,
       lastSchedulerTickAt: null,
       circuit: freshCircuit(),
+      pairCircuits: new Map(),
       lastNotifiedAlerts: new Set(),
       persistedAt: null,
       hydrated: false,
@@ -179,6 +190,7 @@ function getState(): MonitorState {
   // persists (missing new fields), migrate it in-place so we never read undefined.
   const s = globalForMonitor.__l2Monitor;
   if (!s.circuit) s.circuit = freshCircuit();
+  if (!s.pairCircuits) s.pairCircuits = new Map();
   if (!s.lastNotifiedAlerts) s.lastNotifiedAlerts = new Set();
   if (s.persistedAt === undefined) s.persistedAt = null;
   if (s.hydrated === undefined) s.hydrated = false;
@@ -243,6 +255,9 @@ export function recordL2Attempt(
     h.totalFailures++;
   }
   h.lastRetriesUsed = result.retriesUsed ?? 0;
+
+  // Update per-pair circuit breaker (#4)
+  recordPairAttempt(pair, result.success);
 }
 
 // Mark that the scheduler ticked (so we can detect scheduler death).
@@ -250,6 +265,77 @@ export function recordSchedulerTick(): void {
   const state = getState();
   state.schedulerRunning = true;
   state.lastSchedulerTickAt = Math.floor(Date.now() / 1000);
+}
+
+// ── Per-pair circuit breaker (priority #4) ──
+// Granular cascade protection: if a single pair keeps failing, only that pair's
+// collection is skipped (not all pairs). Shorter cooldown than the global CB
+// since a single pair failing is less severe than all pairs failing.
+
+export function recordPairAttempt(pair: string, success: boolean): void {
+  const state = getState();
+  let cb = state.pairCircuits.get(pair);
+  if (!cb) {
+    cb = freshPairCircuit();
+    state.pairCircuits.set(pair, cb);
+  }
+  const now = Math.floor(Date.now() / 1000);
+
+  if (cb.open) {
+    // If past cooldown, this was a half-open probe attempt
+    if (cb.openUntil !== null && now >= cb.openUntil) {
+      if (success) {
+        // Probe succeeded — close
+        cb.open = false;
+        cb.openedAt = null;
+        cb.openUntil = null;
+        cb.currentCooldownSec = PAIR_CB_BASE_COOLDOWN_SEC;
+        console.log(`[l2-pair-cb] ${pair}: CLOSED — half-open probe succeeded`);
+      } else {
+        // Probe failed — re-open with backoff
+        cb.currentCooldownSec = Math.min(cb.currentCooldownSec * 2, PAIR_CB_MAX_COOLDOWN_SEC);
+        cb.openUntil = now + cb.currentCooldownSec;
+        cb.trips++;
+        console.warn(`[l2-pair-cb] ${pair}: re-opened after probe failed — cooldown ${cb.currentCooldownSec}s (trips: ${cb.trips})`);
+      }
+    }
+    return;
+  }
+
+  // Circuit closed: track consecutive failures via PairHealth
+  const h = state.pairs.get(pair);
+  if (!h) return;
+  if (!success && h.consecutiveFailures >= PAIR_CB_THRESHOLD) {
+    // Trip the pair's circuit
+    cb.open = true;
+    cb.openedAt = now;
+    cb.openUntil = now + cb.currentCooldownSec;
+    cb.trips++;
+    console.warn(`[l2-pair-cb] ${pair}: OPENED — ${h.consecutiveFailures} consecutive failures. Cooldown ${cb.currentCooldownSec}s.`);
+  } else if (success) {
+    // Success resets the pair's CB state (already reset by recordL2Attempt)
+    cb.currentCooldownSec = PAIR_CB_BASE_COOLDOWN_SEC;
+  }
+}
+
+// Is a specific pair's circuit currently open (collection for that pair should be skipped)?
+export function isPairCircuitOpen(pair: string): boolean {
+  const state = getState();
+  const cb = state.pairCircuits.get(pair);
+  if (!cb || !cb.open) return false;
+  const now = Math.floor(Date.now() / 1000);
+  // Past cooldown → half-open, allow probe
+  if (cb.openUntil !== null && now >= cb.openUntil) return false;
+  return true;
+}
+
+export function getPairCircuitBreakers(): Record<string, PairCircuitBreakerState> {
+  const state = getState();
+  const out: Record<string, PairCircuitBreakerState> = {};
+  for (const [pair, cb] of state.pairCircuits) {
+    out[pair] = { ...cb };
+  }
+  return out;
 }
 
 // ── Circuit breaker ──
@@ -321,6 +407,17 @@ export function getCircuitBreaker(): CircuitBreakerState {
 
 // ── Alert derivation ──
 
+// Derive severity from alert code + level (priority #7).
+// critical = system-wide failure (circuit open, scheduler dead)
+// error   = pair-level outage
+// warn    = degradation (stale, consecutive failures, never collected)
+function deriveSeverity(code: L2Alert["code"], level: L2Alert["level"]): AlertSeverity {
+  if (code === "circuit_open" || code === "scheduler_dead") return "critical";
+  if (code === "circuit_open_pair") return "error";
+  if (level === "error") return "error";
+  return "warn";
+}
+
 function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
   const alerts: L2Alert[] = [];
   const now = Math.floor(Date.now() / 1000);
@@ -328,6 +425,7 @@ function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
   if (h.totalAttempts === 0) {
     alerts.push({
       level: "warn",
+      severity: "warn",
       pair: h.pair,
       code: "never_collected",
       message: `No L2 snapshot collected yet for ${h.pair}`,
@@ -340,6 +438,7 @@ function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
   if (h.consecutiveFailures >= OUTAGE_THRESHOLD) {
     alerts.push({
       level: "error",
+      severity: "error",
       pair: h.pair,
       code: "outage",
       message: `${h.pair}: ${h.consecutiveFailures} consecutive collection failures — collector appears down`,
@@ -349,6 +448,7 @@ function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
   } else if (h.consecutiveFailures >= DEGRADED_THRESHOLD) {
     alerts.push({
       level: "warn",
+      severity: "warn",
       pair: h.pair,
       code: "consecutive_failures",
       message: `${h.pair}: ${h.consecutiveFailures} recent failure(s) — last error: ${h.lastError ?? "unknown"}`,
@@ -360,8 +460,10 @@ function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
   if (h.lastSuccessAt !== null) {
     const age = now - h.lastSuccessAt;
     if (age > stalenessThresholdSec * STALE_MULTIPLIER) {
+      const lvl = h.consecutiveFailures > 0 ? "error" : "warn";
       alerts.push({
-        level: h.consecutiveFailures > 0 ? "error" : "warn",
+        level: lvl,
+        severity: deriveSeverity("stale", lvl),
         pair: h.pair,
         code: "stale",
         message: `${h.pair}: last snapshot ${formatAge(age)} old (threshold ${formatAge(stalenessThresholdSec * STALE_MULTIPLIER)})`,
@@ -372,11 +474,29 @@ function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
     // attempts made but never succeeded
     alerts.push({
       level: "error",
+      severity: "error",
       pair: h.pair,
       code: "outage",
       message: `${h.pair}: ${h.totalAttempts} attempts, 0 successes — collector failing`,
       detail: h.lastError ?? undefined,
       runbook: RUNBOOK.outage,
+    });
+  }
+
+  // Per-pair circuit breaker alert (#4)
+  const state = getState();
+  const pcb = state.pairCircuits.get(h.pair);
+  if (pcb && pcb.open) {
+    const inCooldown = pcb.openUntil !== null && now < pcb.openUntil;
+    alerts.push({
+      level: "error",
+      severity: "error",
+      pair: h.pair,
+      code: "circuit_open_pair",
+      message: inCooldown
+        ? `${h.pair}: per-pair circuit OPEN — collection skipped for ${formatAge((pcb.openUntil ?? 0) - now)} (trips: ${pcb.trips})`
+        : `${h.pair}: per-pair circuit half-open — probe allowed`,
+      runbook: RUNBOOK.circuit_open_pair,
     });
   }
 
@@ -423,6 +543,7 @@ export function getL2Health(stalenessThresholdSec = 3600): L2HealthSummary {
     if (tickAge > 300) {
       allAlerts.push({
         level: "error",
+        severity: "critical",
         pair: "*",
         code: "scheduler_dead",
         message: `Scheduler: no tick in ${formatAge(tickAge)} — in-process collector appears dead`,
@@ -433,6 +554,7 @@ export function getL2Health(stalenessThresholdSec = 3600): L2HealthSummary {
   } else if (!state.schedulerRunning) {
     allAlerts.push({
       level: "warn",
+      severity: "warn",
       pair: "*",
       code: "scheduler_dead",
       message: "Scheduler: not started yet — in-process collector not running",
@@ -441,13 +563,14 @@ export function getL2Health(stalenessThresholdSec = 3600): L2HealthSummary {
     if (worstStatus === "healthy") worstStatus = "degraded";
   }
 
-  // Circuit breaker alert
+  // Global circuit breaker alert
   const cb = state.circuit;
   if (cb.open) {
     const now = Math.floor(Date.now() / 1000);
     const inCooldown = cb.openUntil !== null && now < cb.openUntil;
     allAlerts.push({
       level: "error",
+      severity: "critical",
       pair: "*",
       code: "circuit_open",
       message: inCooldown
@@ -472,6 +595,7 @@ export function getL2Health(stalenessThresholdSec = 3600): L2HealthSummary {
     schedulerRunning: state.schedulerRunning,
     lastSchedulerTickAt: state.lastSchedulerTickAt,
     circuitBreaker: { ...cb },
+    pairCircuitBreakers: getPairCircuitBreakers(),
     persistedAt: state.persistedAt,
   };
 }
@@ -628,6 +752,7 @@ export async function resetL2Monitor(): Promise<void> {
   state.schedulerRunning = false;
   state.lastSchedulerTickAt = null;
   state.circuit = freshCircuit();
+  state.pairCircuits.clear();
   state.lastNotifiedAlerts.clear();
   state.persistedAt = null;
   state.hydrated = true;
