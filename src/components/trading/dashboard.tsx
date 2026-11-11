@@ -283,6 +283,7 @@ export function TradingDashboard() {
   const [btSL, setBtSL] = useState("3");
   const [btTP, setBtTP] = useState("5");
   const [btResult, setBtResult] = useState<BtResponse | null>(null);
+  const [btError, setBtError] = useState<string | null>(null);
   const [btLoading, setBtLoading] = useState(false);
   const [btTf, setBtTf] = useState("1h");
   const [histLoading, setHistLoading] = useState(false);
@@ -375,14 +376,21 @@ export function TradingDashboard() {
   }
 
   async function runBt() {
-    setBtLoading(true); setTradeStatus("Running backtest on real historical candles + Monte Carlo…");
+    setBtLoading(true); setBtError(null); setTradeStatus("Running backtest on real historical candles + Monte Carlo…");
     try {
-      const r = await fetch("/api/backtest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pair: selectedPair, strategy: btStrategy, initialCapital: Number(btCapital), stopLossPct: Number(btSL) / 100, takeProfitPct: Number(btTP) / 100, params: { timeframe: btTf } }) });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+      const r = await fetch("/api/backtest", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pair: selectedPair, strategy: btStrategy, initialCapital: Number(btCapital), stopLossPct: Number(btSL) / 100, takeProfitPct: Number(btTP) / 100, params: { timeframe: btTf } }), signal: controller.signal });
+      clearTimeout(timeout);
       const d = await r.json();
-      if (d.error) { setTradeStatus(`BT error: ${d.error}`); return; }
+      if (d.error) { setBtError(d.error); setTradeStatus(`BT error: ${d.error}`); return; }
       setBtResult(d as BtResponse);
       setTradeStatus(`Backtest complete: ${d.dataSource?.candleCount} ${d.dataSource?.timeframe} candles · ${d.dataSource?.windowDays}d · ${d.result?.tradeCount} trades`);
-    } catch { setTradeStatus("Backtest failed"); }
+    } catch (e) {
+      const msg = e instanceof Error && e.name === "AbortError" ? "Backtest timed out (30s) — server may be under heavy load. Try again." : "Backtest failed — server may be unavailable. Try again.";
+      setBtError(msg);
+      setTradeStatus(msg);
+    }
     finally { setBtLoading(false); }
   }
 
@@ -1656,6 +1664,20 @@ export function TradingDashboard() {
                         </p>
                       </div>
                     )}
+                  </div>
+                </Card>
+              )}
+
+              {btError && !btResult && (
+                <Card className="border-rose-500/20 bg-rose-500/[0.03]">
+                  <div className="p-6 text-center">
+                    <AlertTriangle className="mx-auto h-8 w-8 text-rose-400 mb-2" />
+                    <h4 className="text-sm font-bold text-rose-300">Backtest Error</h4>
+                    <p className="mt-1 text-[11px] text-slate-400">{btError}</p>
+                    <p className="mt-2 text-[10px] text-slate-500">The backtest engine includes L2 order book fetching, realistic limit execution simulation, and microstructure analysis which may require significant server resources. If the server is under load, please try again in a moment.</p>
+                    <Button size="sm" variant="outline" className="mt-3 border-rose-500/30 bg-rose-500/[0.04] text-rose-300 hover:bg-rose-500/10" onClick={runBt} disabled={btLoading}>
+                      {btLoading ? <><Clock className="h-3.5 w-3.5 animate-spin" /> Retrying…</> : "Retry Backtest"}
+                    </Button>
                   </div>
                 </Card>
               )}

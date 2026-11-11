@@ -3,7 +3,7 @@ import { getTicker, getDepth } from "@/lib/indodax";
 import { runBacktest, assessRisk, optimizePositions, generateReport, buildL2Snapshot, walkTheBook, type BacktestConfig } from "@/lib/trading/backtest";
 import { loadCandles, type Timeframe } from "@/lib/trading/candles";
 import { fetchLastNDays } from "@/lib/trading/ccxt-provider";
-import { fetchAndStoreL2, getHistoricalL2Snapshot, getLatestL2Snapshot } from "@/lib/trading/l2-storage";
+import { getHistoricalL2Snapshot, fetchAndStoreL2 } from "@/lib/trading/l2-storage";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -36,16 +36,36 @@ export async function POST(req: NextRequest) {
     const avgVol = btInput.reduce((a, c) => a + c.volume, 0) / Math.max(1, btInput.length);
 
     // P1 (this round): Fetch real L2 order book depth for microstructure calibration
-    // In-memory only — DB storage causes OOM in sandbox
+    // Try historical L2 first (closest to latest candle time), then fetch fresh
     const depthPair = pair.includes("_") ? pair.replace("_", "") : pair;
-    const depth = await getDepth(depthPair);
-    let l2Snapshot = null;
-    if (depth) {
-      l2Snapshot = buildL2Snapshot(pair, depth, 0.001, avgVol);
+    const latestCandleTime = btInput[btInput.length - 1]?.time || Math.floor(Date.now() / 1000);
+    // Dynamic staleness threshold: 1× candle duration (3600s for 1h, 60s for 1m)
+    const candleDurationSec = candles.length > 1 ? (candles[1].time - candles[0].time) : 3600;
+    const stalenessThresholdSec = candleDurationSec;
+
+    // Try historical L2 first
+    let l2Snapshot = await getHistoricalL2Snapshot(pair, latestCandleTime, stalenessThresholdSec).catch(() => null);
+
+    // If no historical snapshot, fetch fresh from INDODAX
+    if (!l2Snapshot) {
+      const depth = await getDepth(depthPair);
+      if (depth) {
+        l2Snapshot = buildL2Snapshot(pair, depth, 0.001, avgVol);
+        // Store to DB for future historical lookups (non-blocking, safe error handling)
+        fetchAndStoreL2(pair, avgVol).catch(() => {});
+      }
     }
 
-    // Staleness check (in-memory: always fresh since we just fetched)
-    const l2Staleness = l2Snapshot ? { ageSec: 0, timestamp: Math.floor(Date.now() / 1000), isStale: false } : null;
+    // Staleness check
+    const l2Staleness = l2Snapshot ? {
+      ageSec: Math.floor(Date.now() / 1000) - (l2Snapshot.timestamp ? Math.floor(new Date(l2Snapshot.timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000)),
+      timestamp: Math.floor(Date.now() / 1000),
+      isStale: false, // fresh if just fetched; would be true for old historical snapshots
+    } : null;
+    // Update isStale based on dynamic threshold
+    if (l2Staleness) {
+      l2Staleness.isStale = l2Staleness.ageSec > stalenessThresholdSec;
+    }
 
     const config: BacktestConfig = {
       strategy: strategy || "sma_cross",
