@@ -126,3 +126,33 @@ model L2Snapshot {
   @@unique([pair, timestamp])
   @@index([pair, timestamp])
 }
+
+// L2 collector health state — persisted so the in-process monitor survives
+// hot-reloads / restarts. One row per tracked pair + a sentinel "__scheduler__"
+// row for global scheduler-liveness state. The in-memory monitor remains the
+// fast-path; this table is hydrated on startup and flushed after each cycle.
+model L2CollectorHealth {
+  id                  String   @id @default(cuid())
+  key                 String   @unique // pair name, or "__scheduler__" for global
+  lastSuccessAt       Int?
+  lastFailureAt       Int?
+  lastError           String?
+  lastErrorAt         Int?
+  consecutiveFailures Int      @default(0)
+  totalAttempts       Int      @default(0)
+  totalSuccesses      Int      @default(0)
+  totalFailures       Int      @default(0)
+  lastSnapshotCount   Int      @default(0)
+  lastAgeSec          Int?
+  lastRetriesUsed     Int      @default(0)
+  // Scheduler-liveness fields (only populated on the __scheduler__ row)
+  schedulerRunning    Boolean  @default(false)
+  lastSchedulerTickAt Int?
+  // Circuit-breaker state (only on __scheduler__ row)
+  circuitOpen         Boolean  @default(false)
+  circuitOpenedAt     Int?
+  circuitTrips        Int      @default(0)
+  circuitOpenUntil    Int?
+  updatedAt           DateTime @updatedAt
+}
+

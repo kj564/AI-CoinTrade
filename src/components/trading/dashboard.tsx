@@ -315,6 +315,9 @@ export function TradingDashboard() {
   const [l2Health, setL2Health] = useState<any>(null);
   const [l2HealthLoading, setL2HealthLoading] = useState(false);
   const [l2Collecting, setL2Collecting] = useState(false);
+  const [l2DeepCheck, setL2DeepCheck] = useState<any>(null);
+  const [l2DeepCheckLoading, setL2DeepCheckLoading] = useState(false);
+  const [l2RunbookOpen, setL2RunbookOpen] = useState(false);
   // refs to always have latest capital/risk in interval without re-triggering effect
   const sigCapitalRef = useRef(sigCapital);
   const sigRiskRef = useRef(sigRisk);
@@ -380,6 +383,17 @@ export function TradingDashboard() {
       setL2Health(d);
     } catch { /* ignore */ }
     setL2Collecting(false);
+  };
+
+  // Deep check — runs full end-to-end pipeline verification
+  const runL2DeepCheck = async () => {
+    setL2DeepCheckLoading(true);
+    try {
+      const r = await fetch("/api/l2/health?deep=1");
+      const d = await r.json();
+      setL2DeepCheck(d.deepCheck);
+    } catch { /* ignore */ }
+    setL2DeepCheckLoading(false);
   };
 
   // pair detail
@@ -1298,6 +1312,15 @@ export function TradingDashboard() {
                                   <span className="text-[8px] text-slate-600">
                                     {l2HealthLoading ? "refreshing…" : l2Health ? `updated ${formatL2Age(l2Health.generatedAt)}` : "—"}
                                   </span>
+                                  {l2Health?.persistedAt && (
+                                    <span className="rounded bg-teal-500/10 px-1 py-0 text-[7px] font-bold text-teal-300" title={`Monitor state persisted to DB ${formatL2Age(l2Health.persistedAt)} ago`}>DB✓</span>
+                                  )}
+                                  <span className={cn("rounded px-1 py-0 text-[7px] font-bold", botCfg?.telegramToken && botCfg?.telegramChatId ? "bg-sky-500/10 text-sky-300" : "bg-slate-500/10 text-slate-500")} title={botCfg?.telegramToken && botCfg?.telegramChatId ? "Telegram alerting configured" : "Telegram not configured (set in Bot Config)"}>
+                                    {botCfg?.telegramToken && botCfg?.telegramChatId ? "TG✓" : "TG—"}
+                                  </span>
+                                  <Button size="sm" variant="outline" className="h-5 border-purple-500/30 bg-purple-500/[0.04] px-1.5 text-[8px] text-purple-300 hover:bg-purple-500/10" onClick={runL2DeepCheck} disabled={l2DeepCheckLoading}>
+                                    {l2DeepCheckLoading ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Checking…</> : "Deep Check"}
+                                  </Button>
                                   <Button size="sm" variant="outline" className="h-5 border-teal-500/30 bg-teal-500/[0.04] px-1.5 text-[8px] text-teal-300 hover:bg-teal-500/10" onClick={triggerL2Collect} disabled={l2Collecting}>
                                     {l2Collecting ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Collecting…</> : "Collect Now"}
                                   </Button>
@@ -1340,9 +1363,58 @@ export function TradingDashboard() {
                                     </div>
                                   </div>
 
+                                  {/* Circuit breaker + persistence row */}
+                                  {l2Health.circuitBreaker && (
+                                    <div className={cn("mb-2 grid grid-cols-2 gap-1.5 rounded p-2 sm:grid-cols-4", l2Health.circuitBreaker.open ? "border border-rose-500/30 bg-rose-500/[0.06]" : "border border-white/[0.06] bg-white/[0.02]")}>
+                                      <div>
+                                        <div className="text-[8px] uppercase text-slate-500">Circuit Breaker</div>
+                                        <div className={cn("font-bold tabular-nums", l2Health.circuitBreaker.open ? "text-rose-400" : "text-emerald-400")}>
+                                          {l2Health.circuitBreaker.open ? "OPEN" : "CLOSED"}
+                                        </div>
+                                        <div className="text-[7px] text-slate-600">{l2Health.circuitBreaker.open ? (l2Health.circuitBreaker.openUntil && l2Health.circuitBreaker.openUntil > l2Health.generatedAt ? `cooldown ${formatL2Age(l2Health.circuitBreaker.openUntil - l2Health.generatedAt + l2Health.generatedAt)} left` : "half-open probe") : "collecting normally"}</div>
+                                      </div>
+                                      <div>
+                                        <div className="text-[8px] uppercase text-slate-500">CB Trips</div>
+                                        <div className="font-bold tabular-nums text-slate-200">{l2Health.circuitBreaker.trips}</div>
+                                        <div className="text-[7px] text-slate-600">{l2Health.circuitBreaker.consecutiveBadCycles} bad cycles</div>
+                                      </div>
+                                      <div>
+                                        <div className="text-[8px] uppercase text-slate-500">Persisted</div>
+                                        <div className={cn("font-bold tabular-nums", l2Health.persistedAt ? "text-emerald-400" : "text-slate-500")}>
+                                          {l2Health.persistedAt ? formatL2Age(l2Health.persistedAt) : "never"}
+                                        </div>
+                                        <div className="text-[7px] text-slate-600">DB-backed state</div>
+                                      </div>
+                                      <div>
+                                        <div className="text-[8px] uppercase text-slate-500">Metrics</div>
+                                        <a href="/api/l2/metrics" target="_blank" rel="noopener noreferrer" className="font-bold text-teal-400 hover:underline">/api/l2/metrics</a>
+                                        <div className="text-[7px] text-slate-600">Prometheus format</div>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Deep check results */}
+                                  {l2DeepCheck && (
+                                    <div className={cn("mb-2 rounded border p-2", l2DeepCheck.overall === "pass" ? "border-emerald-500/30 bg-emerald-500/[0.04]" : "border-rose-500/30 bg-rose-500/[0.04]")}>
+                                      <div className="mb-1 flex items-center justify-between">
+                                        <span className="text-[8px] font-bold uppercase text-slate-400">Deep Check — {l2DeepCheck.overall === "pass" ? "PASS" : "FAIL"}</span>
+                                        <span className="text-[7px] text-slate-600">end-to-end pipeline</span>
+                                      </div>
+                                      <div className="space-y-0.5">
+                                        {l2DeepCheck.checks?.map((c: any, i: number) => (
+                                          <div key={i} className="flex items-start gap-1 text-[8px]">
+                                            {c.status === "pass" ? <CheckCircle2 className="mt-0.5 h-2.5 w-2.5 flex-shrink-0 text-emerald-400" /> : <XCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0 text-rose-400" />}
+                                            <span className="flex-1"><b className="font-mono text-slate-300">{c.name}</b> <span className="text-slate-500">· {c.durationMs}ms</span> — {c.detail}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      {l2DeepCheck.runbookHint && <p className="mt-1 text-[7px] text-slate-500">{l2DeepCheck.runbookHint}</p>}
+                                    </div>
+                                  )}
+
                                   {/* Per-pair grid */}
                                   <div className="mb-2">
-                                    <div className="mb-1 text-[8px] font-bold text-slate-500">Per-Pair Collection Status (in-process scheduler, 30-min cycle, 3-attempt exponential backoff)</div>
+                                    <div className="mb-1 text-[8px] font-bold text-slate-500">Per-Pair Collection Status (30-min cycle · 3-attempt backoff · validated · circuit-protected)</div>
                                     <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
                                       {(l2Health.pairs || []).map((p: any) => {
                                         const pairStatus = p.consecutiveFailures >= 3 ? "down" : p.consecutiveFailures >= 1 ? "degraded" : (p.lastSuccessAt && (l2Health.generatedAt - p.lastSuccessAt) > 7200) ? "stale" : "healthy";
@@ -1379,12 +1451,18 @@ export function TradingDashboard() {
                                   {/* Alerts */}
                                   {l2Health.alerts && l2Health.alerts.length > 0 && (
                                     <div className="mb-2 rounded border border-amber-500/20 bg-amber-500/[0.04] p-2">
-                                      <div className="mb-1 text-[8px] font-bold uppercase text-amber-400">Alerts ({l2Health.alerts.length})</div>
+                                      <div className="mb-1 flex items-center justify-between">
+                                        <span className="text-[8px] font-bold uppercase text-amber-400">Alerts ({l2Health.alerts.length})</span>
+                                        <button onClick={() => setL2RunbookOpen(true)} className="text-[7px] font-bold text-sky-400 hover:underline">Open Runbook →</button>
+                                      </div>
                                       <div className="max-h-24 space-y-0.5 overflow-y-auto">
                                         {l2Health.alerts.map((a: any, i: number) => (
                                           <div key={i} className={cn("flex items-start gap-1 text-[8px]", a.level === "error" ? "text-rose-300" : "text-amber-300")}>
                                             {a.level === "error" ? <XCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" /> : <AlertCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" />}
-                                            <span><b className="font-mono">[{a.pair}]</b> {a.message}{a.detail ? ` — ${a.detail}` : ""}</span>
+                                            <span className="flex-1"><b className="font-mono">[{a.pair}]</b> {a.message}{a.detail ? ` — ${a.detail}` : ""}</span>
+                                            {a.runbook && (
+                                              <button onClick={() => setL2RunbookOpen(true)} className="flex-shrink-0 text-[7px] text-sky-400 hover:underline" title={a.runbook}>runbook</button>
+                                            )}
                                           </div>
                                         ))}
                                       </div>
@@ -1419,8 +1497,40 @@ export function TradingDashboard() {
                                   })()}
 
                                   <p className="mt-1.5 text-[8px] leading-relaxed text-slate-500">
-                                    Tracks in-process L2 snapshot collection (every 30 ticks ≈ 30 min for 5 pairs). Each fetch uses 3-attempt exponential backoff (500ms → 1s → 2s, jittered). Snapshots are validated before storage (crossed books, empty OB, non-positive prices rejected). Status: <b className="text-emerald-300">healthy</b> = no failures &amp; fresh; <b className="text-amber-300">degraded</b> = recent failure or stale; <b className="text-rose-300">down</b> = 3+ consecutive failures or scheduler dead.
+                                    Tracks in-process L2 snapshot collection (every 30 ticks ≈ 30 min for 5 pairs). Each fetch uses 3-attempt exponential backoff (500ms → 1s → 2s, jittered). Snapshots are validated before storage. Circuit breaker opens after 3 consecutive 0-success cycles (5-min→30-min cooldown). State persisted to DB survives hot-reload. External alerts fire on new incidents via Telegram + webhook. Status: <b className="text-emerald-300">healthy</b> = no failures &amp; fresh; <b className="text-amber-300">degraded</b> = recent failure or stale; <b className="text-rose-300">down</b> = 3+ consecutive failures, circuit open, or scheduler dead.
                                   </p>
+
+                                  {/* Runbook (collapsible troubleshooting) */}
+                                  <Collapsible open={l2RunbookOpen} onOpenChange={setL2RunbookOpen} className="mt-2">
+                                    <CollapsibleTrigger asChild>
+                                      <button className="flex w-full items-center justify-between rounded border border-sky-500/20 bg-sky-500/[0.04] px-2 py-1 text-left hover:bg-sky-500/[0.07]">
+                                        <span className="text-[8px] font-bold uppercase text-sky-300">L2 Collector Runbook</span>
+                                        <ChevronDown className={cn("h-3 w-3 text-sky-300 transition-transform", l2RunbookOpen && "rotate-180")} />
+                                      </button>
+                                    </CollapsibleTrigger>
+                                    <CollapsibleContent className="mt-1 space-y-1.5">
+                                      {[
+                                        { id: "runbook-outage", title: "outage — 3+ consecutive failures", steps: ["1. Check /api/l2/health?deep=1 → is indodax_depth_api passing?", "2. If INDODAX API down: wait for recovery (circuit breaker auto-skips).", "3. If API up but collection fails: check dev.log for [l2-collector] errors.", "4. Manual probe: curl -X POST /api/l2/collect?force=1", "5. If persists: INDODAX may have rate-limited the depth endpoint."] },
+                                        { id: "runbook-stale", title: "stale — snapshot older than 2× candle duration", steps: ["1. Check scheduler status in aggregate stats (RUNNING?).", "2. If STOPPED: the in-process scheduler died — restart dev server.", "3. If RUNNING but stale: last collection cycle may have been skipped by circuit breaker.", "4. Click 'Collect Now' to force a fresh snapshot.", "5. Stale snapshots degrade backtest calibration accuracy but don't break live signals."] },
+                                        { id: "runbook-consecutive-failures", title: "consecutive_failures — 1-2 recent failures", steps: ["1. Transient — the retry w/ backoff usually self-heals.", "2. Monitor the per-pair grid; if it escalates to outage (3+), follow the outage runbook.", "3. Check lastError field for the specific failure reason."] },
+                                        { id: "runbook-circuit-open", title: "circuit_open — cascade-failure protection active", steps: ["1. The circuit opened after 3 consecutive 0-success collection cycles.", "2. Collection is auto-skipped until cooldown elapses (5min→30min exponential).", "3. After cooldown, a half-open probe runs ONE cycle.", "4. If probe succeeds → circuit closes. If fails → re-opens with longer cooldown.", "5. To override (debugging): curl -X POST '/api/l2/collect?force=1'"] },
+                                        { id: "runbook-scheduler-dead", title: "scheduler_dead — no tick in 5 min", steps: ["1. The in-process bot scheduler stopped (dev server crash or hot-reload gap).", "2. Restart: the scheduler auto-starts on first page load via ensureBotScheduler().", "3. If persistent: check dev.log for [bot-scheduler] startup errors.", "4. Note: monitor state is DB-persisted, so stats survive the restart."] },
+                                        { id: "runbook-never-collected", title: "never_collected — no snapshot yet", steps: ["1. Normal on first deploy / fresh DB.", "2. Click 'Collect Now' to trigger the first collection.", "3. The scheduler will collect every 30 min going forward."] },
+                                      ].map((rb) => (
+                                        <div key={rb.id} id={rb.id} className="rounded bg-white/[0.02] p-1.5">
+                                          <div className="mb-0.5 text-[8px] font-bold text-sky-300">{rb.title}</div>
+                                          <div className="space-y-0.5">
+                                            {rb.steps.map((s, si) => (
+                                              <div key={si} className="text-[7px] leading-relaxed text-slate-400">{s}</div>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      ))}
+                                      <div className="rounded bg-sky-500/[0.04] p-1.5 text-[7px] leading-relaxed text-slate-400">
+                                        <b className="text-sky-300">Endpoints:</b> GET /api/l2/health (summary) · GET /api/l2/health?deep=1 (end-to-end check) · GET /api/l2/metrics (Prometheus) · POST /api/l2/collect (manual collect, rate-limited 3/60s) · POST /api/l2/collect?force=1 (override circuit breaker)
+                                      </div>
+                                    </CollapsibleContent>
+                                  </Collapsible>
                                 </>
                               )}
                             </div>
