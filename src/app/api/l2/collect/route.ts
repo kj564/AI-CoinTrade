@@ -10,8 +10,9 @@ import {
   persistL2Health,
   hydrateL2MonitorFromDB,
 } from "@/lib/trading/l2-monitor";
-import { sendL2ExternalAlerts } from "@/lib/trading/l2-alerts";
-import { checkCollectRateLimit, getRateLimitBackend } from "@/lib/trading/l2-rate-limit";
+import { sendL2ExternalAlerts } from "@/lib/alerting/dispatch";
+import { checkCollectRateLimit, getRateLimitBackend } from "@/lib/rate-limit/factory";
+import { generateTraceId } from "@/lib/alerting/trace";
 import { loadCandles } from "@/lib/trading/candles";
 
 export const runtime = "nodejs";
@@ -28,6 +29,7 @@ const RATE_MAX_CALLS = 3;
 // Rate-limited (3 calls/60s/source, in-memory or Redis backend) and circuit-breaker
 // protected (both global and per-pair).
 export async function POST(req: NextRequest) {
+  const traceId = generateTraceId();
   try {
     // Rate limit check (priority #4) — pluggable backend (memory/Redis)
     const source = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "local";
@@ -39,6 +41,7 @@ export async function POST(req: NextRequest) {
           detail: `Max ${RATE_MAX_CALLS} collection calls per ${RATE_WINDOW_SEC}s from this source.`,
           retryAfterSec: rl.retryAfterSec,
           rateLimitBackend: getRateLimitBackend(),
+          traceId,
         },
         { status: 429, headers: { "Retry-After": String(rl.retryAfterSec) } },
       );
@@ -58,6 +61,7 @@ export async function POST(req: NextRequest) {
           error: "Global circuit breaker is open — collection skipped to prevent cascade failure",
           circuitBreaker: health.circuitBreaker,
           detail: `Trips: ${health.circuitBreaker.trips}. Cooldown until ${health.circuitBreaker.openUntil ? new Date(health.circuitBreaker.openUntil * 1000).toISOString() : "n/a"}. Pass ?force=1 to override.`,
+          traceId,
         },
         { status: 503 },
       );
@@ -153,18 +157,29 @@ export async function POST(req: NextRequest) {
     // Persist monitor state to DB
     await persistL2Health();
 
-    // Fire external alerts on NEW error-level incidents (multi-channel)
+    // Fire external alerts on NEW error-level incidents (multi-channel).
+    // Awaiting the dispatch so the response includes the alert trace ID for
+    // log correlation. Channel sends are parallel with 8s timeout each, so
+    // the added latency is bounded.
     const health = getL2Health();
     const newAlerts = getNewErrorAlerts();
+    let alertTraceId: string | undefined;
+    let alertDelivery: { telegram: boolean | null; slack: boolean | null; discord: boolean | null; email: boolean | null; webhook: boolean | null } | undefined;
     if (newAlerts.length > 0) {
-      sendL2ExternalAlerts(newAlerts, health).catch((e) => {
-        console.warn("[l2/collect] external alert delivery failed:", e instanceof Error ? e.message : e);
-      });
+      try {
+        const r = await sendL2ExternalAlerts(newAlerts, health);
+        alertTraceId = r.traceId;
+        alertDelivery = { telegram: r.telegram, slack: r.slack, discord: r.discord, email: r.email, webhook: r.webhook };
+      } catch (e) {
+        console.warn(`[l2/collect] [trace=${traceId}] external alert delivery failed:`, e instanceof Error ? e.message : e);
+      }
     }
 
     const skippedCount = results.filter((r) => r.skipped).length;
+
     return NextResponse.json({
       success: true,
+      traceId,
       results,
       summary: {
         total: results.length,
@@ -175,11 +190,13 @@ export async function POST(req: NextRequest) {
       circuitBreaker: health.circuitBreaker,
       pairCircuitBreakers: health.pairCircuitBreakers,
       alertsSent: newAlerts.length,
+      alertTraceId,
+      alertDelivery,
       rateLimitBackend: getRateLimitBackend(),
       timestamp: new Date().toISOString(),
     });
   } catch (e) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "L2 collection failed" }, { status: 500 });
+    return NextResponse.json({ error: e instanceof Error ? e.message : "L2 collection failed", traceId }, { status: 500 });
   }
 }
 

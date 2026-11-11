@@ -318,6 +318,14 @@ export function TradingDashboard() {
   const [l2DeepCheck, setL2DeepCheck] = useState<any>(null);
   const [l2DeepCheckLoading, setL2DeepCheckLoading] = useState(false);
   const [l2RunbookOpen, setL2RunbookOpen] = useState(false);
+  // L2 alert smoke-test state
+  const [l2AlertTestOpen, setL2AlertTestOpen] = useState(false);
+  const [l2AlertTestLoading, setL2AlertTestLoading] = useState(false);
+  const [l2AlertTestResult, setL2AlertTestResult] = useState<any>(null);
+  const [l2AlertTestToken, setL2AlertTestToken] = useState("");
+  const [l2AlertTestSeverity, setL2AlertTestSeverity] = useState<"warn" | "error" | "critical">("warn");
+  const [l2AlertTestTitle, setL2AlertTestTitle] = useState("L2 alert delivery test");
+  const [l2AlertTestMessage, setL2AlertTestMessage] = useState("Validating alert routing end-to-end. If you received this, the channel is working.");
   // refs to always have latest capital/risk in interval without re-triggering effect
   const sigCapitalRef = useRef(sigCapital);
   const sigRiskRef = useRef(sigRisk);
@@ -394,6 +402,31 @@ export function TradingDashboard() {
       setL2DeepCheck(d.deepCheck);
     } catch { /* ignore */ }
     setL2DeepCheckLoading(false);
+  };
+
+  // Alert smoke test — dispatches a synthetic alert to verify delivery
+  const runL2AlertTest = async () => {
+    if (!l2AlertTestToken.trim()) {
+      setL2AlertTestResult({ error: "Token required — set L2_ALERT_TEST_TOKEN env var and paste it here." });
+      return;
+    }
+    setL2AlertTestLoading(true);
+    try {
+      const r = await fetch("/api/l2/alerts/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-l2-test-token": l2AlertTestToken.trim() },
+        body: JSON.stringify({
+          severity: l2AlertTestSeverity,
+          title: l2AlertTestTitle,
+          message: l2AlertTestMessage,
+        }),
+      });
+      const d = await r.json();
+      setL2AlertTestResult(d);
+    } catch (e) {
+      setL2AlertTestResult({ error: e instanceof Error ? e.message : "Request failed" });
+    }
+    setL2AlertTestLoading(false);
   };
 
   // pair detail
@@ -1335,8 +1368,115 @@ export function TradingDashboard() {
                                   <Button size="sm" variant="outline" className="h-5 border-teal-500/30 bg-teal-500/[0.04] px-1.5 text-[8px] text-teal-300 hover:bg-teal-500/10" onClick={triggerL2Collect} disabled={l2Collecting}>
                                     {l2Collecting ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Collecting…</> : "Collect Now"}
                                   </Button>
+                                  <Button size="sm" variant="outline" className="h-5 border-amber-500/30 bg-amber-500/[0.04] px-1.5 text-[8px] text-amber-300 hover:bg-amber-500/10" onClick={() => setL2AlertTestOpen((v) => !v)} title="Smoke-test alert delivery to configured channels">
+                                    Test Alert
+                                  </Button>
                                 </div>
                               </div>
+
+                              {/* Alert smoke-test panel (collapsible) */}
+                              {l2AlertTestOpen && (
+                                <div className="mb-2 rounded border border-amber-500/20 bg-amber-500/[0.03] p-2">
+                                  <div className="mb-1.5 flex items-center justify-between">
+                                    <span className="text-[8px] font-bold uppercase text-amber-300">Alert Delivery Smoke Test</span>
+                                    <span className="text-[7px] text-slate-500">POST /api/l2/alerts/test · requires L2_ALERT_TEST_TOKEN</span>
+                                  </div>
+                                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                                    <div>
+                                      <label className="text-[7px] uppercase text-slate-500">Test token</label>
+                                      <input
+                                        type="password"
+                                        value={l2AlertTestToken}
+                                        onChange={(e) => setL2AlertTestToken(e.target.value)}
+                                        placeholder="paste L2_ALERT_TEST_TOKEN value"
+                                        className="w-full rounded border border-white/10 bg-black/20 px-1.5 py-1 text-[8px] text-slate-200 focus:border-amber-500/40 focus:outline-none"
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="text-[7px] uppercase text-slate-500">Severity</label>
+                                      <select
+                                        value={l2AlertTestSeverity}
+                                        onChange={(e) => setL2AlertTestSeverity(e.target.value as "warn" | "error" | "critical")}
+                                        className="w-full rounded border border-white/10 bg-black/20 px-1.5 py-1 text-[8px] text-slate-200 focus:border-amber-500/40 focus:outline-none"
+                                      >
+                                        <option value="warn">warn → Slack + Discord + webhook</option>
+                                        <option value="error">error → Telegram + Slack + Email + webhook</option>
+                                        <option value="critical">critical → ALL configured channels</option>
+                                      </select>
+                                    </div>
+                                    <div className="sm:col-span-2">
+                                      <label className="text-[7px] uppercase text-slate-500">Title</label>
+                                      <input
+                                        type="text"
+                                        value={l2AlertTestTitle}
+                                        onChange={(e) => setL2AlertTestTitle(e.target.value)}
+                                        className="w-full rounded border border-white/10 bg-black/20 px-1.5 py-1 text-[8px] text-slate-200 focus:border-amber-500/40 focus:outline-none"
+                                      />
+                                    </div>
+                                    <div className="sm:col-span-2">
+                                      <label className="text-[7px] uppercase text-slate-500">Message</label>
+                                      <textarea
+                                        value={l2AlertTestMessage}
+                                        onChange={(e) => setL2AlertTestMessage(e.target.value)}
+                                        rows={2}
+                                        className="w-full rounded border border-white/10 bg-black/20 px-1.5 py-1 text-[8px] text-slate-200 focus:border-amber-500/40 focus:outline-none"
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className="mt-1.5 flex items-center gap-2">
+                                    <Button size="sm" variant="outline" className="h-5 border-amber-500/40 bg-amber-500/10 px-2 text-[8px] font-bold text-amber-300 hover:bg-amber-500/20" onClick={runL2AlertTest} disabled={l2AlertTestLoading}>
+                                      {l2AlertTestLoading ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Sending…</> : "Send Test Alert"}
+                                    </Button>
+                                    <span className="text-[7px] text-slate-500">Rate-limited: 2 calls/60s</span>
+                                  </div>
+
+                                  {/* Results */}
+                                  {l2AlertTestResult && (
+                                    <div className="mt-2 rounded border border-white/10 bg-black/20 p-1.5">
+                                      {l2AlertTestResult.error ? (
+                                        <div className="text-[8px] text-rose-300">
+                                          <b>Error:</b> {l2AlertTestResult.error}
+                                          {l2AlertTestResult.detail && <div className="mt-0.5 text-slate-400">{l2AlertTestResult.detail}</div>}
+                                          {l2AlertTestResult.hint && <div className="mt-0.5 text-amber-300">{l2AlertTestResult.hint}</div>}
+                                        </div>
+                                      ) : (
+                                        <>
+                                          <div className="mb-1 flex items-center justify-between">
+                                            <span className="text-[8px] font-bold text-slate-300">
+                                              Delivery — severity <span className="uppercase text-amber-300">{l2AlertTestResult.severity}</span> · trace <span className="font-mono text-slate-400">{l2AlertTestResult.traceId}</span>
+                                            </span>
+                                            <span className="text-[7px] text-slate-500">{l2AlertTestResult.alertCount} channel(s) attempted</span>
+                                          </div>
+                                          <div className="space-y-0.5">
+                                            {(["telegram", "slack", "discord", "email", "webhook"] as const).map((ch) => {
+                                              const d = l2AlertTestResult.delivery?.[ch];
+                                              if (!d) return null;
+                                              return (
+                                                <div key={ch} className="flex items-center gap-1.5 text-[8px]">
+                                                  {!d.attempted ? (
+                                                    <span className="text-slate-600">— {ch}: not routed (skipped by severity matrix or not configured)</span>
+                                                  ) : d.success === true ? (
+                                                    <><CheckCircle2 className="h-2.5 w-2.5 text-emerald-400" /><span className="text-emerald-300">{ch}</span><span className="text-slate-500">· {d.durationMs}ms · delivered</span></>
+                                                  ) : d.success === false ? (
+                                                    <><XCircle className="h-2.5 w-2.5 text-rose-400" /><span className="text-rose-300">{ch}</span><span className="text-slate-500">· {d.durationMs}ms · failed{d.error ? `: ${d.error.slice(0, 80)}` : ""}</span></>
+                                                  ) : (
+                                                    <><Clock className="h-2.5 w-2.5 text-amber-400" /><span className="text-amber-300">{ch}</span><span className="text-slate-500">· in progress</span></>
+                                                  )}
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                          {l2AlertTestResult.configuredChannels && (
+                                            <div className="mt-1 text-[7px] text-slate-500">
+                                              Configured: {Object.entries(l2AlertTestResult.configuredChannels).filter(([, v]) => v).map(([k]) => k).join(", ") || "none"}
+                                            </div>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
 
                               {!l2Health ? (
                                 <div className="py-3 text-center text-[9px] text-slate-600">
@@ -1546,7 +1686,8 @@ export function TradingDashboard() {
                                         { id: "runbook-never-collected", title: "never_collected — no snapshot yet (severity: warn)", steps: ["1. Normal on first deploy / fresh DB.", "2. Click 'Collect Now' to trigger the first collection.", "3. The scheduler will collect every 30 min going forward."] },
                                         { id: "runbook-rate-limited", title: "rate_limited — too many collect calls (429)", steps: ["1. The /api/l2/collect endpoint is rate-limited (3 calls/60s per source).", "2. Wait for the Retry-After period to elapse.", "3. The in-process scheduler is NOT affected — only manual/API calls are limited.", "4. For multi-instance deployments, set REDIS_URL for shared rate limiting.", "5. Backend: check rateLimitBackend in the collect response (memory/redis)."] },
                                         { id: "runbook-persistence-failed", title: "persistence_failed — DB flush failed", steps: ["1. The in-memory monitor is still accurate (authoritative).", "2. The DB flush failed — check dev.log for [l2-monitor] persistL2Health failed.", "3. Common cause: SQLite locked or DB connection issue.", "4. The next collection cycle will retry the flush automatically.", "5. If persistent: the monitor won't survive hot-reloads until fixed."] },
-                                        { id: "runbook-alerting-delivery-failed", title: "alerting_delivery_failed — external channel failed", steps: ["1. The alert was recorded in the monitor but delivery to a channel failed.", "2. Check dev.log for [l2-alerts] <channel> failed messages.", "3. Telegram: verify BotConfig.telegramToken/ChatId are valid.", "4. Slack/Discord: verify L2_ALERT_*_WEBHOOK_URL env vars are reachable.", "5. Email: verify L2_ALERT_SMTP_* env vars (host/port/user/pass).", "6. The alert is NOT lost — it's in the monitor and will show in the UI."] },
+                                        { id: "runbook-alerting-delivery-failed", title: "alerting_delivery_failed — external channel failed", steps: ["1. The alert was recorded in the monitor but delivery to a channel failed.", "2. Check dev.log for [l2-alerts] [trace=...] <channel> failed messages.", "3. Run a smoke test: click 'Test Alert' in the L2 card, or curl POST /api/l2/alerts/test with L2_ALERT_TEST_TOKEN.", "4. Telegram: verify BotConfig.telegramToken/ChatId are valid.", "5. Slack/Discord: verify L2_ALERT_*_WEBHOOK_URL env vars are reachable.", "6. Email: verify L2_ALERT_SMTP_* env vars (host/port/user/pass).", "7. The alert is NOT lost — it's in the monitor and will show in the UI.", "8. Grafana alert rule: increase(l2_alert_delivery_failed_total[15m]) > 0 → critical."] },
+                                        { id: "runbook-alert-smoke-test", title: "alert_smoke_test — verify delivery end-to-end", steps: ["1. Set L2_ALERT_TEST_TOKEN env var to a random secret string.", "2. Restart the server so the env var is picked up.", "3. Click 'Test Alert' in the L2 Collector Health card (or POST /api/l2/alerts/test).", "4. Enter the token, choose a severity (warn/error/critical), and send.", "5. The response shows per-channel: attempted, success, durationMs, error.", "6. Verify the message arrived in each configured channel (Slack/Discord/Email/etc).", "7. If a channel shows success=false: follow the alerting_delivery_failed runbook for that channel.", "8. The test is rate-limited (2/60s) and does NOT create a real incident in the monitor."] },
                                       ].map((rb) => (
                                         <div key={rb.id} id={rb.id} className="rounded bg-white/[0.02] p-1.5">
                                           <div className="mb-0.5 text-[8px] font-bold text-sky-300">{rb.title}</div>
@@ -1558,7 +1699,7 @@ export function TradingDashboard() {
                                         </div>
                                       ))}
                                       <div className="rounded bg-sky-500/[0.04] p-1.5 text-[7px] leading-relaxed text-slate-400">
-                                        <b className="text-sky-300">Endpoints:</b> GET /api/l2/health (+configuredChannels) · GET /api/l2/health?deep=1 (7 checks: depth API, DB read/write, monitor, scheduler, persistence round-trip, alerting channels, per-pair CBs) · GET /api/l2/metrics (Prometheus, 18 metrics) · POST /api/l2/collect (rate-limited 3/60s, per-pair CB protected) · POST /api/l2/collect?force=1 (override both global + per-pair CB). <b className="text-sky-300">Grafana:</b> import grafana/l2-collector-dashboard.json · <b className="text-sky-300">Env vars:</b> L2_ALERT_SLACK_WEBHOOK_URL, L2_ALERT_DISCORD_WEBHOOK_URL, L2_ALERT_SMTP_HOST/PORT/USER/PASS, L2_ALERT_EMAIL_TO/FROM, L2_ALERT_WEBHOOK_URL, REDIS_URL
+                                        <b className="text-sky-300">Endpoints:</b> GET /api/l2/health (+configuredChannels) · GET /api/l2/health?deep=1 (7 checks: depth API, DB read/write, monitor, scheduler, persistence round-trip, alerting channels, per-pair CBs) · GET /api/l2/metrics (Prometheus, 24 metrics incl. delivery counters + rate-limit backend) · POST /api/l2/collect (rate-limited 3/60s, per-pair CB protected, trace ID in response) · POST /api/l2/collect?force=1 (override both global + per-pair CB) · <b className="text-amber-300">POST /api/l2/alerts/test</b> (smoke-test alert delivery end-to-end, token-protected via L2_ALERT_TEST_TOKEN, per-channel timing + success/failure). <b className="text-sky-300">Grafana:</b> import grafana/l2-collector-dashboard.json + grafana/l2-alert-rules.yml (10 alert rules with severity + runbook labels) · <b className="text-sky-300">Env vars:</b> L2_ALERT_SLACK_WEBHOOK_URL, L2_ALERT_DISCORD_WEBHOOK_URL, L2_ALERT_SMTP_HOST/PORT/USER/PASS, L2_ALERT_EMAIL_TO/FROM, L2_ALERT_WEBHOOK_URL, L2_ALERT_TEST_TOKEN, REDIS_URL
                                       </div>
                                     </CollapsibleContent>
                                   </Collapsible>

@@ -3,6 +3,8 @@
 // Exposed at GET /api/l2/metrics.
 
 import type { L2HealthSummary } from "./l2-monitor";
+import { getDeliverySnapshot, DELIVERY_CHANNELS } from "@/lib/alerting/delivery-tracker";
+import { getRateLimitBackend } from "@/lib/rate-limit/factory";
 
 // Prometheus text exposition format:
 //   # HELP <name> <description>
@@ -135,6 +137,33 @@ export function formatPrometheusMetrics(summary: L2HealthSummary): string {
   lines.push("# HELP l2_persisted_at_timestamp Unix timestamp of last successful DB persist (0=never)");
   lines.push("# TYPE l2_persisted_at_timestamp gauge");
   lines.push(metric("l2_persisted_at_timestamp", {}, summary.persistedAt ?? 0));
+
+  // Alert delivery metrics (per-channel success/failure counters).
+  // Powers the Grafana alert rule: increase(l2_alert_delivery_failed_total[15m]) > 0 → critical.
+  const delivery = getDeliverySnapshot();
+  lines.push("# HELP l2_alert_delivery_success_total Total successful alert deliveries per channel");
+  lines.push("# TYPE l2_alert_delivery_success_total counter");
+  for (const ch of DELIVERY_CHANNELS) {
+    lines.push(metric("l2_alert_delivery_success_total", { channel: ch }, delivery.success[ch] ?? 0));
+  }
+
+  lines.push("# HELP l2_alert_delivery_failed_total Total failed alert deliveries per channel");
+  lines.push("# TYPE l2_alert_delivery_failed_total counter");
+  for (const ch of DELIVERY_CHANNELS) {
+    lines.push(metric("l2_alert_delivery_failed_total", { channel: ch }, delivery.failed[ch] ?? 0));
+  }
+
+  lines.push("# HELP l2_alert_delivery_last_timestamp_seconds Unix timestamp of last delivery attempt per channel (0=never)");
+  lines.push("# TYPE l2_alert_delivery_last_timestamp_seconds gauge");
+  for (const ch of DELIVERY_CHANNELS) {
+    lines.push(metric("l2_alert_delivery_last_timestamp_seconds", { channel: ch }, delivery.lastDeliveryAt[ch] ?? 0));
+  }
+
+  // Rate-limit metric: expose the active backend (1=memory, 2=redis) so Grafana
+  // can alert if a multi-instance deployment accidentally runs on memory.
+  lines.push("# HELP l2_rate_limit_backend Active rate-limit backend: 1=memory 2=redis");
+  lines.push("# TYPE l2_rate_limit_backend gauge");
+  lines.push(metric("l2_rate_limit_backend", {}, getRateLimitBackend() === "redis" ? 2 : 1));
 
   return lines.join("\n") + "\n";
 }

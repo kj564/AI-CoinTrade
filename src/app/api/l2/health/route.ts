@@ -3,17 +3,9 @@ import { getL2Health, hydrateL2MonitorFromDB, type L2HealthSummary } from "@/lib
 import { getDepth } from "@/lib/indodax";
 import { validateDepth } from "@/lib/trading/l2-storage";
 import { db } from "@/lib/db";
-
-// Inline channel detection (avoids importing l2-alerts which has createRequire overhead)
-function detectChannels(cfg: { telegramToken?: string | null; telegramChatId?: string | null } | null) {
-  return {
-    telegram: !!(cfg?.telegramToken && cfg?.telegramChatId),
-    slack: !!process.env.L2_ALERT_SLACK_WEBHOOK_URL,
-    discord: !!process.env.L2_ALERT_DISCORD_WEBHOOK_URL,
-    email: !!(process.env.L2_ALERT_SMTP_HOST && process.env.L2_ALERT_EMAIL_TO),
-    webhook: !!process.env.L2_ALERT_WEBHOOK_URL,
-  };
-}
+// Pure channel-config module (no native deps, no db) — keeps the health route
+// bundle light. The old inline detectChannels() is replaced by this import.
+import { getConfiguredChannels as detectChannels } from "@/lib/alerting/channels";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

@@ -1,0 +1,134 @@
+# L2 Collector — Prometheus alerting rules.
+#
+# Load into Prometheus or Grafana Agent (alerting_rules section) to get
+# severity-routed alerts for the L2 order-book collector. Each rule carries
+# `severity`, `runbook`, and `channel` labels so notification routing can
+# fan out to Slack / Discord / Email / webhook / Telegram per the severity
+# matrix defined in src/lib/alerting/channels.ts.
+#
+# Requires the /api/l2/metrics endpoint to be scraped (see prometheus.yml):
+#
+#   scrape_configs:
+#     - job_name: l2_collector
+#       scrape_interval: 30s
+#       static_configs:
+#         - targets: ['localhost:3000']
+#       metrics_path: /api/l2/metrics
+#
+# Alert label conventions:
+#   severity  = info | warn | error | critical
+#   runbook   = anchor in the dashboard runbook (e.g. #runbook-outage)
+#   channel   = which delivery channel failed (for delivery_failed rules)
+
+groups:
+  - name: l2_collector_health
+    interval: 30s
+    rules:
+      # ── Critical: collector not running at all ──
+      - alert: L2CollectorSchedulerDown
+        expr: l2_collector_scheduler_running == 0
+        for: 5m
+        labels:
+          severity: critical
+          runbook: "#runbook-scheduler-dead"
+        annotations:
+          summary: "L2 collector scheduler is not running"
+          description: "The in-process bot scheduler has been stopped for 5+ minutes. L2 snapshots are not being collected. Restart the dev/production server — the scheduler auto-starts on first page load."
+
+      - alert: L2CollectorDown
+        expr: l2_collector_status == 3
+        for: 5m
+        labels:
+          severity: critical
+          runbook: "#runbook-outage"
+        annotations:
+          summary: "L2 collector status is DOWN"
+          description: "3+ consecutive collection failures across all pairs. INDODAX depth API may be down or rate-limiting. Circuit breaker should be open (auto-skips collection)."
+
+      # ── Error: stale snapshots / repeated failures ──
+      - alert: L2SnapshotStale
+        expr: l2_last_success_age_seconds > 900
+        for: 5m
+        labels:
+          severity: error
+          runbook: "#runbook-stale"
+        annotations:
+          summary: "L2 snapshot stale for {{ $labels.pair }}"
+          description: "Last successful collection for {{ $labels.pair }} was more than 15 minutes ago. Scheduler may be skipping cycles (circuit breaker) or the pair's per-pair CB is open."
+
+      - alert: L2ConsecutiveFailures
+        expr: increase(l2_consecutive_failures[10m]) > 0
+        for: 2m
+        labels:
+          severity: error
+          runbook: "#runbook-consecutive-failures"
+        annotations:
+          summary: "L2 collection failures for {{ $labels.pair }}"
+          description: "{{ $labels.pair }} has recorded collection failures in the last 10 minutes. Check the per-pair lastError in /api/l2/health. If it escalates to 3+ consecutive, the per-pair circuit breaker will open."
+
+      # ── Warn: per-pair circuit open / rate limit surge ──
+      - alert: L2PairCircuitOpen
+        expr: l2_pair_circuit_open == 1
+        for: 1m
+        labels:
+          severity: warn
+          runbook: "#runbook-circuit-open-pair"
+        annotations:
+          summary: "Per-pair circuit breaker open for {{ $labels.pair }}"
+          description: "{{ $labels.pair }}'s circuit breaker opened after 3 consecutive failures. Collection for this pair is skipped (other pairs continue). Cooldown is 1min→10min exponential."
+
+      - alert: L2GlobalCircuitOpen
+        expr: l2_circuit_open == 1
+        for: 1m
+        labels:
+          severity: critical
+          runbook: "#runbook-circuit-open"
+        annotations:
+          summary: "Global L2 circuit breaker is OPEN"
+          description: "3 consecutive 0-success collection cycles. All collection is auto-skipped until cooldown elapses (5min→30min exponential). After cooldown, a half-open probe runs one cycle."
+
+      - alert: L2RateLimitSurge
+        expr: increase(l2_rate_limit_backend[15m]) > 10
+        for: 5m
+        labels:
+          severity: warn
+          runbook: "#runbook-rate-limited"
+        annotations:
+          summary: "L2 collect endpoint rate-limit surge"
+          description: "More than 10 rate-limited requests in 15 minutes. A client is hitting /api/l2/collect faster than 3/60s. The in-process scheduler is unaffected — only manual/API calls are limited."
+
+      # ── Critical: alert delivery itself is failing ──
+      # This is the most important alert: if alerting is broken, no other alerts
+      # will reach operators. Fire on ANY delivery failure in the last 15 min.
+      - alert: L2AlertDeliveryFailed
+        expr: increase(l2_alert_delivery_failed_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+          runbook: "#runbook-alerting-delivery-failed"
+          channel: "{{ $labels.channel }}"
+        annotations:
+          summary: "L2 alert delivery failed for {{ $labels.channel }}"
+          description: "One or more alert deliveries to the '{{ $labels.channel }}' channel failed in the last 15 minutes. Check the channel config (env vars / bot config) and network reachability. The alert was NOT lost — it's in the monitor — but external notification failed."
+
+      # ── Warn: scheduler liveness drifting ──
+      - alert: L2SchedulerLivenessDegraded
+        expr: l2_collector_scheduler_liveness_seconds > 120
+        for: 3m
+        labels:
+          severity: warn
+          runbook: "#runbook-scheduler-dead"
+        annotations:
+          summary: "L2 scheduler liveness degraded"
+          description: "Last scheduler tick was more than 2 minutes ago (expected ~60s). The scheduler may be stalled or the server under heavy load. If it exceeds 5 min, L2CollectorSchedulerDown will fire (critical)."
+
+      # ── Info: persistence not flushing ──
+      - alert: L2PersistenceStale
+        expr: (time() - l2_persisted_at_timestamp) > 3600
+        for: 10m
+        labels:
+          severity: warn
+          runbook: "#runbook-persistence-failed"
+        annotations:
+          summary: "L2 monitor state not persisted to DB"
+          description: "Monitor state hasn't been flushed to DB in over an hour. In-memory state is still authoritative, but the monitor won't survive hot-reloads/restarts until this is fixed. Check dev.log for [l2-monitor] persistL2Health failed messages."
