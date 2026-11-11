@@ -64,16 +64,29 @@ export interface L2HealthSummary {
   schedulerRunning: boolean;
   lastSchedulerTickAt: number | null;
   circuitBreaker: CircuitBreakerState;
+  pairCircuitBreakers: Record<string, PairCircuitBreakerState>;  // per-pair CB (#4)
   persistedAt: number | null;  // unix sec of last successful DB flush
 }
 
+export type AlertSeverity = "info" | "warn" | "error" | "critical";
+
 export interface L2Alert {
   level: "warn" | "error";
+  severity: AlertSeverity;     // derived severity for channel routing (#7)
   pair: string;
-  code: "stale" | "consecutive_failures" | "outage" | "never_collected" | "circuit_open" | "scheduler_dead";
+  code: "stale" | "consecutive_failures" | "outage" | "never_collected" | "circuit_open" | "circuit_open_pair" | "scheduler_dead" | "rate_limited";
   message: string;
   detail?: string;
   runbook?: string;   // runbook anchor reference for troubleshooting
+}
+
+// Per-pair circuit breaker state (priority #4 — granular cascade protection)
+export interface PairCircuitBreakerState {
+  open: boolean;
+  openedAt: number | null;       // unix sec
+  openUntil: number | null;      // unix sec — when half-open probe allowed
+  trips: number;
+  currentCooldownSec: number;
 }
 
 const HISTORY_LIMIT = 20;
@@ -87,15 +100,21 @@ const CB_BASE_COOLDOWN_SEC = 300;       // 5 min initial cooldown
 const CB_MAX_COOLDOWN_SEC = 1800;       // cap at 30 min
 const CB_HALF_OPEN_SUCCESS_THRESHOLD = 1; // need >=1 success in half-open cycle to close
 
+// Per-pair circuit breaker config (priority #4)
+const PAIR_CB_THRESHOLD = 3;            // 3 consecutive failures → open pair CB
+const PAIR_CB_BASE_COOLDOWN_SEC = 60;   // 1 min initial cooldown (per-pair, shorter than global)
+const PAIR_CB_MAX_COOLDOWN_SEC = 600;   // cap at 10 min
+
 // Runbook anchors — map alert codes to in-app runbook section references.
-// The dashboard renders a full runbook; these anchors link to the relevant section.
 const RUNBOOK: Record<string, string> = {
   stale: "#runbook-stale",
   consecutive_failures: "#runbook-consecutive-failures",
   outage: "#runbook-outage",
   never_collected: "#runbook-never-collected",
   circuit_open: "#runbook-circuit-open",
+  circuit_open_pair: "#runbook-circuit-open-pair",
   scheduler_dead: "#runbook-scheduler-dead",
+  rate_limited: "#runbook-rate-limited",
 };
 
 // Pairs tracked — must match the scheduler's L2_PAIRS
@@ -107,6 +126,7 @@ interface MonitorState {
   schedulerRunning: boolean;
   lastSchedulerTickAt: number | null;
   circuit: CircuitBreakerState;
+  pairCircuits: Map<string, PairCircuitBreakerState>;  // per-pair CB (#4)
   lastNotifiedAlerts: Set<string>;   // dedup keys for external alerting
   persistedAt: number | null;
   hydrated: boolean;
