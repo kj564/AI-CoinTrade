@@ -142,6 +142,17 @@ function fmtCompact(v: number | null | undefined) {
   if (v === null || v === undefined || !isFinite(v)) return "—";
   return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(v);
 }
+// Format a unix-second timestamp as a relative age (e.g. "3m ago", "2h5m ago").
+function formatL2Age(ts: number | null | undefined): string {
+  if (!ts || !isFinite(ts)) return "—";
+  const now = Math.floor(Date.now() / 1000);
+  const sec = Math.max(0, now - ts);
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h${m > 0 ? `${m}m` : ""}`;
+}
 
 const PAIRS = ["btc_idr", "eth_idr", "sol_idr", "bnb_idr", "xrp_idr", "ada_idr", "doge_idr", "avax_idr", "matic_idr", "dot_idr"];
 const COIN_NAMES: Record<string, string> = {
@@ -300,6 +311,10 @@ export function TradingDashboard() {
   const [aiLoading, setAiLoading] = useState(false);
   // Research Lab collapsible (advanced ML metrics)
   const [labOpen, setLabOpen] = useState(false);
+  // L2 collector health monitoring (polls /api/l2/health)
+  const [l2Health, setL2Health] = useState<any>(null);
+  const [l2HealthLoading, setL2HealthLoading] = useState(false);
+  const [l2Collecting, setL2Collecting] = useState(false);
   // refs to always have latest capital/risk in interval without re-triggering effect
   const sigCapitalRef = useRef(sigCapital);
   const sigRiskRef = useRef(sigRisk);
@@ -334,6 +349,38 @@ export function TradingDashboard() {
     const t = setInterval(doFetch, 30000);
     return () => { active = false; clearInterval(t); };
   }, []);
+
+  // L2 collector health — polls every 30s when Research Lab is open
+  useEffect(() => {
+    if (!labOpen) return;
+    let active = true;
+    const doFetch = async () => {
+      try {
+        setL2HealthLoading(true);
+        const r = await fetch("/api/l2/health");
+        if (!active) return;
+        const d = await r.json();
+        setL2Health(d);
+      } catch { /* ignore */ }
+      if (active) setL2HealthLoading(false);
+    };
+    doFetch();
+    const t = setInterval(doFetch, 30000);
+    return () => { active = false; clearInterval(t); };
+  }, [labOpen]);
+
+  // Manual L2 collection trigger (forces a snapshot for all pairs)
+  const triggerL2Collect = async () => {
+    setL2Collecting(true);
+    try {
+      await fetch("/api/l2/collect", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      // refresh health immediately
+      const r = await fetch("/api/l2/health");
+      const d = await r.json();
+      setL2Health(d);
+    } catch { /* ignore */ }
+    setL2Collecting(false);
+  };
 
   // pair detail
   useEffect(() => {
@@ -1228,6 +1275,155 @@ export function TradingDashboard() {
                                 </div>
                               </div>
                             </div>
+
+                            {/* ── L2 Collector Health Monitor (infra hardening) ── */}
+                            <div className="rounded-lg border border-teal-500/20 bg-teal-500/[0.03] p-3">
+                              <div className="mb-2 flex items-center justify-between">
+                                <div className="flex items-center gap-1.5">
+                                  <Activity className="h-3 w-3 text-teal-400" />
+                                  <span className="text-[10px] font-bold uppercase tracking-wide text-slate-400">L2 Collector Health</span>
+                                  <Badge className="ml-0.5 border border-teal-500/30 bg-teal-500/10 px-1 py-0 text-[7px] font-bold text-teal-300">MONITOR</Badge>
+                                  {l2Health && (
+                                    <Badge className={cn(
+                                      "ml-1 px-1 py-0 text-[7px] font-bold",
+                                      l2Health.status === "healthy" ? "border border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                                      : l2Health.status === "degraded" ? "border border-amber-500/30 bg-amber-500/10 text-amber-300"
+                                      : "border border-rose-500/30 bg-rose-500/10 text-rose-300"
+                                    )}>
+                                      {l2Health.status?.toUpperCase()}
+                                    </Badge>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[8px] text-slate-600">
+                                    {l2HealthLoading ? "refreshing…" : l2Health ? `updated ${formatL2Age(l2Health.generatedAt)}` : "—"}
+                                  </span>
+                                  <Button size="sm" variant="outline" className="h-5 border-teal-500/30 bg-teal-500/[0.04] px-1.5 text-[8px] text-teal-300 hover:bg-teal-500/10" onClick={triggerL2Collect} disabled={l2Collecting}>
+                                    {l2Collecting ? <><Clock className="mr-1 h-2.5 w-2.5 animate-spin" />Collecting…</> : "Collect Now"}
+                                  </Button>
+                                </div>
+                              </div>
+
+                              {!l2Health ? (
+                                <div className="py-3 text-center text-[9px] text-slate-600">
+                                  {l2HealthLoading ? "Loading collector health…" : "Open to load health data."}
+                                </div>
+                              ) : (
+                                <>
+                                  {/* Aggregate stats */}
+                                  <div className="mb-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                                    <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                      <div className="text-[8px] uppercase text-slate-500">Scheduler</div>
+                                      <div className={cn("font-bold tabular-nums", l2Health.schedulerRunning ? "text-emerald-400" : "text-rose-400")}>
+                                        {l2Health.schedulerRunning ? "RUNNING" : "STOPPED"}
+                                      </div>
+                                      <div className="text-[7px] text-slate-600">{l2Health.lastSchedulerTickAt ? `tick ${formatL2Age(l2Health.lastSchedulerTickAt)} ago` : "no tick yet"}</div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                      <div className="text-[8px] uppercase text-slate-500">Total Attempts</div>
+                                      <div className="font-bold tabular-nums text-slate-200">{l2Health.totalAttempts}</div>
+                                      <div className="text-[7px] text-slate-600">{l2Health.totalSuccesses} ok · {l2Health.totalFailures} fail</div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                      <div className="text-[8px] uppercase text-slate-500">Success Rate</div>
+                                      <div className={cn("font-bold tabular-nums", l2Health.successRate > 0.9 ? "text-emerald-400" : l2Health.successRate > 0.5 ? "text-amber-400" : "text-rose-400")}>
+                                        {(l2Health.successRate * 100).toFixed(0)}%
+                                      </div>
+                                      <div className="text-[7px] text-slate-600">{l2Health.totalAttempts > 0 ? `${l2Health.totalAttempts} attempts` : "no data"}</div>
+                                    </div>
+                                    <div className="rounded bg-white/[0.03] px-2 py-1.5">
+                                      <div className="text-[8px] uppercase text-slate-500">Active Alerts</div>
+                                      <div className={cn("font-bold tabular-nums", (l2Health.alerts?.length ?? 0) === 0 ? "text-emerald-400" : "text-amber-400")}>
+                                        {l2Health.alerts?.length ?? 0}
+                                      </div>
+                                      <div className="text-[7px] text-slate-600">{(l2Health.alerts?.filter((a: any) => a.level === "error").length ?? 0)} error · {(l2Health.alerts?.filter((a: any) => a.level === "warn").length ?? 0)} warn</div>
+                                    </div>
+                                  </div>
+
+                                  {/* Per-pair grid */}
+                                  <div className="mb-2">
+                                    <div className="mb-1 text-[8px] font-bold text-slate-500">Per-Pair Collection Status (in-process scheduler, 30-min cycle, 3-attempt exponential backoff)</div>
+                                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-3">
+                                      {(l2Health.pairs || []).map((p: any) => {
+                                        const pairStatus = p.consecutiveFailures >= 3 ? "down" : p.consecutiveFailures >= 1 ? "degraded" : (p.lastSuccessAt && (l2Health.generatedAt - p.lastSuccessAt) > 7200) ? "stale" : "healthy";
+                                        return (
+                                          <div key={p.pair} className="rounded bg-white/[0.03] p-1.5">
+                                            <div className="mb-0.5 flex items-center justify-between">
+                                              <span className="text-[9px] font-bold text-slate-300">{p.pair}</span>
+                                              <span className={cn(
+                                                "rounded px-1 py-0 text-[7px] font-bold",
+                                                pairStatus === "healthy" ? "bg-emerald-500/15 text-emerald-300"
+                                                : pairStatus === "degraded" ? "bg-amber-500/15 text-amber-300"
+                                                : pairStatus === "stale" ? "bg-amber-500/15 text-amber-300"
+                                                : "bg-rose-500/15 text-rose-300"
+                                              )}>{pairStatus.toUpperCase()}</span>
+                                            </div>
+                                            <div className="space-y-0.5 text-[8px]">
+                                              <div className="flex justify-between"><span className="text-slate-500">last success</span><span className="tabular-nums text-slate-300">{p.lastSuccessAt ? `${formatL2Age(p.lastSuccessAt)} ago` : "never"}</span></div>
+                                              <div className="flex justify-between"><span className="text-slate-500">consec fails</span><span className={cn("tabular-nums font-bold", p.consecutiveFailures > 0 ? "text-rose-400" : "text-emerald-400")}>{p.consecutiveFailures}</span></div>
+                                              <div className="flex justify-between"><span className="text-slate-500">snapshots</span><span className="tabular-nums text-slate-300">{p.lastSnapshotCount}</span></div>
+                                              <div className="flex justify-between"><span className="text-slate-500">last retries</span><span className="tabular-nums text-slate-400">{p.lastRetriesUsed}</span></div>
+                                              <div className="flex justify-between"><span className="text-slate-500">success rate</span><span className={cn("tabular-nums font-bold", p.totalAttempts > 0 ? (p.totalSuccesses / p.totalAttempts > 0.9 ? "text-emerald-400" : p.totalSuccesses / p.totalAttempts > 0.5 ? "text-amber-400" : "text-rose-400") : "text-slate-500")}>{p.totalAttempts > 0 ? `${((p.totalSuccesses / p.totalAttempts) * 100).toFixed(0)}%` : "—"}<span className="text-slate-600"> ({p.totalAttempts})</span></span></div>
+                                            </div>
+                                            {p.lastError && (
+                                              <div className="mt-0.5 rounded bg-rose-500/[0.06] px-1 py-0.5 text-[7px] leading-tight text-rose-300/80" title={p.lastError}>
+                                                {p.lastError.length > 60 ? p.lastError.slice(0, 60) + "…" : p.lastError}
+                                              </div>
+                                            )}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+
+                                  {/* Alerts */}
+                                  {l2Health.alerts && l2Health.alerts.length > 0 && (
+                                    <div className="mb-2 rounded border border-amber-500/20 bg-amber-500/[0.04] p-2">
+                                      <div className="mb-1 text-[8px] font-bold uppercase text-amber-400">Alerts ({l2Health.alerts.length})</div>
+                                      <div className="max-h-24 space-y-0.5 overflow-y-auto">
+                                        {l2Health.alerts.map((a: any, i: number) => (
+                                          <div key={i} className={cn("flex items-start gap-1 text-[8px]", a.level === "error" ? "text-rose-300" : "text-amber-300")}>
+                                            {a.level === "error" ? <XCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" /> : <AlertCircle className="mt-0.5 h-2.5 w-2.5 flex-shrink-0" />}
+                                            <span><b className="font-mono">[{a.pair}]</b> {a.message}{a.detail ? ` — ${a.detail}` : ""}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* Recent history (per-pair, last few attempts) */}
+                                  {(() => {
+                                    const allHistory = (l2Health.pairs || []).flatMap((p: any) => (p.history || []).map((h: any) => ({ ...h, pair: p.pair })));
+                                    const recent = allHistory.sort((a: any, b: any) => b.ts - a.ts).slice(0, 8);
+                                    if (recent.length === 0) return null;
+                                    return (
+                                      <div className="rounded border border-white/[0.06] bg-white/[0.02] p-2">
+                                        <div className="mb-1 text-[8px] font-bold text-slate-500">Recent Collection Attempts</div>
+                                        <div className="max-h-28 space-y-0.5 overflow-y-auto">
+                                          {recent.map((h: any, i: number) => (
+                                            <div key={i} className="flex items-center justify-between text-[8px]">
+                                              <span className="flex items-center gap-1">
+                                                {h.success ? <CheckCircle2 className="h-2.5 w-2.5 text-emerald-400" /> : <XCircle className="h-2.5 w-2.5 text-rose-400" />}
+                                                <span className="font-mono text-slate-400">{h.pair}</span>
+                                              </span>
+                                              <span className="flex items-center gap-2 text-slate-500">
+                                                {h.retriesUsed > 0 && <span className="text-amber-400">{h.retriesUsed}r</span>}
+                                                <span className="tabular-nums">{h.durationMs}ms</span>
+                                                <span className="tabular-nums">{formatL2Age(h.ts)} ago</span>
+                                              </span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })()}
+
+                                  <p className="mt-1.5 text-[8px] leading-relaxed text-slate-500">
+                                    Tracks in-process L2 snapshot collection (every 30 ticks ≈ 30 min for 5 pairs). Each fetch uses 3-attempt exponential backoff (500ms → 1s → 2s, jittered). Snapshots are validated before storage (crossed books, empty OB, non-positive prices rejected). Status: <b className="text-emerald-300">healthy</b> = no failures &amp; fresh; <b className="text-amber-300">degraded</b> = recent failure or stale; <b className="text-rose-300">down</b> = 3+ consecutive failures or scheduler dead.
+                                  </p>
+                                </>
+                              )}
+                            </div>
                           </CollapsibleContent>
                         </Collapsible>
                       </div>
@@ -1674,10 +1870,42 @@ export function TradingDashboard() {
                     <AlertTriangle className="mx-auto h-8 w-8 text-rose-400 mb-2" />
                     <h4 className="text-sm font-bold text-rose-300">Backtest Error</h4>
                     <p className="mt-1 text-[11px] text-slate-400">{btError}</p>
-                    <p className="mt-2 text-[10px] text-slate-500">The backtest engine includes L2 order book fetching, realistic limit execution simulation, and microstructure analysis which may require significant server resources. If the server is under load, please try again in a moment.</p>
-                    <Button size="sm" variant="outline" className="mt-3 border-rose-500/30 bg-rose-500/[0.04] text-rose-300 hover:bg-rose-500/10" onClick={runBt} disabled={btLoading}>
-                      {btLoading ? <><Clock className="h-3.5 w-3.5 animate-spin" /> Retrying…</> : "Retry Backtest"}
-                    </Button>
+                    {/* Structured error detail (priority #5) — classify the failure mode */}
+                    <div className="mx-auto mt-3 max-w-md rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-left">
+                      <div className="mb-1.5 text-[9px] font-bold uppercase tracking-wide text-slate-500">Diagnostic Detail</div>
+                      {(() => {
+                        const isTimeout = btError.toLowerCase().includes("timed out");
+                        const isL2 = btError.toLowerCase().includes("l2") || btError.toLowerCase().includes("depth") || btError.toLowerCase().includes("order book");
+                        const isUnavailable = btError.toLowerCase().includes("unavailable") || btError.toLowerCase().includes("failed");
+                        return (
+                          <div className="space-y-1 text-[9px] text-slate-400">
+                            <div className="flex items-start gap-1.5">
+                              <span className={cn("mt-0.5 h-1.5 w-1.5 flex-shrink-0 rounded-full", isTimeout ? "bg-amber-400" : isL2 ? "bg-teal-400" : "bg-rose-400")} />
+                              <span><b className="text-slate-300">Failure mode:</b> {isTimeout ? "Server timeout (30s) — heavy compute (Monte Carlo + L2 fetch + microstructure) exceeded the client-side abort threshold." : isL2 ? "L2 order book fetch/validate failure — INDODAX depth API returned empty or invalid data. The collector now retries with exponential backoff." : isUnavailable ? "Server unreachable — the API route may have crashed or the dev server restarted." : "API returned an error response."}</span>
+                            </div>
+                            <div className="flex items-start gap-1.5">
+                              <span className="mt-0.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-400" />
+                              <span><b className="text-slate-300">Likely cause:</b> {isTimeout ? "Sandbox resource limits under concurrent load." : isL2 ? "Transient INDODAX API issue or invalid depth payload (crossed book / empty OB rejected by validator)." : "Process restart or unhandled exception in backtest route."}</span>
+                            </div>
+                            <div className="flex items-start gap-1.5">
+                              <span className="mt-0.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-slate-400" />
+                              <span><b className="text-slate-300">Suggested action:</b> {isTimeout ? "Retry — the engine auto-retries L2 fetches 3× with backoff. If persistent, reduce backtest window." : isL2 ? "Retry. Check the L2 Collector Health monitor in Research Lab for per-pair status." : "Retry after a few seconds; check dev server logs if persistent."}</span>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    <p className="mt-2 text-[10px] text-slate-500">The backtest engine includes L2 order book fetching (3-attempt exponential backoff), realistic limit execution simulation, and microstructure analysis which may require significant server resources.</p>
+                    <div className="mt-3 flex items-center justify-center gap-2">
+                      <Button size="sm" variant="outline" className="border-rose-500/30 bg-rose-500/[0.04] text-rose-300 hover:bg-rose-500/10" onClick={runBt} disabled={btLoading}>
+                        {btLoading ? <><Clock className="h-3.5 w-3.5 animate-spin" /> Retrying…</> : "Retry Backtest"}
+                      </Button>
+                      {!labOpen && (
+                        <Button size="sm" variant="ghost" className="text-teal-300 hover:bg-teal-500/10" onClick={() => setLabOpen(true)}>
+                          <Activity className="mr-1 h-3.5 w-3.5" /> Open L2 Health Monitor
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </Card>
               )}
