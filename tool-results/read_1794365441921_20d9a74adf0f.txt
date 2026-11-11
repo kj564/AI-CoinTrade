@@ -1,0 +1,782 @@
+     1→// L2 Collector Health Monitor (in-process + DB-persisted)
+     2→// Tracks per-pair collection success/failure over time so scheduler failures are
+     3→// detectable, per-pair errors are surfaced, and stale/outage alerts can be derived.
+     4→//
+     5→// This round (production hardening):
+     6→//  - Aggregate state is persisted to DB (L2CollectorHealth) so the monitor
+     7→//    survives hot-reloads / restarts. In-memory remains the fast-path; DB is
+     8→//    hydrated on startup and flushed after each collection cycle. The in-memory
+     9→//    write always succeeds (circular-dependency safe); DB flush is best-effort.
+    10→//  - Circuit breaker: if N consecutive collection cycles have 0 successes,
+    11→//    the circuit opens and collection is skipped for a cooldown (with exponential
+    12→//    backoff). Prevents cascade failure when INDODAX API is down.
+    13→//  - Alert dedup: tracks which error-level alert signatures have already been
+    14→//    notified externally so Telegram/webhook alerts fire only on NEW incidents.
+    15→
+    16→import { db } from "@/lib/db";
+    17→
+    18→export type L2HealthStatus = "healthy" | "degraded" | "down";
+    19→
+    20→export interface PairHealth {
+    21→  pair: string;
+    22→  lastSuccessAt: number | null;       // unix sec
+    23→  lastFailureAt: number | null;       // unix sec
+    24→  lastError: string | null;
+    25→  lastErrorAt: number | null;
+    26→  consecutiveFailures: number;
+    27→  totalAttempts: number;
+    28→  totalSuccesses: number;
+    29→  totalFailures: number;
+    30→  lastSnapshotCount: number;
+    31→  lastAgeSec: number | null;
+    32→  lastRetriesUsed: number;
+    33→  // Rolling history (last 20 attempts) for diagnostics — NOT persisted (transient)
+    34→  history: L2AttemptRecord[];
+    35→}
+    36→
+    37→export interface L2AttemptRecord {
+    38→  ts: number;          // unix sec
+    39→  success: boolean;
+    40→  error?: string;
+    41→  ageSec?: number;
+    42→  retriesUsed: number;
+    43→  durationMs: number;
+    44→}
+    45→
+    46→export interface CircuitBreakerState {
+    47→  open: boolean;
+    48→  openedAt: number | null;        // unix sec
+    49→  openUntil: number | null;       // unix sec — when half-open probe allowed
+    50→  trips: number;                  // total times circuit has opened
+    51→  consecutiveBadCycles: number;   // cycles with 0 successes
+    52→  currentCooldownSec: number;     // current cooldown (doubles on re-trip, capped)
+    53→}
+    54→
+    55→export interface L2HealthSummary {
+    56→  status: L2HealthStatus;
+    57→  generatedAt: number;        // unix sec
+    58→  pairs: PairHealth[];
+    59→  totalAttempts: number;
+    60→  totalSuccesses: number;
+    61→  totalFailures: number;
+    62→  successRate: number;        // 0..1
+    63→  alerts: L2Alert[];
+    64→  schedulerRunning: boolean;
+    65→  lastSchedulerTickAt: number | null;
+    66→  circuitBreaker: CircuitBreakerState;
+    67→  pairCircuitBreakers: Record<string, PairCircuitBreakerState>;  // per-pair CB (#4)
+    68→  persistedAt: number | null;  // unix sec of last successful DB flush
+    69→}
+    70→
+    71→export type AlertSeverity = "info" | "warn" | "error" | "critical";
+    72→
+    73→export interface L2Alert {
+    74→  level: "warn" | "error";
+    75→  severity: AlertSeverity;     // derived severity for channel routing (#7)
+    76→  pair: string;
+    77→  code: "stale" | "consecutive_failures" | "outage" | "never_collected" | "circuit_open" | "circuit_open_pair" | "scheduler_dead" | "rate_limited";
+    78→  message: string;
+    79→  detail?: string;
+    80→  runbook?: string;   // runbook anchor reference for troubleshooting
+    81→}
+    82→
+    83→// Per-pair circuit breaker state (priority #4 — granular cascade protection)
+    84→export interface PairCircuitBreakerState {
+    85→  open: boolean;
+    86→  openedAt: number | null;       // unix sec
+    87→  openUntil: number | null;      // unix sec — when half-open probe allowed
+    88→  trips: number;
+    89→  currentCooldownSec: number;
+    90→}
+    91→
+    92→const HISTORY_LIMIT = 20;
+    93→const OUTAGE_THRESHOLD = 3;       // consecutiveFailures >= 3 → down
+    94→const DEGRADED_THRESHOLD = 1;     // consecutiveFailures >= 1 → degraded
+    95→const STALE_MULTIPLIER = 2;       // lastSuccess age > 2× candle duration → stale
+    96→
+    97→// Circuit breaker config
+    98→const CB_BAD_CYCLE_THRESHOLD = 3;       // 3 consecutive 0-success cycles → open
+    99→const CB_BASE_COOLDOWN_SEC = 300;       // 5 min initial cooldown
+   100→const CB_MAX_COOLDOWN_SEC = 1800;       // cap at 30 min
+   101→const CB_HALF_OPEN_SUCCESS_THRESHOLD = 1; // need >=1 success in half-open cycle to close
+   102→
+   103→// Per-pair circuit breaker config (priority #4)
+   104→const PAIR_CB_THRESHOLD = 3;            // 3 consecutive failures → open pair CB
+   105→const PAIR_CB_BASE_COOLDOWN_SEC = 60;   // 1 min initial cooldown (per-pair, shorter than global)
+   106→const PAIR_CB_MAX_COOLDOWN_SEC = 600;   // cap at 10 min
+   107→
+   108→// Runbook anchors — map alert codes to in-app runbook section references.
+   109→const RUNBOOK: Record<string, string> = {
+   110→  stale: "#runbook-stale",
+   111→  consecutive_failures: "#runbook-consecutive-failures",
+   112→  outage: "#runbook-outage",
+   113→  never_collected: "#runbook-never-collected",
+   114→  circuit_open: "#runbook-circuit-open",
+   115→  circuit_open_pair: "#runbook-circuit-open-pair",
+   116→  scheduler_dead: "#runbook-scheduler-dead",
+   117→  rate_limited: "#runbook-rate-limited",
+   118→};
+   119→
+   120→// Pairs tracked — must match the scheduler's L2_PAIRS
+   121→const TRACKED_PAIRS = ["btc_idr", "eth_idr", "sol_idr", "bnb_idr", "xrp_idr"];
+   122→const SCHEDULER_KEY = "__scheduler__";
+   123→
+   124→interface MonitorState {
+   125→  pairs: Map<string, PairHealth>;
+   126→  schedulerRunning: boolean;
+   127→  lastSchedulerTickAt: number | null;
+   128→  circuit: CircuitBreakerState;
+   129→  pairCircuits: Map<string, PairCircuitBreakerState>;  // per-pair CB (#4)
+   130→  lastNotifiedAlerts: Set<string>;   // dedup keys for external alerting
+   131→  persistedAt: number | null;
+   132→  hydrated: boolean;
+   133→}
+   134→
+   135→const globalForMonitor = globalThis as unknown as { __l2Monitor?: MonitorState };
+   136→
+   137→function freshCircuit(): CircuitBreakerState {
+   138→  return {
+   139→    open: false,
+   140→    openedAt: null,
+   141→    openUntil: null,
+   142→    trips: 0,
+   143→    consecutiveBadCycles: 0,
+   144→    currentCooldownSec: CB_BASE_COOLDOWN_SEC,
+   145→  };
+   146→}
+   147→
+   148→function freshPairCircuit(): PairCircuitBreakerState {
+   149→  return {
+   150→    open: false,
+   151→    openedAt: null,
+   152→    openUntil: null,
+   153→    trips: 0,
+   154→    currentCooldownSec: PAIR_CB_BASE_COOLDOWN_SEC,
+   155→  };
+   156→}
+   157→
+   158→function getState(): MonitorState {
+   159→  if (!globalForMonitor.__l2Monitor) {
+   160→    const pairs = new Map<string, PairHealth>();
+   161→    for (const p of TRACKED_PAIRS) {
+   162→      pairs.set(p, {
+   163→        pair: p,
+   164→        lastSuccessAt: null,
+   165→        lastFailureAt: null,
+   166→        lastError: null,
+   167→        lastErrorAt: null,
+   168→        consecutiveFailures: 0,
+   169→        totalAttempts: 0,
+   170→        totalSuccesses: 0,
+   171→        totalFailures: 0,
+   172→        lastSnapshotCount: 0,
+   173→        lastAgeSec: null,
+   174→        lastRetriesUsed: 0,
+   175→        history: [],
+   176→      });
+   177→    }
+   178→    globalForMonitor.__l2Monitor = {
+   179→      pairs,
+   180→      schedulerRunning: false,
+   181→      lastSchedulerTickAt: null,
+   182→      circuit: freshCircuit(),
+   183→      pairCircuits: new Map(),
+   184→      lastNotifiedAlerts: new Set(),
+   185→      persistedAt: null,
+   186→      hydrated: false,
+   187→    };
+   188→  }
+   189→  // Hot-reload safety: if a stale global singleton from an older code shape
+   190→  // persists (missing new fields), migrate it in-place so we never read undefined.
+   191→  const s = globalForMonitor.__l2Monitor;
+   192→  if (!s.circuit) s.circuit = freshCircuit();
+   193→  if (!s.pairCircuits) s.pairCircuits = new Map();
+   194→  if (!s.lastNotifiedAlerts) s.lastNotifiedAlerts = new Set();
+   195→  if (s.persistedAt === undefined) s.persistedAt = null;
+   196→  if (s.hydrated === undefined) s.hydrated = false;
+   197→  return s;
+   198→}
+   199→
+   200→// ── In-memory recording (always succeeds — fast path) ──
+   201→
+   202→// Record a collection attempt (success or failure) for a pair.
+   203→export function recordL2Attempt(
+   204→  pair: string,
+   205→  result: { success: boolean; error?: string; ageSec?: number; snapshotCount?: number; retriesUsed?: number; durationMs?: number },
+   206→): void {
+   207→  const state = getState();
+   208→  let h = state.pairs.get(pair);
+   209→  if (!h) {
+   210→    // auto-register unknown pairs
+   211→    h = {
+   212→      pair,
+   213→      lastSuccessAt: null,
+   214→      lastFailureAt: null,
+   215→      lastError: null,
+   216→      lastErrorAt: null,
+   217→      consecutiveFailures: 0,
+   218→      totalAttempts: 0,
+   219→      totalSuccesses: 0,
+   220→      totalFailures: 0,
+   221→      lastSnapshotCount: 0,
+   222→      lastAgeSec: null,
+   223→      lastRetriesUsed: 0,
+   224→      history: [],
+   225→    };
+   226→    state.pairs.set(pair, h);
+   227→  }
+   228→
+   229→  const now = Math.floor(Date.now() / 1000);
+   230→  const record: L2AttemptRecord = {
+   231→    ts: now,
+   232→    success: result.success,
+   233→    error: result.error,
+   234→    ageSec: result.ageSec,
+   235→    retriesUsed: result.retriesUsed ?? 0,
+   236→    durationMs: result.durationMs ?? 0,
+   237→  };
+   238→
+   239→  h.totalAttempts++;
+   240→  h.history.push(record);
+   241→  if (h.history.length > HISTORY_LIMIT) h.history.shift();
+   242→
+   243→  if (result.success) {
+   244→    h.lastSuccessAt = now;
+   245→    h.consecutiveFailures = 0;
+   246→    h.totalSuccesses++;
+   247→    h.lastError = null;
+   248→    if (result.snapshotCount !== undefined) h.lastSnapshotCount = result.snapshotCount;
+   249→    if (result.ageSec !== undefined) h.lastAgeSec = result.ageSec;
+   250→  } else {
+   251→    h.lastFailureAt = now;
+   252→    h.lastErrorAt = now;
+   253→    h.lastError = result.error ?? "Unknown error";
+   254→    h.consecutiveFailures++;
+   255→    h.totalFailures++;
+   256→  }
+   257→  h.lastRetriesUsed = result.retriesUsed ?? 0;
+   258→
+   259→  // Update per-pair circuit breaker (#4)
+   260→  recordPairAttempt(pair, result.success);
+   261→}
+   262→
+   263→// Mark that the scheduler ticked (so we can detect scheduler death).
+   264→export function recordSchedulerTick(): void {
+   265→  const state = getState();
+   266→  state.schedulerRunning = true;
+   267→  state.lastSchedulerTickAt = Math.floor(Date.now() / 1000);
+   268→}
+   269→
+   270→// ── Per-pair circuit breaker (priority #4) ──
+   271→// Granular cascade protection: if a single pair keeps failing, only that pair's
+   272→// collection is skipped (not all pairs). Shorter cooldown than the global CB
+   273→// since a single pair failing is less severe than all pairs failing.
+   274→
+   275→export function recordPairAttempt(pair: string, success: boolean): void {
+   276→  const state = getState();
+   277→  let cb = state.pairCircuits.get(pair);
+   278→  if (!cb) {
+   279→    cb = freshPairCircuit();
+   280→    state.pairCircuits.set(pair, cb);
+   281→  }
+   282→  const now = Math.floor(Date.now() / 1000);
+   283→
+   284→  if (cb.open) {
+   285→    // If past cooldown, this was a half-open probe attempt
+   286→    if (cb.openUntil !== null && now >= cb.openUntil) {
+   287→      if (success) {
+   288→        // Probe succeeded — close
+   289→        cb.open = false;
+   290→        cb.openedAt = null;
+   291→        cb.openUntil = null;
+   292→        cb.currentCooldownSec = PAIR_CB_BASE_COOLDOWN_SEC;
+   293→        console.log(`[l2-pair-cb] ${pair}: CLOSED — half-open probe succeeded`);
+   294→      } else {
+   295→        // Probe failed — re-open with backoff
+   296→        cb.currentCooldownSec = Math.min(cb.currentCooldownSec * 2, PAIR_CB_MAX_COOLDOWN_SEC);
+   297→        cb.openUntil = now + cb.currentCooldownSec;
+   298→        cb.trips++;
+   299→        console.warn(`[l2-pair-cb] ${pair}: re-opened after probe failed — cooldown ${cb.currentCooldownSec}s (trips: ${cb.trips})`);
+   300→      }
+   301→    }
+   302→    return;
+   303→  }
+   304→
+   305→  // Circuit closed: track consecutive failures via PairHealth
+   306→  const h = state.pairs.get(pair);
+   307→  if (!h) return;
+   308→  if (!success && h.consecutiveFailures >= PAIR_CB_THRESHOLD) {
+   309→    // Trip the pair's circuit
+   310→    cb.open = true;
+   311→    cb.openedAt = now;
+   312→    cb.openUntil = now + cb.currentCooldownSec;
+   313→    cb.trips++;
+   314→    console.warn(`[l2-pair-cb] ${pair}: OPENED — ${h.consecutiveFailures} consecutive failures. Cooldown ${cb.currentCooldownSec}s.`);
+   315→  } else if (success) {
+   316→    // Success resets the pair's CB state (already reset by recordL2Attempt)
+   317→    cb.currentCooldownSec = PAIR_CB_BASE_COOLDOWN_SEC;
+   318→  }
+   319→}
+   320→
+   321→// Is a specific pair's circuit currently open (collection for that pair should be skipped)?
+   322→export function isPairCircuitOpen(pair: string): boolean {
+   323→  const state = getState();
+   324→  const cb = state.pairCircuits.get(pair);
+   325→  if (!cb || !cb.open) return false;
+   326→  const now = Math.floor(Date.now() / 1000);
+   327→  // Past cooldown → half-open, allow probe
+   328→  if (cb.openUntil !== null && now >= cb.openUntil) return false;
+   329→  return true;
+   330→}
+   331→
+   332→export function getPairCircuitBreakers(): Record<string, PairCircuitBreakerState> {
+   333→  const state = getState();
+   334→  const out: Record<string, PairCircuitBreakerState> = {};
+   335→  for (const [pair, cb] of state.pairCircuits) {
+   336→    out[pair] = { ...cb };
+   337→  }
+   338→  return out;
+   339→}
+   340→
+   341→// ── Circuit breaker ──
+   342→
+   343→// Called after a full collection cycle completes. Updates circuit state.
+   344→// `successCount` = number of pairs that succeeded in this cycle.
+   345→export function recordCollectionCycle(successCount: number, pairCount: number): void {
+   346→  const state = getState();
+   347→  const cb = state.circuit;
+   348→
+   349→  // If circuit is open, check if cooldown has elapsed → half-open
+   350→  if (cb.open) {
+   351→    const now = Math.floor(Date.now() / 1000);
+   352→    if (cb.openUntil !== null && now >= cb.openUntil) {
+   353→      // Half-open probe: this cycle was allowed. Evaluate result.
+   354→      if (successCount >= CB_HALF_OPEN_SUCCESS_THRESHOLD) {
+   355→        // Recovered — close circuit
+   356→        cb.open = false;
+   357→        cb.openedAt = null;
+   358→        cb.openUntil = null;
+   359→        cb.consecutiveBadCycles = 0;
+   360→        cb.currentCooldownSec = CB_BASE_COOLDOWN_SEC; // reset cooldown
+   361→        console.log("[l2-circuit-breaker] CLOSED — half-open probe succeeded");
+   362→      } else {
+   363→        // Still failing — re-open with backoff
+   364→        cb.currentCooldownSec = Math.min(cb.currentCooldownSec * 2, CB_MAX_COOLDOWN_SEC);
+   365→        cb.openUntil = now + cb.currentCooldownSec;
+   366→        cb.trips++;
+   367→        console.warn(`[l2-circuit-breaker] re-opened after half-open probe failed — cooldown ${cb.currentCooldownSec}s (trips: ${cb.trips})`);
+   368→      }
+   369→      return;
+   370→    }
+   371→    // Still in cooldown — ignore
+   372→    return;
+   373→  }
+   374→
+   375→  // Circuit closed: track bad cycles
+   376→  if (successCount === 0 && pairCount > 0) {
+   377→    cb.consecutiveBadCycles++;
+   378→    if (cb.consecutiveBadCycles >= CB_BAD_CYCLE_THRESHOLD) {
+   379→      // Trip the circuit
+   380→      const now = Math.floor(Date.now() / 1000);
+   381→      cb.open = true;
+   382→      cb.openedAt = now;
+   383→      cb.openUntil = now + cb.currentCooldownSec;
+   384→      cb.trips++;
+   385→      console.error(`[l2-circuit-breaker] OPENED — ${cb.consecutiveBadCycles} consecutive 0-success cycles. Cooldown ${cb.currentCooldownSec}s. Collection will be skipped.`);
+   386→    }
+   387→  } else if (successCount > 0) {
+   388→    // Healthy cycle — reset bad cycle counter
+   389→    cb.consecutiveBadCycles = 0;
+   390→  }
+   391→}
+   392→
+   393→// Is the circuit currently open (collection should be skipped)?
+   394→export function isCircuitOpen(): boolean {
+   395→  const state = getState();
+   396→  const cb = state.circuit;
+   397→  if (!cb.open) return false;
+   398→  const now = Math.floor(Date.now() / 1000);
+   399→  // If past openUntil, we're in half-open → allow the probe (return false so collection runs)
+   400→  if (cb.openUntil !== null && now >= cb.openUntil) return false;
+   401→  return true;
+   402→}
+   403→
+   404→export function getCircuitBreaker(): CircuitBreakerState {
+   405→  return { ...getState().circuit };
+   406→}
+   407→
+   408→// ── Alert derivation ──
+   409→
+   410→// Derive severity from alert code + level (priority #7).
+   411→// critical = system-wide failure (circuit open, scheduler dead)
+   412→// error   = pair-level outage
+   413→// warn    = degradation (stale, consecutive failures, never collected)
+   414→function deriveSeverity(code: L2Alert["code"], level: L2Alert["level"]): AlertSeverity {
+   415→  if (code === "circuit_open" || code === "scheduler_dead") return "critical";
+   416→  if (code === "circuit_open_pair") return "error";
+   417→  if (level === "error") return "error";
+   418→  return "warn";
+   419→}
+   420→
+   421→function deriveAlerts(h: PairHealth, stalenessThresholdSec: number): L2Alert[] {
+   422→  const alerts: L2Alert[] = [];
+   423→  const now = Math.floor(Date.now() / 1000);
+   424→
+   425→  if (h.totalAttempts === 0) {
+   426→    alerts.push({
+   427→      level: "warn",
+   428→      severity: "warn",
+   429→      pair: h.pair,
+   430→      code: "never_collected",
+   431→      message: `No L2 snapshot collected yet for ${h.pair}`,
+   432→      runbook: RUNBOOK.never_collected,
+   433→    });
+   434→    return alerts;
+   435→  }
+   436→
+   437→  // Outage: too many consecutive failures
+   438→  if (h.consecutiveFailures >= OUTAGE_THRESHOLD) {
+   439→    alerts.push({
+   440→      level: "error",
+   441→      severity: "error",
+   442→      pair: h.pair,
+   443→      code: "outage",
+   444→      message: `${h.pair}: ${h.consecutiveFailures} consecutive collection failures — collector appears down`,
+   445→      detail: h.lastError ?? undefined,
+   446→      runbook: RUNBOOK.outage,
+   447→    });
+   448→  } else if (h.consecutiveFailures >= DEGRADED_THRESHOLD) {
+   449→    alerts.push({
+   450→      level: "warn",
+   451→      severity: "warn",
+   452→      pair: h.pair,
+   453→      code: "consecutive_failures",
+   454→      message: `${h.pair}: ${h.consecutiveFailures} recent failure(s) — last error: ${h.lastError ?? "unknown"}`,
+   455→      runbook: RUNBOOK.consecutive_failures,
+   456→    });
+   457→  }
+   458→
+   459→  // Stale: last successful snapshot is older than threshold
+   460→  if (h.lastSuccessAt !== null) {
+   461→    const age = now - h.lastSuccessAt;
+   462→    if (age > stalenessThresholdSec * STALE_MULTIPLIER) {
+   463→      const lvl = h.consecutiveFailures > 0 ? "error" : "warn";
+   464→      alerts.push({
+   465→        level: lvl,
+   466→        severity: deriveSeverity("stale", lvl),
+   467→        pair: h.pair,
+   468→        code: "stale",
+   469→        message: `${h.pair}: last snapshot ${formatAge(age)} old (threshold ${formatAge(stalenessThresholdSec * STALE_MULTIPLIER)})`,
+   470→        runbook: RUNBOOK.stale,
+   471→      });
+   472→    }
+   473→  } else if (h.totalAttempts > 0) {
+   474→    // attempts made but never succeeded
+   475→    alerts.push({
+   476→      level: "error",
+   477→      severity: "error",
+   478→      pair: h.pair,
+   479→      code: "outage",
+   480→      message: `${h.pair}: ${h.totalAttempts} attempts, 0 successes — collector failing`,
+   481→      detail: h.lastError ?? undefined,
+   482→      runbook: RUNBOOK.outage,
+   483→    });
+   484→  }
+   485→
+   486→  // Per-pair circuit breaker alert (#4)
+   487→  const state = getState();
+   488→  const pcb = state.pairCircuits.get(h.pair);
+   489→  if (pcb && pcb.open) {
+   490→    const inCooldown = pcb.openUntil !== null && now < pcb.openUntil;
+   491→    alerts.push({
+   492→      level: "error",
+   493→      severity: "error",
+   494→      pair: h.pair,
+   495→      code: "circuit_open_pair",
+   496→      message: inCooldown
+   497→        ? `${h.pair}: per-pair circuit OPEN — collection skipped for ${formatAge((pcb.openUntil ?? 0) - now)} (trips: ${pcb.trips})`
+   498→        : `${h.pair}: per-pair circuit half-open — probe allowed`,
+   499→      runbook: RUNBOOK.circuit_open_pair,
+   500→    });
+   501→  }
+   502→
+   503→  return alerts;
+   504→}
+   505→
+   506→function formatAge(sec: number): string {
+   507→  if (sec < 60) return `${sec}s`;
+   508→  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+   509→  const h = Math.floor(sec / 3600);
+   510→  const m = Math.floor((sec % 3600) / 60);
+   511→  return `${h}h${m > 0 ? `${m}m` : ""}`;
+   512→}
+   513→
+   514→// Get full health summary. stalenessThresholdSec defaults to 1h candle duration.
+   515→export function getL2Health(stalenessThresholdSec = 3600): L2HealthSummary {
+   516→  const state = getState();
+   517→  const pairs = Array.from(state.pairs.values());
+   518→
+   519→  let totalAttempts = 0;
+   520→  let totalSuccesses = 0;
+   521→  let totalFailures = 0;
+   522→  let worstStatus: L2HealthStatus = "healthy";
+   523→  const allAlerts: L2Alert[] = [];
+   524→
+   525→  for (const p of pairs) {
+   526→    totalAttempts += p.totalAttempts;
+   527→    totalSuccesses += p.totalSuccesses;
+   528→    totalFailures += p.totalFailures;
+   529→
+   530→    const alerts = deriveAlerts(p, stalenessThresholdSec);
+   531→    allAlerts.push(...alerts);
+   532→
+   533→    // Determine pair-level status
+   534→    const hasError = alerts.some((a) => a.level === "error");
+   535→    const hasWarn = alerts.some((a) => a.level === "warn");
+   536→    if (hasError) worstStatus = "down";
+   537→    else if (hasWarn && worstStatus !== "down") worstStatus = "degraded";
+   538→  }
+   539→
+   540→  // Scheduler liveness: if no tick in last 5 min, scheduler is presumed dead
+   541→  if (state.lastSchedulerTickAt !== null) {
+   542→    const tickAge = Math.floor(Date.now() / 1000) - state.lastSchedulerTickAt;
+   543→    if (tickAge > 300) {
+   544→      allAlerts.push({
+   545→        level: "error",
+   546→        severity: "critical",
+   547→        pair: "*",
+   548→        code: "scheduler_dead",
+   549→        message: `Scheduler: no tick in ${formatAge(tickAge)} — in-process collector appears dead`,
+   550→        runbook: RUNBOOK.scheduler_dead,
+   551→      });
+   552→      worstStatus = "down";
+   553→    }
+   554→  } else if (!state.schedulerRunning) {
+   555→    allAlerts.push({
+   556→      level: "warn",
+   557→      severity: "warn",
+   558→      pair: "*",
+   559→      code: "scheduler_dead",
+   560→      message: "Scheduler: not started yet — in-process collector not running",
+   561→      runbook: RUNBOOK.scheduler_dead,
+   562→    });
+   563→    if (worstStatus === "healthy") worstStatus = "degraded";
+   564→  }
+   565→
+   566→  // Global circuit breaker alert
+   567→  const cb = state.circuit;
+   568→  if (cb.open) {
+   569→    const now = Math.floor(Date.now() / 1000);
+   570→    const inCooldown = cb.openUntil !== null && now < cb.openUntil;
+   571→    allAlerts.push({
+   572→      level: "error",
+   573→      severity: "critical",
+   574→      pair: "*",
+   575→      code: "circuit_open",
+   576→      message: inCooldown
+   577→        ? `Circuit breaker OPEN — collection skipped for ${formatAge((cb.openUntil ?? 0) - now)} (trips: ${cb.trips})`
+   578→        : `Circuit breaker half-open — probe cycle allowed`,
+   579→      runbook: RUNBOOK.circuit_open,
+   580→    });
+   581→    if (worstStatus !== "down") worstStatus = "down";
+   582→  }
+   583→
+   584→  const successRate = totalAttempts > 0 ? totalSuccesses / totalAttempts : 0;
+   585→
+   586→  return {
+   587→    status: worstStatus,
+   588→    generatedAt: Math.floor(Date.now() / 1000),
+   589→    pairs,
+   590→    totalAttempts,
+   591→    totalSuccesses,
+   592→    totalFailures,
+   593→    successRate,
+   594→    alerts: allAlerts,
+   595→    schedulerRunning: state.schedulerRunning,
+   596→    lastSchedulerTickAt: state.lastSchedulerTickAt,
+   597→    circuitBreaker: { ...cb },
+   598→    pairCircuitBreakers: getPairCircuitBreakers(),
+   599→    persistedAt: state.persistedAt,
+   600→  };
+   601→}
+   602→
+   603→// ── Alert dedup for external notification ──
+   604→// Returns error-level alerts whose signature hasn't been notified yet.
+   605→// Marks them as notified so subsequent calls don't re-notify.
+   606→export function getNewErrorAlerts(): L2Alert[] {
+   607→  const state = getState();
+   608→  const summary = getL2Health();
+   609→  const newAlerts: L2Alert[] = [];
+   610→  for (const a of summary.alerts) {
+   611→    if (a.level !== "error") continue;
+   612→    const key = `${a.pair}:${a.code}`;
+   613→    if (!state.lastNotifiedAlerts.has(key)) {
+   614→      newAlerts.push(a);
+   615→      state.lastNotifiedAlerts.add(key);
+   616→    }
+   617→  }
+   618→  // Prune resolved alerts from the notified set so they can re-notify if they recur
+   619→  const currentErrorKeys = new Set(
+   620→    summary.alerts.filter((a) => a.level === "error").map((a) => `${a.pair}:${a.code}`),
+   621→  );
+   622→  for (const key of Array.from(state.lastNotifiedAlerts)) {
+   623→    if (!currentErrorKeys.has(key)) state.lastNotifiedAlerts.delete(key);
+   624→  }
+   625→  return newAlerts;
+   626→}
+   627→
+   628→// ── DB persistence ──
+   629→
+   630→// Persist current in-memory state to DB. Best-effort: failures are swallowed
+   631→// (in-memory remains authoritative). Called after each collection cycle.
+   632→export async function persistL2Health(): Promise<void> {
+   633→  const state = getState();
+   634→  try {
+   635→    const now = Math.floor(Date.now() / 1000);
+   636→    // Persist per-pair rows
+   637→    for (const h of state.pairs.values()) {
+   638→      await db.l2CollectorHealth.upsert({
+   639→        where: { key: h.pair },
+   640→        create: {
+   641→          key: h.pair,
+   642→          lastSuccessAt: h.lastSuccessAt,
+   643→          lastFailureAt: h.lastFailureAt,
+   644→          lastError: h.lastError,
+   645→          lastErrorAt: h.lastErrorAt,
+   646→          consecutiveFailures: h.consecutiveFailures,
+   647→          totalAttempts: h.totalAttempts,
+   648→          totalSuccesses: h.totalSuccesses,
+   649→          totalFailures: h.totalFailures,
+   650→          lastSnapshotCount: h.lastSnapshotCount,
+   651→          lastAgeSec: h.lastAgeSec,
+   652→          lastRetriesUsed: h.lastRetriesUsed,
+   653→        },
+   654→        update: {
+   655→          lastSuccessAt: h.lastSuccessAt,
+   656→          lastFailureAt: h.lastFailureAt,
+   657→          lastError: h.lastError,
+   658→          lastErrorAt: h.lastErrorAt,
+   659→          consecutiveFailures: h.consecutiveFailures,
+   660→          totalAttempts: h.totalAttempts,
+   661→          totalSuccesses: h.totalSuccesses,
+   662→          totalFailures: h.totalFailures,
+   663→          lastSnapshotCount: h.lastSnapshotCount,
+   664→          lastAgeSec: h.lastAgeSec,
+   665→          lastRetriesUsed: h.lastRetriesUsed,
+   666→        },
+   667→      });
+   668→    }
+   669→    // Persist scheduler + circuit-breaker state in the sentinel row
+   670→    const cb = state.circuit;
+   671→    await db.l2CollectorHealth.upsert({
+   672→      where: { key: SCHEDULER_KEY },
+   673→      create: {
+   674→        key: SCHEDULER_KEY,
+   675→        schedulerRunning: state.schedulerRunning,
+   676→        lastSchedulerTickAt: state.lastSchedulerTickAt,
+   677→        circuitOpen: cb.open,
+   678→        circuitOpenedAt: cb.openedAt,
+   679→        circuitTrips: cb.trips,
+   680→        circuitOpenUntil: cb.openUntil,
+   681→      },
+   682→      update: {
+   683→        schedulerRunning: state.schedulerRunning,
+   684→        lastSchedulerTickAt: state.lastSchedulerTickAt,
+   685→        circuitOpen: cb.open,
+   686→        circuitOpenedAt: cb.openedAt,
+   687→        circuitTrips: cb.trips,
+   688→        circuitOpenUntil: cb.openUntil,
+   689→      },
+   690→    });
+   691→    state.persistedAt = now;
+   692→  } catch (e) {
+   693→    // Swallow — in-memory is still accurate; DB flush will retry next cycle.
+   694→    console.warn("[l2-monitor] persistL2Health failed (in-memory still authoritative):", e instanceof Error ? e.message : e);
+   695→  }
+   696→}
+   697→
+   698→// Hydrate in-memory state from DB. Called on startup / first health read after restart.
+   699→// Only fills aggregate fields (history stays empty — it's transient diagnostics).
+   700→// Idempotent: only runs once per process (guarded by `hydrated` flag) unless force=true.
+   701→export async function hydrateL2MonitorFromDB(force = false): Promise<void> {
+   702→  const state = getState();
+   703→  if (state.hydrated && !force) return;
+   704→  try {
+   705→    const rows = await db.l2CollectorHealth.findMany();
+   706→    if (rows.length === 0) {
+   707→      state.hydrated = true;
+   708→      return;
+   709→    }
+   710→    for (const row of rows) {
+   711→      if (row.key === SCHEDULER_KEY) {
+   712→        state.schedulerRunning = row.schedulerRunning;
+   713→        state.lastSchedulerTickAt = row.lastSchedulerTickAt;
+   714→        state.circuit = {
+   715→          open: row.circuitOpen,
+   716→          openedAt: row.circuitOpenedAt,
+   717→          openUntil: row.circuitOpenUntil,
+   718→          trips: row.circuitTrips,
+   719→          consecutiveBadCycles: state.circuit.consecutiveBadCycles, // not persisted (transient)
+   720→          currentCooldownSec: state.circuit.currentCooldownSec,
+   721→        };
+   722→      } else {
+   723→        const h = state.pairs.get(row.key);
+   724→        if (h) {
+   725→          h.lastSuccessAt = row.lastSuccessAt;
+   726→          h.lastFailureAt = row.lastFailureAt;
+   727→          h.lastError = row.lastError;
+   728→          h.lastErrorAt = row.lastErrorAt;
+   729→          h.consecutiveFailures = row.consecutiveFailures;
+   730→          h.totalAttempts = row.totalAttempts;
+   731→          h.totalSuccesses = row.totalSuccesses;
+   732→          h.totalFailures = row.totalFailures;
+   733→          h.lastSnapshotCount = row.lastSnapshotCount;
+   734→          h.lastAgeSec = row.lastAgeSec;
+   735→          h.lastRetriesUsed = row.lastRetriesUsed;
+   736→        }
+   737→      }
+   738→    }
+   739→    state.hydrated = true;
+   740→    console.log("[l2-monitor] hydrated from DB —", rows.length, "rows");
+   741→  } catch (e) {
+   742→    // Swallow — fall back to fresh in-memory state
+   743→    state.hydrated = true;
+   744→    console.warn("[l2-monitor] hydrate failed (starting fresh):", e instanceof Error ? e.message : e);
+   745→  }
+   746→}
+   747→
+   748→// Reset monitor state (useful for testing / admin reset). Also clears DB.
+   749→export async function resetL2Monitor(): Promise<void> {
+   750→  const state = getState();
+   751→  state.pairs.clear();
+   752→  state.schedulerRunning = false;
+   753→  state.lastSchedulerTickAt = null;
+   754→  state.circuit = freshCircuit();
+   755→  state.pairCircuits.clear();
+   756→  state.lastNotifiedAlerts.clear();
+   757→  state.persistedAt = null;
+   758→  state.hydrated = true;
+   759→  for (const p of TRACKED_PAIRS) {
+   760→    state.pairs.set(p, {
+   761→      pair: p,
+   762→      lastSuccessAt: null,
+   763→      lastFailureAt: null,
+   764→      lastError: null,
+   765→      lastErrorAt: null,
+   766→      consecutiveFailures: 0,
+   767→      totalAttempts: 0,
+   768→      totalSuccesses: 0,
+   769→      totalFailures: 0,
+   770→      lastSnapshotCount: 0,
+   771→      lastAgeSec: null,
+   772→      lastRetriesUsed: 0,
+   773→      history: [],
+   774→    });
+   775→  }
+   776→  try {
+   777→    await db.l2CollectorHealth.deleteMany();
+   778→  } catch { /* ignore */ }
+   779→}
+   780→
+   781→export const L2_RUNBOOK_SECTIONS = RUNBOOK;
+   782→
