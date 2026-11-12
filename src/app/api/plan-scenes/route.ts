@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
+import { withZaiRetry, getZaiConfigStatus } from "@/lib/zai";
 import { buildPlanPrompt, decorateVisualPrompt, extractJson, normalizeScenes } from "@/lib/storybook/prompt";
 import type { PlanRequest, PlanResponse } from "@/lib/storybook/types";
 
@@ -22,14 +22,16 @@ export async function POST(req: NextRequest) {
       style: body.style,
     });
 
-    const zai = await ZAI.create();
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "assistant", content: system },
-        { role: "user", content: user },
-      ],
-      thinking: { type: "disabled" },
-    });
+    const completion = await withZaiRetry(
+      (zai) => zai.chat.completions.create({
+        messages: [
+          { role: "assistant", content: system },
+          { role: "user", content: user },
+        ],
+        thinking: { type: "disabled" },
+      }),
+      { maxRetries: 2, retryDelayMs: 1500 },
+    );
 
     const raw = completion.choices[0]?.message?.content ?? "";
     let payload: unknown;
@@ -58,6 +60,15 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     console.error("[plan-scenes] error", err);
     const msg = err instanceof Error ? err.message : "Scene planning failed.";
+    if (msg.includes("401") && msg.includes("X-Token")) {
+      const status = await getZaiConfigStatus();
+      return NextResponse.json({
+        error: "ZAI API rejected request: missing X-Token header",
+        detail: "The /etc/.z-ai-config file is missing the `token` field, or the sandbox is mid-refresh.",
+        configStatus: status,
+        retryable: true,
+      }, { status: 502 });
+    }
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

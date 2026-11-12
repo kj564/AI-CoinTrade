@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
+import { withZaiRetry, getZaiConfigStatus } from "@/lib/zai";
 import fs from "fs";
 import path from "path";
 import type { GenerateNarrationRequest, VoiceId } from "@/lib/storybook/types";
@@ -48,7 +48,6 @@ export async function POST(req: NextRequest) {
     ensureDir();
 
     const chunks = splitText(text);
-    const zai = await ZAI.create();
 
     const buffers: Buffer[] = [];
     for (let i = 0; i < chunks.length; i++) {
@@ -58,13 +57,17 @@ export async function POST(req: NextRequest) {
       // retry up to 3 times with backoff (the TTS endpoint can rate-limit)
       for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
         try {
-          const response = await zai.audio.tts.create({
-            input: chunk,
-            voice,
-            speed: 0.95,
-            response_format: "wav",
-            stream: false,
-          });
+          // Use withZaiRetry to re-create the ZAI instance on 401 (config-refresh race)
+          const response = await withZaiRetry(
+            (zai) => zai.audio.tts.create({
+              input: chunk,
+              voice,
+              speed: 0.95,
+              response_format: "wav",
+              stream: false,
+            }),
+            { maxRetries: 1, retryDelayMs: 1500 },
+          );
           const ab = await response.arrayBuffer();
           buffers.push(Buffer.from(new Uint8Array(ab)));
           ok = true;
@@ -83,6 +86,15 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     console.error("[generate-narration] error", err);
     const msg = err instanceof Error ? err.message : "Narration generation failed.";
+    if (msg.includes("401") && msg.includes("X-Token")) {
+      const status = await getZaiConfigStatus();
+      return NextResponse.json({
+        error: "ZAI API rejected request: missing X-Token header",
+        detail: "The /etc/.z-ai-config file is missing the `token` field, or the sandbox is mid-refresh.",
+        configStatus: status,
+        retryable: true,
+      }, { status: 502 });
+    }
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

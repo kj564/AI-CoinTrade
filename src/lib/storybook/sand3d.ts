@@ -1,4 +1,4 @@
-import ZAI from "z-ai-web-dev-sdk";
+import { withZaiRetry } from "@/lib/zai";
 import fs from "fs";
 import path from "path";
 import { execFileSync } from "child_process";
@@ -100,7 +100,6 @@ export async function authorSand3dProgram(
   const programFile = `${slug}.mjs`;
   const tmpPath = path.join(SAND3D_PROPS_DIR, programFile);
 
-  const zai = await ZAI.create();
   const messages: { role: "assistant" | "user"; content: string }[] = [
     { role: "assistant", content: SYSTEM_PROMPT },
     {
@@ -118,7 +117,10 @@ Write the JS module now.`,
   let lastError = "";
   const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const completion = await zai.chat.completions.create({ messages, thinking: { type: "disabled" } });
+    const completion = await withZaiRetry(
+      (zai) => zai.chat.completions.create({ messages, thinking: { type: "disabled" } }),
+      { maxRetries: 2, retryDelayMs: 1500 },
+    );
     let candidate = (completion.choices[0]?.message?.content ?? "").trim();
     const fence = candidate.match(/```(?:javascript|js)?\s*([\s\S]*?)```/i);
     if (fence) candidate = fence[1].trim();

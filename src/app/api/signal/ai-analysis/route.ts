@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
+import { withZaiRetry, getZaiConfigStatus } from "@/lib/zai";
 
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -11,8 +11,6 @@ export async function POST(req: Request) {
   try {
     const data = await req.json();
     if (!data) return NextResponse.json({ error: "signal data required" }, { status: 400 });
-
-    const zai = await ZAI.create();
 
     const systemPrompt = `You are a multi-agent crypto trading desk for INDODAX (Indonesian crypto exchange). Analyze market data from 4 specialist perspectives, then synthesize a final recommendation.
 
@@ -75,19 +73,39 @@ ${data.volumeWarning ? `VOLUME WARNING: ${data.volumeWarning}` : ""}
 
 Analyze this data from all 4 perspectives and give a final recommendation.`;
 
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "assistant", content: systemPrompt },
-        { role: "user", content: userData },
-      ],
-      thinking: { type: "disabled" },
-    });
+    const completion = await withZaiRetry(
+      (zai) => zai.chat.completions.create({
+        messages: [
+          { role: "assistant", content: systemPrompt },
+          { role: "user", content: userData },
+        ],
+        thinking: { type: "disabled" },
+      }),
+      { maxRetries: 2, retryDelayMs: 1500 },
+    );
 
     const analysis = completion.choices[0]?.message?.content;
     if (!analysis) return NextResponse.json({ error: "LLM returned empty response" }, { status: 500 });
 
     return NextResponse.json({ success: true, analysis, timestamp: new Date().toISOString() });
   } catch (e) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : "AI analysis failed" }, { status: 500 });
+    // On 401 "missing X-Token header", provide a clear diagnostic so operators
+    // know to check /etc/.z-ai-config rather than thinking the app is broken.
+    const msg = e instanceof Error ? e.message : "AI analysis failed";
+    if (msg.includes("401") && msg.includes("X-Token")) {
+      const status = await getZaiConfigStatus();
+      return NextResponse.json({
+        error: "ZAI API rejected request: missing X-Token header",
+        detail: "The /etc/.z-ai-config file is missing the `token` field, or the sandbox is mid-refresh of the config. The route auto-retries 2× with 1.5s backoff; if it still fails, the config file needs a valid JWT token.",
+        configStatus: status,
+        hint: status.found
+          ? (status.hasToken
+            ? "Token is present in config but was rejected — it may be expired. Wait for the sandbox to refresh it, or check /api/zai/health."
+            : "Token field is MISSING from config. The SDK skips the X-Token header when token is empty. Wait for the sandbox to refresh /etc/.z-ai-config.")
+          : "No .z-ai-config file found. The sandbox should create /etc/.z-ai-config automatically.",
+        retryable: true,
+      }, { status: 502 });
+    }
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
