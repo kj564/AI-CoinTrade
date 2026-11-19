@@ -1,477 +1,357 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect } from "react";
 
-// ── PSYOP//TERMINAL ──
-// This is not a trading dashboard. This is a behavioral confrontation system.
-// The market is the stage. YOU are the subject.
-//
-// Design principles (brutalist anti-design):
-//   - No green for profit. Only losses have visual presence.
-//   - The tilt score pulsates. When it's high, the UI glitches.
-//   - The confession gate blocks execution. You must articulate before you act.
-//   - The shadow self tells you what your pattern says you'll do.
-//   - The pain engine makes losses visceral (meals, hours, labor).
+// ── ALPHA SIGNAL DASHBOARD ──
+// Real edges: funding contrarian + volatility scaling + regime routing + Kelly.
+// NOT the old indicator-based advisor (proven noise).
+// Each signal has: entry, stop (2 ATR), targets (1.5R/3R), position size,
+// regime-matched backtest, invalidation criteria.
 
-interface TiltData {
-  total: number;
-  factors: {
-    tradeFrequency: number;
-    lossStreak: number;
-    planDeviation: number;
-    sessionFatigue: number;
-    confessionDecay: number;
-    revengeWindow: number;
+interface AlphaSignal {
+  pair: string;
+  action: "LONG" | "SHORT" | "REDUCE" | "FLAT" | "CLOSE";
+  strength: string;
+  conviction: number;
+  entry: number;
+  stopLoss: number;
+  takeProfit1: number;
+  takeProfit2: number;
+  positionSizePct: number;
+  positionSizeIdr: number;
+  rewardRiskRatio: number;
+  edges: { funding: string; regime: string; volatility: string; trend: string };
+  backtest: {
+    winRate: number;
+    avgReturn: number;
+    avgHoldHours: number;
+    sampleSize: number;
+    maxDrawdown: number;
+    sharpeRatio: number;
+    regimeMatched: string;
   };
-  state: "calm" | "elevated" | "tilted" | "friction" | "lockdown";
-  recommendation: string;
-}
-
-interface ShadowData {
-  predictedAction: string;
-  confidence: number;
-  sampleSize: number;
-  pattern: string;
-  historicalMatches: number;
-  shadowVerdict: string;
-  currentTilt: number;
-}
-
-interface ConfessionResult {
-  classification: string;
-  wordCount: number;
-  signals: any;
-  tiltContribution: number;
-  verdict: string;
-  executeDenied: boolean;
-  denialReason: string | null;
-}
-
-interface ProfileData {
-  profile: {
-    totalIntentions: number;
-    totalExecutions: number;
-    totalDeviations: number;
-    currentTilt: number;
-    maxTilt: number;
-    planAdherenceRate: number;
-    tiltState: string;
+  rationale: string[];
+  invalidation: string;
+  warning: string | null;
+  raw: {
+    price: number;
+    atr: number;
+    atrPercent: number;
+    rsi: number;
+    adx: number;
+    fundingRate: number;
+    fundingPercentile: number;
+    regime: string;
   };
-  badges: { id: string; label: string; severity: string; description: string; earned: boolean }[];
-  recentConfessions: { id: string; text: string; classified: string; wordCount: number }[];
 }
 
-export default function PsyopTerminal() {
-  const [tilt, setTilt] = useState<TiltData | null>(null);
-  const [shadow, setShadow] = useState<ShadowData | null>(null);
-  const [profile, setProfile] = useState<ProfileData | null>(null);
-  const [price, setPrice] = useState<number | null>(null);
-  const [pair, setPair] = useState("btc_idr");
-  const [capital] = useState(10000000);
+interface AlphaResult {
+  signals: AlphaSignal[];
+  portfolioAllocation: { pair: string; action: string; allocationPct: number }[];
+  capitalAtRisk: number;
+  regimeSummary: string;
+  generatedAt: string;
+  disclaimer: string;
+}
 
-  // Confession state
-  const [confessionText, setConfessionText] = useState("");
-  const [confessionResult, setConfessionResult] = useState<ConfessionResult | null>(null);
-  const [confessing, setConfessing] = useState(false);
+export default function AlphaDashboard() {
+  const [data, setData] = useState<AlphaResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [capital, setCapital] = useState(10000000);
 
-  // Glitch state — intensifies with tilt
-  const [glitchKey, setGlitchKey] = useState(0);
-
-  const fetchAll = useCallback(async () => {
+  const fetchSignals = async () => {
+    setLoading(true);
     try {
-      const [tiltRes, shadowRes, profileRes, marketRes] = await Promise.all([
-        fetch("/api/psyop/tilt").then((r) => r.json()),
-        fetch("/api/psyop/shadow").then((r) => r.json()),
-        fetch("/api/psyop/profile").then((r) => r.json()),
-        fetch(`/api/psyop/market?pair=${pair}&capital=${capital}`).then((r) => r.json()),
-      ]);
-      if (tiltRes.total !== undefined) setTilt(tiltRes);
-      if (shadowRes.predictedAction) setShadow(shadowRes);
-      if (profileRes.profile) setProfile(profileRes);
-      if (marketRes.currentPrice) setPrice(marketRes.currentPrice);
+      const r = await fetch(`/api/signal/alpha?capital=${capital}`);
+      const d = await r.json();
+      setData(d);
     } catch { /* ignore */ }
-  }, [pair, capital]);
+    setLoading(false);
+  };
 
   useEffect(() => {
     let active = true;
     const doFetch = async () => {
+      setLoading(true);
       try {
-        const [tiltRes, shadowRes, profileRes, marketRes] = await Promise.all([
-          fetch("/api/psyop/tilt").then((r) => r.json()),
-          fetch("/api/psyop/shadow").then((r) => r.json()),
-          fetch("/api/psyop/profile").then((r) => r.json()),
-          fetch(`/api/psyop/market?pair=${pair}&capital=${capital}`).then((r) => r.json()),
-        ]);
-        if (!active) return;
-        if (tiltRes.total !== undefined) setTilt(tiltRes);
-        if (shadowRes.predictedAction) setShadow(shadowRes);
-        if (profileRes.profile) setProfile(profileRes);
-        if (marketRes.currentPrice) setPrice(marketRes.currentPrice);
+        const r = await fetch(`/api/signal/alpha?capital=${capital}`);
+        const d = await r.json();
+        if (active) setData(d);
       } catch { /* ignore */ }
+      if (active) setLoading(false);
     };
     doFetch();
-    const interval = setInterval(doFetch, 15000);
+    const interval = setInterval(doFetch, 60000);
     return () => { active = false; clearInterval(interval); };
-  }, [pair, capital]);
+  }, [capital]);
 
-  // Glitch effect intensifies with tilt
-  useEffect(() => {
-    if (!tilt) return;
-    const intensity = tilt.total;
-    if (intensity > 60) {
-      const glitchInterval = setInterval(() => setGlitchKey((k) => k + 1), 800 - intensity * 5);
-      return () => clearInterval(glitchInterval);
-    }
-  }, [tilt?.total]);
+  const fmtIdr = (n: number) => "Rp " + n.toLocaleString("id-ID", { maximumFractionDigits: 0 });
+  const fmtPct = (n: number, dp = 2) => `${(n * 100).toFixed(dp)}%`;
 
-  const submitConfession = async () => {
-    if (confessionText.trim().split(/\s+/).filter(Boolean).length < 20) {
-      setConfessionResult({
-        classification: "rejected",
-        wordCount: confessionText.trim().split(/\s+/).filter(Boolean).length,
-        signals: {},
-        tiltContribution: 10,
-        verdict: `MINIMUM 20 WORDS. You wrote ${confessionText.trim().split(/\s+/).filter(Boolean).length}. If you can't articulate 20 words of reasoning, you haven't thought it through. This is impulse wearing a costume.`,
-        executeDenied: true,
-        denialReason: "Confession too short — minimum 20 words required.",
-      });
-      return;
-    }
-    setConfessing(true);
-    try {
-      const res = await fetch("/api/psyop/confess", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: confessionText, pair }),
-      });
-      const data = await res.json();
-      setConfessionResult(data);
-      fetchAll();
-    } catch { /* ignore */ }
-    setConfessing(false);
-  };
+  const actionColor = (a: string) =>
+    a === "LONG" ? "#16a34a"
+    : a === "SHORT" ? "#dc2626"
+    : a === "REDUCE" ? "#f59e0b"
+    : a === "CLOSE" ? "#f59e0b"
+    : "#6b7280";
 
-  const tiltColor = (t: number) => {
-    if (t >= 85) return "#ff0000";
-    if (t >= 70) return "#ff3300";
-    if (t >= 45) return "#ff6600";
-    if (t >= 25) return "#ffaa00";
-    return "#666";
-  };
-
-  const tiltState = tilt?.state ?? "calm";
-  const locked = tiltState === "lockdown";
-  const friction = tiltState === "friction";
+  const activeSignals = data?.signals.filter((s) => s.action === "LONG" || s.action === "SHORT") ?? [];
+  const flatSignals = data?.signals.filter((s) => s.action === "FLAT") ?? [];
 
   return (
-    <div
-      key={glitchKey}
-      style={{
-        background: "#000",
-        color: "#ccc",
-        fontFamily: "monospace",
-        minHeight: "100vh",
-        padding: "20px",
-        maxWidth: "900px",
-        margin: "0 auto",
-      }}
-    >
-      {/* Glitch overlay when tilted */}
-      {tilt && tilt.total > 60 && (
-        <style>{`
-          @keyframes glitch {
-            0% { transform: translate(0); filter: hue-rotate(0deg); }
-            20% { transform: translate(-${tilt.total > 80 ? 3 : 1}px, ${tilt.total > 80 ? 2 : 1}px); }
-            40% { transform: translate(${tilt.total > 80 ? 2 : 1}px, -${tilt.total > 80 ? 2 : 1}px); filter: hue-rotate(${tilt.total}deg); }
-            60% { transform: translate(-1px, 1px); }
-            80% { transform: translate(1px, -1px); filter: hue-rotate(-${tilt.total}deg); }
-            100% { transform: translate(0); filter: hue-rotate(0deg); }
-          }
-          * { animation: glitch ${(100 - tilt.total) / 20}s infinite; }
-        `}</style>
-      )}
-
-      {/* HEADER */}
-      <header style={{ borderBottom: "1px solid #333", paddingBottom: "10px", marginBottom: "20px" }}>
-        <h1 style={{ fontSize: "28px", fontWeight: "bold", letterSpacing: "-1px", margin: 0 }}>
-          PSYOP<span style={{ color: "#ff0000" }}>{"//"}</span>TERMINAL
-        </h1>
-        <p style={{ fontSize: "11px", color: "#666", margin: "4px 0 0" }}>
-          the market is the stage. <span style={{ color: "#999" }}>you are the subject.</span>
-        </p>
-      </header>
-
-      {/* TILT SCORE — full-width, pulsating */}
-      <section style={{ marginBottom: "24px" }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "baseline",
-            gap: "12px",
-            padding: "16px 0",
-            borderBottom: `2px solid ${tiltColor(tilt?.total ?? 0)}`,
-          }}
-        >
-          <span style={{ fontSize: "11px", color: "#666", textTransform: "uppercase" }}>Tilt Index</span>
-          <span
-            style={{
-              fontSize: "72px",
-              fontWeight: "bold",
-              color: tiltColor(tilt?.total ?? 0),
-              lineHeight: 1,
-              textShadow: tilt && tilt.total > 60 ? `0 0 ${tilt.total / 3}px ${tiltColor(tilt.total)}` : "none",
-            }}
-          >
-            {tilt?.total.toFixed(0) ?? "--"}
-          </span>
-          <span style={{ fontSize: "14px", color: "#666" }}>/100</span>
-          <span
-            style={{
-              marginLeft: "auto",
-              fontSize: "10px",
-              textTransform: "uppercase",
-              letterSpacing: "2px",
-              padding: "4px 8px",
-              border: `1px solid ${tiltColor(tilt?.total ?? 0)}`,
-              color: tiltColor(tilt?.total ?? 0),
-            }}
-          >
-            {tiltState}
-          </span>
-        </div>
-
-        {/* Tilt breakdown */}
-        {tilt && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "4px", marginTop: "8px", fontSize: "10px" }}>
-            {[
-              ["trade freq", tilt.factors.tradeFrequency, 25],
-              ["loss streak", tilt.factors.lossStreak, 25],
-              ["plan dev", tilt.factors.planDeviation, 20],
-              ["fatigue", tilt.factors.sessionFatigue, 15],
-              ["confession", tilt.factors.confessionDecay, 10],
-              ["revenge", tilt.factors.revengeWindow, 5],
-            ].map(([label, val, max]) => (
-              <div key={label as string} style={{ color: "#666" }}>
-                {label}: <span style={{ color: tiltColor(val as number) }}>{val}</span>/{max}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {tilt && (
-          <p style={{ fontSize: "12px", color: tiltColor(tilt.total), marginTop: "8px", lineHeight: 1.4 }}>
-            {tilt.recommendation}
+    <div style={{ minHeight: "100vh", background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ maxWidth: "1200px", margin: "0 auto", padding: "24px 16px" }}>
+        {/* HEADER */}
+        <header style={{ marginBottom: "32px", borderBottom: "1px solid #262626", paddingBottom: "16px" }}>
+          <h1 style={{ fontSize: "28px", fontWeight: 700, margin: 0, letterSpacing: "-0.5px" }}>
+            Alpha Signal Terminal
+          </h1>
+          <p style={{ fontSize: "13px", color: "#737373", margin: "6px 0 0" }}>
+            Funding contrarian + volatility scaling + regime routing + fractional Kelly.
+            Real edges, honest backtests, risk-managed signals.
           </p>
-        )}
-      </section>
+        </header>
 
-      {/* MARKET — stated flatly, no celebration */}
-      <section style={{ marginBottom: "24px", padding: "12px", border: "1px solid #222", background: "#0a0a0a" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-          <span style={{ fontSize: "11px", color: "#666", textTransform: "uppercase" }}>{pair}</span>
-          <span style={{ fontSize: "20px", color: "#ccc" }}>
-            Rp {price ? price.toLocaleString("id-ID", { maximumFractionDigits: 0 }) : "---"}
-          </span>
-        </div>
-        <p style={{ fontSize: "10px", color: "#444", margin: "6px 0 0" }}>
-          the price is the price. it has no opinion about you.
-        </p>
-      </section>
-
-      {/* SHADOW SELF */}
-      {shadow && (
-        <section style={{ marginBottom: "24px", padding: "16px", border: `1px solid ${shadow.confidence > 0.6 ? "#ff3300" : "#333"}`, background: "#0a0a0a" }}>
-          <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: "8px" }}>
-            Shadow Self <span style={{ color: "#444" }}>(your behavioral pattern)</span>
-          </div>
-          <div style={{ fontSize: "16px", color: "#ccc", marginBottom: "8px" }}>
-            <span style={{ color: "#ff3300", fontWeight: "bold" }}>{shadow.predictedAction.replace(/_/g, " ")}</span>
-            <span style={{ color: "#666", fontSize: "11px", marginLeft: "8px" }}>
-              {shadow.confidence > 0 ? `${Math.round(shadow.confidence * 100)}% confidence · ${shadow.historicalMatches} matches` : ""}
-            </span>
-          </div>
-          <p style={{ fontSize: "12px", color: "#999", lineHeight: 1.5 }}>{shadow.shadowVerdict}</p>
-          {shadow.pattern !== "insufficient data" && (
-            <p style={{ fontSize: "10px", color: "#444", marginTop: "6px", fontFamily: "monospace" }}>
-              pattern: {shadow.pattern} · sample: {shadow.sampleSize}
-            </p>
-          )}
-        </section>
-      )}
-
-      {/* CONFESSION GATE */}
-      <section style={{ marginBottom: "24px" }}>
-        <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: "8px", borderBottom: "1px solid #222", paddingBottom: "4px" }}>
-          Confession Gate <span style={{ color: "#444" }}>(required before execution)</span>
-        </div>
-
-        <textarea
-          value={confessionText}
-          onChange={(e) => setConfessionText(e.target.value)}
-          placeholder="Type at least 20 words explaining WHY this trade fits your plan. What setup? What level? What risk? If you can't articulate it, don't execute it."
-          disabled={locked}
-          style={{
-            width: "100%",
-            minHeight: "100px",
-            background: "#0a0a0a",
-            border: `1px solid ${locked ? "#ff0000" : "#333"}`,
-            color: "#ccc",
-            fontFamily: "monospace",
-            fontSize: "12px",
-            padding: "12px",
-            resize: "vertical",
-            outline: "none",
-          }}
-        />
-
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "8px" }}>
-          <span style={{ fontSize: "10px", color: confessionText.trim().split(/\s+/).filter(Boolean).length >= 20 ? "#666" : "#ff3300" }}>
-            {confessionText.trim().split(/\s+/).filter(Boolean).length} words {confessionText.trim().split(/\s+/).filter(Boolean).length >= 20 ? "✓" : "(need 20)"}
-          </span>
-
-          <button
-            onClick={submitConfession}
-            disabled={locked || confessing || confessionText.trim().split(/\s+/).filter(Boolean).length < 20}
-            style={{
-              padding: "8px 24px",
-              background: locked ? "#1a0000" : friction ? "#1a0a00" : "#111",
-              border: `1px solid ${locked ? "#ff0000" : friction ? "#ff6600" : "#333"}`,
-              color: locked ? "#ff0000" : friction ? "#ff6600" : "#ccc",
-              fontFamily: "monospace",
-              fontSize: "12px",
-              cursor: locked ? "not-allowed" : "pointer",
-              textTransform: "uppercase",
-              letterSpacing: "2px",
-            }}
-          >
-            {locked ? "LOCKED" : friction ? "EXECUTE (FRICTION)" : "EXECUTE"}
-          </button>
-        </div>
-
-        {/* Confession verdict */}
-        {confessionResult && (
-          <div
-            style={{
-              marginTop: "12px",
-              padding: "12px",
-              border: `1px solid ${
-                confessionResult.classification === "tilt_driven" ? "#ff0000"
-                : confessionResult.classification === "plan_driven" ? "#333"
-                : "#ff6600"
-              }`,
-              background: "#0a0a0a",
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
-              <span style={{ fontSize: "11px", textTransform: "uppercase", color: "#666" }}>
-                classified: <span style={{
-                  color:
-                    confessionResult.classification === "tilt_driven" ? "#ff0000"
-                    : confessionResult.classification === "plan_driven" ? "#ccc"
-                    : "#ff6600",
-                  fontWeight: "bold",
-                }}>{confessionResult.classification.replace(/_/g, " ")}</span>
-              </span>
-              {confessionResult.executeDenied && (
-                <span style={{ fontSize: "11px", color: "#ff0000", fontWeight: "bold" }}>EXECUTE DENIED</span>
-              )}
-            </div>
-            <p style={{ fontSize: "12px", color: "#ccc", lineHeight: 1.5 }}>{confessionResult.verdict}</p>
-            {confessionResult.denialReason && (
-              <p style={{ fontSize: "11px", color: "#ff3300", marginTop: "6px" }}>{confessionResult.denialReason}</p>
-            )}
-          </div>
-        )}
-      </section>
-
-      {/* BADGES — inverted gamification */}
-      {profile && profile.badges.length > 0 && (
-        <section style={{ marginBottom: "24px" }}>
-          <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: "8px", borderBottom: "1px solid #222", paddingBottom: "4px" }}>
-            Behavioral Badges <span style={{ color: "#444" }}>(earned for bad patterns)</span>
-          </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-            {profile.badges.filter((b) => b.earned).map((b) => (
-              <span
-                key={b.id}
-                title={b.description}
-                style={{
-                  fontSize: "10px",
-                  textTransform: "uppercase",
-                  letterSpacing: "1px",
-                  padding: "4px 8px",
-                  border: `1px solid ${b.severity === "critical" ? "#ff0000" : b.severity === "error" ? "#ff3300" : b.severity === "warn" ? "#ff6600" : "#333"}`,
-                  color: b.severity === "critical" ? "#ff0000" : b.severity === "error" ? "#ff3300" : b.severity === "warn" ? "#ff6600" : "#ccc",
-                }}
-              >
-                {b.label}
-              </span>
-            ))}
-            {profile.badges.filter((b) => b.earned).length === 0 && (
-              <span style={{ fontSize: "11px", color: "#444" }}>no badges earned. keep it that way.</span>
-            )}
-          </div>
-        </section>
-      )}
-
-      {/* PROFILE STATS */}
-      {profile && (
-        <section style={{ marginBottom: "24px", padding: "12px", border: "1px solid #222", background: "#0a0a0a" }}>
-          <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: "8px" }}>Your Numbers</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "8px", fontSize: "12px" }}>
-            <div>
-              <div style={{ color: "#666", fontSize: "10px" }}>Intentions</div>
-              <div style={{ color: "#ccc", fontSize: "18px" }}>{profile.profile.totalIntentions}</div>
-            </div>
-            <div>
-              <div style={{ color: "#666", fontSize: "10px" }}>Executions</div>
-              <div style={{ color: "#ccc", fontSize: "18px" }}>{profile.profile.totalExecutions}</div>
-            </div>
-            <div>
-              <div style={{ color: "#666", fontSize: "10px" }}>Deviations</div>
-              <div style={{ color: profile.profile.totalDeviations > 0 ? "#ff3300" : "#ccc", fontSize: "18px" }}>{profile.profile.totalDeviations}</div>
-            </div>
-            <div>
-              <div style={{ color: "#666", fontSize: "10px" }}>Max Tilt</div>
-              <div style={{ color: tiltColor(profile.profile.maxTilt), fontSize: "18px" }}>{profile.profile.maxTilt.toFixed(0)}</div>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* RECENT CONFESSIONS */}
-      {profile && profile.recentConfessions.length > 0 && (
-        <section style={{ marginBottom: "24px" }}>
-          <div style={{ fontSize: "11px", color: "#666", textTransform: "uppercase", marginBottom: "8px", borderBottom: "1px solid #222", paddingBottom: "4px" }}>
-            Your Own Words <span style={{ color: "#444" }}>(recent confessions)</span>
-          </div>
-          <div style={{ maxHeight: "200px", overflowY: "auto" }}>
-            {profile.recentConfessions.map((c) => (
-              <div key={c.id} style={{ padding: "6px 0", borderBottom: "1px solid #111", fontSize: "11px" }}>
-                <span style={{
-                  color:
-                    c.classified === "tilt_driven" ? "#ff0000"
-                    : c.classified === "plan_driven" ? "#666"
-                    : "#ff6600",
-                  fontWeight: "bold",
-                  textTransform: "uppercase",
-                  marginRight: "8px",
-                }}>
-                  [{c.classified.replace(/_/g, " ")}]
-                </span>
-                <span style={{ color: "#888" }}>{c.text}</span>
-                <span style={{ color: "#333", marginLeft: "6px" }}>· {c.wordCount}w</span>
+        {/* PORTFOLIO SUMMARY */}
+        {data && (
+          <section style={{ marginBottom: "32px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
+              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Capital at Risk</div>
+                <div style={{ fontSize: "28px", fontWeight: 700, color: data.capitalAtRisk > 0.04 ? "#f59e0b" : "#e5e5e5", marginTop: "4px" }}>
+                  {fmtPct(data.capitalAtRisk)}
+                </div>
+                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Max 6% (risk-managed)</div>
               </div>
-            ))}
-          </div>
-        </section>
-      )}
+              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Active Signals</div>
+                <div style={{ fontSize: "28px", fontWeight: 700, marginTop: "4px" }}>{activeSignals.length}</div>
+                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>{activeSignals.filter((s) => s.action === "LONG").length} long · {activeSignals.filter((s) => s.action === "SHORT").length} short</div>
+              </div>
+              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Flat (No Edge)</div>
+                <div style={{ fontSize: "28px", fontWeight: 700, color: "#525252", marginTop: "4px" }}>{flatSignals.length}</div>
+                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Not trading = valid position</div>
+              </div>
+              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Capital</div>
+                <input
+                  type="number"
+                  value={capital}
+                  onChange={(e) => setCapital(Math.max(100000, parseInt(e.target.value) || 10000000))}
+                  onBlur={fetchSignals}
+                  style={{ background: "transparent", border: "none", color: "#e5e5e5", fontSize: "20px", fontWeight: 700, width: "100%", outline: "none" }}
+                />
+                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Click to edit</div>
+              </div>
+            </div>
 
-      {/* FOOTER */}
-      <footer style={{ marginTop: "40px", paddingTop: "12px", borderTop: "1px solid #222", fontSize: "10px", color: "#333" }}>
-        <p>PSYOP{"//"}TERMINAL v1.0 — this system does not predict the market. it predicts you.</p>
-        <p style={{ marginTop: "4px" }}>the market is efficient. your psychology is not. that's the only edge.</p>
-      </footer>
+            {/* Regime summary */}
+            <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "12px 16px", marginTop: "12px" }}>
+              <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "4px" }}>Market Regime</div>
+              <div style={{ fontSize: "13px", color: "#a3a3a3" }}>{data.regimeSummary}</div>
+            </div>
+          </section>
+        )}
+
+        {/* ACTIVE SIGNALS */}
+        {data && activeSignals.length > 0 && (
+          <section style={{ marginBottom: "32px" }}>
+            <h2 style={{ fontSize: "16px", fontWeight: 600, marginBottom: "16px", color: "#e5e5e5" }}>
+              Active Signals <span style={{ color: "#525252", fontSize: "12px", fontWeight: 400 }}>({activeSignals.length})</span>
+            </h2>
+            <div style={{ display: "grid", gap: "16px" }}>
+              {activeSignals.map((s) => (
+                <SignalCard key={s.pair} signal={s} fmtIdr={fmtIdr} fmtPct={fmtPct} actionColor={actionColor} />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* FLAT SIGNALS (no edge — valid) */}
+        {data && flatSignals.length > 0 && (
+          <section style={{ marginBottom: "32px" }}>
+            <h2 style={{ fontSize: "16px", fontWeight: 600, marginBottom: "16px", color: "#737373" }}>
+              No Edge — Flat <span style={{ color: "#525252", fontSize: "12px", fontWeight: 400 }}>({flatSignals.length})</span>
+            </h2>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px" }}>
+              {flatSignals.map((s) => (
+                <div key={s.pair} style={{ background: "#111", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                    <span style={{ fontSize: "14px", fontWeight: 600 }}>{s.pair.toUpperCase()}</span>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#525252" }}>FLAT</span>
+                  </div>
+                  <div style={{ fontSize: "12px", color: "#737373" }}>
+                    <div>Price: {fmtIdr(s.raw.price)}</div>
+                    <div>Funding: {(s.raw.fundingRate * 100).toFixed(4)}% · ADX: {s.raw.adx.toFixed(0)} · RSI: {s.raw.rsi.toFixed(0)}</div>
+                    <div style={{ marginTop: "6px", color: "#525252" }}>{s.rationale[0]}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* DISCLAIMER */}
+        {data && (
+          <footer style={{ marginTop: "40px", paddingTop: "16px", borderTop: "1px solid #262626" }}>
+            <div style={{ fontSize: "11px", color: "#525252", lineHeight: 1.6, background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "8px", padding: "12px" }}>
+              <strong style={{ color: "#737373" }}>Disclaimer:</strong> {data.disclaimer}
+            </div>
+            <div style={{ fontSize: "11px", color: "#404040", marginTop: "8px", textAlign: "center" }}>
+              Generated: {data.generatedAt} · Next refresh: 60s
+              {loading && <span style={{ marginLeft: "8px", color: "#525252" }}>· refreshing…</span>}
+            </div>
+          </footer>
+        )}
+
+        {/* LOADING STATE */}
+        {!data && !loading && (
+          <div style={{ textAlign: "center", padding: "60px 0", color: "#525252" }}>
+            <button onClick={fetchSignals} style={{ padding: "12px 24px", background: "#171717", border: "1px solid #262626", borderRadius: "8px", color: "#e5e5e5", cursor: "pointer", fontSize: "14px" }}>
+              Generate Signals
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
+  signal: AlphaSignal;
+  fmtIdr: (n: number) => string;
+  fmtPct: (n: number, dp?: number) => string;
+  actionColor: (a: string) => string;
+}) {
+  const [showDetails, setShowDetails] = useState(false);
+
+  return (
+    <div style={{ background: "#141414", border: `1px solid ${actionColor(s.action)}40`, borderRadius: "8px", overflow: "hidden" }}>
+      {/* HEADER */}
+      <div style={{ padding: "16px", borderBottom: "1px solid #262626", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <span style={{ fontSize: "18px", fontWeight: 700 }}>{s.pair.toUpperCase()}</span>
+          <span style={{ fontSize: "14px", fontWeight: 700, color: actionColor(s.action), padding: "2px 10px", border: `1px solid ${actionColor(s.action)}`, borderRadius: "4px" }}>
+            {s.action}
+          </span>
+          <span style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase" }}>{s.strength}</span>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: "18px", fontWeight: 600 }}>{fmtIdr(s.entry)}</div>
+          <div style={{ fontSize: "11px", color: "#525252" }}>entry price</div>
+        </div>
+      </div>
+
+      {/* RISK PARAMETERS */}
+      <div style={{ padding: "16px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "12px", marginBottom: "16px" }}>
+          <div>
+            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Stop Loss</div>
+            <div style={{ fontSize: "15px", fontWeight: 600, color: "#dc2626" }}>{fmtIdr(s.stopLoss)}</div>
+            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.entry - s.stopLoss) / s.entry)} (2 ATR)</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Target 1 (1.5R)</div>
+            <div style={{ fontSize: "15px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(s.takeProfit1)}</div>
+            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.takeProfit1 - s.entry) / s.entry)}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Target 2 (3R)</div>
+            <div style={{ fontSize: "15px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(s.takeProfit2)}</div>
+            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.takeProfit2 - s.entry) / s.entry)}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Position Size</div>
+            <div style={{ fontSize: "15px", fontWeight: 600 }}>{fmtIdr(s.positionSizeIdr)}</div>
+            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(s.positionSizePct)} of capital</div>
+          </div>
+        </div>
+
+        {/* BACKTEST STATS */}
+        <div style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
+          <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
+            Regime-Matched Backtest <span style={{ color: "#404040" }}>(sample: {s.backtest.sampleSize})</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Win Rate</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.winRate > 0.5 ? "#16a34a" : "#dc2626" }}>
+                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.winRate, 0) : "—"}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Avg Return</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.avgReturn > 0 ? "#16a34a" : "#dc2626" }}>
+                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.avgReturn) : "—"}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Max DD</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: "#f59e0b" }}>
+                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.maxDrawdown) : "—"}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Sharpe</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.sharpeRatio > 1 ? "#16a34a" : "#737373" }}>
+                {s.backtest.sampleSize > 0 ? s.backtest.sharpeRatio.toFixed(1) : "—"}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* RATIONALE */}
+        <div style={{ marginBottom: "12px" }}>
+          <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "6px" }}>Rationale</div>
+          {s.rationale.map((r, i) => (
+            <div key={i} style={{ fontSize: "12px", color: "#a3a3a3", marginBottom: "3px", paddingLeft: "8px", borderLeft: "2px solid #262626" }}>
+              {r}
+            </div>
+          ))}
+        </div>
+
+        {/* WARNING */}
+        {s.warning && (
+          <div style={{ background: "#1a1000", border: "1px solid #f59e0b40", borderRadius: "6px", padding: "8px 12px", marginBottom: "12px" }}>
+            <span style={{ fontSize: "11px", color: "#f59e0b" }}>{s.warning}</span>
+          </div>
+        )}
+
+        {/* INVALIDATION */}
+        <div style={{ background: "#0f0a0a", border: "1px solid #dc262640", borderRadius: "6px", padding: "8px 12px", marginBottom: "12px" }}>
+          <span style={{ fontSize: "10px", color: "#dc2626", textTransform: "uppercase" }}>Invalidation: </span>
+          <span style={{ fontSize: "11px", color: "#a3a3a3" }}>{s.invalidation}</span>
+        </div>
+
+        {/* DETAILS TOGGLE */}
+        <button
+          onClick={() => setShowDetails(!showDetails)}
+          style={{ background: "transparent", border: "1px solid #262626", color: "#737373", padding: "4px 12px", borderRadius: "4px", fontSize: "11px", cursor: "pointer" }}
+        >
+          {showDetails ? "Hide" : "Show"} raw data + edges
+        </button>
+
+        {showDetails && (
+          <div style={{ marginTop: "12px", paddingTop: "12px", borderTop: "1px solid #262626" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "8px", marginBottom: "12px" }}>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>ATR: </span><span style={{ fontSize: "12px" }}>{s.raw.atr.toFixed(0)} ({s.raw.atrPercent.toFixed(2)}%)</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>RSI: </span><span style={{ fontSize: "12px" }}>{s.raw.rsi.toFixed(0)}</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>ADX: </span><span style={{ fontSize: "12px" }}>{s.raw.adx.toFixed(0)}</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding: </span><span style={{ fontSize: "12px" }}>{(s.raw.fundingRate * 100).toFixed(4)}%</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding %ile: </span><span style={{ fontSize: "12px" }}>{s.raw.fundingPercentile}</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>R:R: </span><span style={{ fontSize: "12px" }}>{s.rewardRiskRatio.toFixed(2)}:1</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Conviction: </span><span style={{ fontSize: "12px" }}>{s.conviction}/100</span></div>
+            </div>
+            <div style={{ fontSize: "11px", color: "#525252" }}>
+              <strong>Edges:</strong> funding={s.edges.funding} · regime={s.edges.regime} · vol={s.edges.volatility} · trend={s.edges.trend}
+            </div>
+            <div style={{ fontSize: "10px", color: "#404040", marginTop: "6px" }}>
+              Backtest match: {s.backtest.regimeMatched}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
