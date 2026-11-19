@@ -1,4 +1,4 @@
-// Binance Klines — historical OHLCV from Binance public API.
+// Binance Klines — historical OHLCV from Binance public API + staleness detection.
 //
 // INDODAX's public API only returns recent trades (~200), which aggregate
 // into very few candles. Binance's klines API returns up to 1000 historical
@@ -10,40 +10,63 @@
 import type { Candle } from "./backtest";
 
 const BINANCE_API = "https://api.binance.com/api/v3";
+// For 1h candles, a new candle appears every 3600s. The latest candle is the
+// current (unclosed) one — its openTime is the start of the current hour.
+// It's only truly stale if no new candle has appeared for > 65 minutes.
+const STALE_THRESHOLD_SEC = 3900; // 65 minutes — allows for API delay
 
 function pairToBinanceSymbol(pair: string): string {
   const coin = pair.replace("_idr", "").toUpperCase();
   return `${coin}USDT`;
 }
 
-// Fetch historical klines from Binance. Returns candles sorted oldest→newest.
-// interval: "1h", "4h", "1d", etc. limit: up to 1000.
-export async function getBinanceKlines(pair: string, interval: "1h" | "4h" | "1d" = "1h", limit = 200): Promise<Candle[]> {
+export interface KlinesResult {
+  candles: Candle[];
+  stale: boolean;          // true if latest candle is older than STALE_THRESHOLD_SEC
+  latestCandleTime: number; // unix sec of latest candle
+  ageSec: number;          // seconds since latest candle
+  source: "binance" | "fallback" | "none";
+}
+
+// Fetch historical klines from Binance with staleness check.
+// Returns candles + staleness metadata. If Binance fails, returns empty + stale=true.
+export async function getBinanceKlinesWithMeta(pair: string, interval: "1h" | "4h" | "1d" = "1h", limit = 200): Promise<KlinesResult> {
   const symbol = pairToBinanceSymbol(pair);
   try {
     const url = `${BINANCE_API}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const r = await fetch(url, { next: { revalidate: 60 } });
-    if (!r.ok) return [];
+    if (!r.ok) return { candles: [], stale: true, latestCandleTime: 0, ageSec: Infinity, source: "none" };
     const data = await r.json();
-    if (!Array.isArray(data)) return [];
-    // Binance klines format: [openTime, open, high, low, close, volume, closeTime, ...]
-    return data.map((k: any[]) => ({
-      time: Math.floor(k[0] / 1000), // ms → sec
+    if (!Array.isArray(data) || data.length === 0) return { candles: [], stale: true, latestCandleTime: 0, ageSec: Infinity, source: "none" };
+
+    const candles: Candle[] = data.map((k: any[]) => ({
+      time: Math.floor(k[0] / 1000),
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
       close: parseFloat(k[4]),
       volume: parseFloat(k[5]),
     }));
+
+    const now = Math.floor(Date.now() / 1000);
+    const latestTime = candles[candles.length - 1].time;
+    const ageSec = now - latestTime;
+    const stale = ageSec > STALE_THRESHOLD_SEC;
+
+    return { candles, stale, latestCandleTime: latestTime, ageSec, source: "binance" };
   } catch (e) {
     console.warn(`[binance] klines failed for ${pair}:`, e instanceof Error ? e.message : e);
-    return [];
+    return { candles: [], stale: true, latestCandleTime: 0, ageSec: Infinity, source: "none" };
   }
 }
 
+// Backward-compat: returns just the candles array (for callers that don't need staleness).
+export async function getBinanceKlines(pair: string, interval: "1h" | "4h" | "1d" = "1h", limit = 200): Promise<Candle[]> {
+  const result = await getBinanceKlinesWithMeta(pair, interval, limit);
+  return result.candles;
+}
+
 // Convert Binance USDT candles to IDR candles using a reference IDR price.
-// This preserves the price RELATIONSHIPS (for indicator calculation) while
-// expressing prices in IDR (for actionable entry/stop/target).
 export function convertKlinesToIdr(klines: Candle[], idrReferencePrice: number, usdtReferencePrice: number): Candle[] {
   if (usdtReferencePrice <= 0) return klines;
   const rate = idrReferencePrice / usdtReferencePrice;
@@ -56,3 +79,4 @@ export function convertKlinesToIdr(klines: Candle[], idrReferencePrice: number, 
     volume: c.volume,
   }));
 }
+

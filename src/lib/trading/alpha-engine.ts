@@ -34,9 +34,11 @@
 // backtested, edge-based signals with explicit invalidation criteria.
 
 import { ensureCandles } from "./candles";
-import { detectRegime, type RegimeInfo } from "./regime";
+import { detectRegime } from "./regime";
 import { getFundingRate, type FundingRateInfo } from "./funding";
-import { getBinanceKlines, convertKlinesToIdr } from "./binance-klines";
+import { getBinanceKlinesWithMeta, convertKlinesToIdr, type KlinesResult } from "./binance-klines";
+import { getMicrostructure, type MicrostructureData } from "./microstructure";
+import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
 import { getTicker } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
 
@@ -63,45 +65,66 @@ export interface AlphaSignal {
   pair: string;
   timestamp: string;
 
+  // === DATA QUALITY ===
+  dataStale: boolean;       // true if candle data is > 10min old
+  dataSource: string;       // "binance" | "fallback" | "stale"
+
   // === THE SIGNAL ===
   action: "LONG" | "SHORT" | "REDUCE" | "FLAT" | "CLOSE";
   strength: "strong" | "moderate" | "weak" | "none";
-  conviction: number; // 0-100, but NOT the old "confidence" — this is edge-weighted
+  conviction: number; // 0-100, edge-weighted
+  confirmed: boolean; // true ONLY if microstructure confirms (OI + absorption)
 
-  // === RISK PARAMETERS (the important part) ===
+  // === RISK PARAMETERS ===
   entry: number;
   stopLoss: number;
-  takeProfit1: number; // 1R target
-  takeProfit2: number; // 2R target (scale out)
-  positionSizePct: number; // % of portfolio to risk (NOT allocation — RISK)
-  positionSizeIdr: number; // IDR amount to allocate (based on capital)
+  takeProfit1: number;
+  takeProfit2: number;
+  positionSizePct: number;
+  positionSizeIdr: number;
+  notionalIdr: number;      // notional position value (entry × quantity)
+  notionalCapPct: number;   // notional as % of capital (capped at 30%)
+  leverage: number;         // notional / capital (capped at 3x)
   rewardRiskRatio: number;
 
-  // === EDGE SOURCES (why this signal exists) ===
+  // === EDGE SOURCES ===
   edges: {
     funding: "contrarian_short" | "contrarian_long" | "neutral";
+    fundingZScore: number;   // z-score of current funding vs 30d distribution
     regime: "trend_follow" | "mean_revert" | "no_trade";
     volatility: "low_vol_size_up" | "normal" | "high_vol_size_down";
     trend: "aligned" | "counter_trend" | "no_trend";
   };
 
-  // === HONEST BACKTEST (regime-matched) ===
+  // === MICROSTRUCTURE CONFIRMATION ===
+  microstructure: {
+    oiTrend: string;
+    oiChange4hPct: number;
+    cvd1h: number;
+    cvdDivergence: boolean;
+    absorptionDetected: boolean;
+    takerBuyRatio: number;
+    confirmation: string;
+  } | null;
+
+  // === WALK-FORWARD OOS BACKTEST ===
   backtest: {
-    winRate: number;     // 0-1
-    avgReturn: number;   // fraction (0.024 = +2.4%)
-    avgHoldHours: number;
-    sampleSize: number;
-    maxDrawdown: number; // fraction
-    sharpeRatio: number;
-    regimeMatched: string; // description of what was matched
+    oosWinRate: number;       // out-of-sample win rate
+    oosAvgReturn: number;
+    oosSampleSize: number;
+    oosSharpe: number;
+    oosMaxDrawdown: number;
+    kellyFraction: number;    // Kelly from OOS trades
+    inSampleWinRate: number;  // for comparison
+    overfitGap: number;       // in-sample - OOS (large = overfit)
+    honest: boolean;          // edge confirmed OOS
+    description: string;
   };
 
-  // === RATIONALE (transparent reasoning) ===
   rationale: string[];
   invalidation: string;
-  warning: string | null; // honest caveat
+  warning: string | null;
 
-  // === RAW DATA (for transparency) ===
   raw: {
     price: number;
     atr: number;
@@ -109,7 +132,8 @@ export interface AlphaSignal {
     rsi: number;
     adx: number;
     fundingRate: number;
-    fundingPercentile: number; // 0-100, where current funding sits vs 30d
+    fundingZScore: number;
+    fundingPercentile: number;
     regime: string;
   };
 }
@@ -171,35 +195,61 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
     capitalAtRisk: Math.min(totalRiskPct * riskScale, maxTotalRisk),
     regimeSummary,
     generatedAt: new Date().toISOString(),
-    disclaimer: "Signals are based on funding rate contrarian + volatility scaling + regime routing + fractional Kelly. Backtest stats are regime-matched, not cherry-picked. No signal guarantees profit. Trade at your own risk. Past performance does not guarantee future results.",
+    disclaimer: "Signals use z-score funding (pair-adaptive), microstructure confirmation (OI+CVD+absorption), walk-forward OOS validation, and fractional Kelly from OOS trades. Edge is only 'confirmed' if OOS win rate >50% and overfit gap <15%. No signal guarantees profit. Not financial advice.",
   };
 }
 
 async function generatePairSignal(pair: string, capitalIdr: number): Promise<AlphaSignal | null> {
-  // Fetch 500 1h klines from Binance (covers ~21 days). We resample to 1d
-  // internally to avoid a second API call (Binance rate-limits parallel reqs).
-  const [binance1h, ticker] = await Promise.all([
-    getBinanceKlines(pair, "1h", 500),
+  // Fetch 500 1h klines from Binance + staleness metadata + INDODAX ticker
+  const [klinesResult, ticker] = await Promise.all([
+    getBinanceKlinesWithMeta(pair, "1h", 500),
     getTicker(pair),
   ]);
 
-  if (binance1h.length < 50) {
+  // P6: DATA STALENESS — if Binance fails or data is old, try DB fallback
+  let candles1hSource = klinesResult.candles;
+  let dataSource = klinesResult.source;
+  let dataStale = klinesResult.stale;
+
+  if (candles1hSource.length < 50) {
+    // Fallback to INDODAX DB candles
     const { candles } = await ensureCandles(pair, "1h", 50);
     if (candles.length < 50) return null;
-    const dailyFallback = resample1hTo1d(candles);
-    return generateSignalFromCandles(pair, capitalIdr, candles, dailyFallback, null);
+    candles1hSource = candles;
+    dataSource = "fallback";
+    dataStale = false; // DB candles are at least recent
   }
 
-  // Resample 1h → 1d (24 1h candles = 1 1d candle)
-  const candles1d = resample1hTo1d(binance1h);
+  // Resample 1h → 1d (avoids second Binance API call)
+  const candles1dRaw = resample1hTo1d(candles1hSource);
 
-  // Convert USDT prices to IDR using current INDODAX ticker
+  // Convert USDT prices to IDR using INDODAX ticker
   const idrPrice = ticker?.last ?? 0;
-  const usdtRefPrice = binance1h[binance1h.length - 1].close;
-  const candles1h = idrPrice > 0 ? convertKlinesToIdr(binance1h, idrPrice, usdtRefPrice) : binance1h;
-  const candles1dIdr = idrPrice > 0 ? convertKlinesToIdr(candles1d, idrPrice, usdtRefPrice) : candles1d;
+  const usdtRefPrice = candles1hSource[candles1hSource.length - 1].close;
+  const candles1h = idrPrice > 0 ? convertKlinesToIdr(candles1hSource, idrPrice, usdtRefPrice) : candles1hSource;
+  const candles1d = idrPrice > 0 ? convertKlinesToIdr(candles1dRaw, idrPrice, usdtRefPrice) : candles1dRaw;
 
-  return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1dIdr, idrPrice || usdtRefPrice);
+  // Fetch funding + microstructure in parallel
+  const [funding, microstructure] = await Promise.all([
+    getFundingRate(pair),
+    getMicrostructure(pair, usdtRefPrice),
+  ]);
+
+  return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
+    dataSource: dataSource as string,
+    dataStale,
+    funding,
+    microstructure,
+    idrPrice: idrPrice || usdtRefPrice,
+  });
+}
+
+interface SignalContext {
+  dataSource: string;
+  dataStale: boolean;
+  funding: FundingRateInfo | null;
+  microstructure: MicrostructureData | null;
+  idrPrice: number;
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -221,341 +271,262 @@ function resample1hTo1d(candles1h: Candle[]): Candle[] {
   return Array.from(buckets.values()).sort((a, b) => a.time - b.time);
 }
 
-async function generateSignalFromCandles(pair: string, capitalIdr: number, candles1h: Candle[], candles1d: Candle[], refPrice: number): Promise<AlphaSignal | null> {
+async function generateSignalFromCandles(
+  pair: string,
+  capitalIdr: number,
+  candles1h: Candle[],
+  candles1d: Candle[],
+  ctx: SignalContext,
+): Promise<AlphaSignal | null> {
   if (candles1h.length < 50 || candles1d.length < 7) return null;
 
   const price = candles1h[candles1h.length - 1].close;
   const atr = calcATR(candles1h, 14);
   const atrPercent = (atr / price) * 100;
   const rsi = calcRSI(candles1h, 14);
-
-  // Regime detection
   const regime = detectRegime(candles1h, candles1d);
 
-  // Funding rate (the primary edge)
-  const funding = await getFundingRate(pair);
+  // P1: Z-SCORE FUNDING — pair-adaptive, not fixed threshold
+  const funding = ctx.funding;
   const fundingRate = funding?.current ?? 0;
   const fundingPct = funding?.currentPct ?? 0;
-  const fundingPercentile = computeFundingPercentile(fundingRate);
+  const fundingZScore = funding?.zScore ?? 0;
+  const fundingPercentile = funding?.percentile ?? 50;
 
-  // === EDGE 1: FUNDING RATE CONTRARIAN ===
   let fundingEdge: AlphaSignal["edges"]["funding"] = "neutral";
   if (funding) {
     if (funding.extremeHigh) fundingEdge = "contrarian_short";
     else if (funding.extremeLow) fundingEdge = "contrarian_long";
   }
 
-  // === EDGE 2: VOLATILITY SCALING ===
+  // VOLATILITY SCALING
   const atrRatio = regime.atrRatio;
   let volEdge: AlphaSignal["edges"]["volatility"] = "normal";
   let volScale = 1.0;
-  if (atrRatio > 1.5) {
-    volEdge = "high_vol_size_down";
-    volScale = 0.5; // halve position in high vol
-  } else if (atrRatio < 0.8) {
-    volEdge = "low_vol_size_up";
-    volScale = 1.3; // slight increase in low vol
-  }
+  if (atrRatio > 1.5) { volEdge = "high_vol_size_down"; volScale = 0.5; }
+  else if (atrRatio < 0.8) { volEdge = "low_vol_size_up"; volScale = 1.3; }
 
-  // === EDGE 3: REGIME ROUTING ===
+  // REGIME ROUTING
   let regimeEdge: AlphaSignal["edges"]["regime"] = "no_trade";
   if (regime.adx > 25) regimeEdge = "trend_follow";
   else if (regime.adx < 20) regimeEdge = "mean_revert";
 
-  // === DETERMINE ACTION ===
+  // DETERMINE ACTION
   let action: AlphaSignal["action"] = "FLAT";
   let strength: AlphaSignal["strength"] = "none";
   let conviction = 0;
-  let trendAligned = false;
   let trendEdge: AlphaSignal["edges"]["trend"] = "no_trend";
-
   const rationale: string[] = [];
   const dailyTrend = regime.dailyTrend;
 
-  // Check if funding + regime align
+  // P2: MICROSTRUCTURE CONFIRMATION — only allow contrarian fade if OI/absorption confirms
+  const micro = ctx.microstructure;
+  const microConfirmed = micro?.confirmation === "reversal_likely";
+  const momentumAlive = micro?.confirmation === "momentum_alive";
+
   if (fundingEdge === "contrarian_short" && (regimeEdge === "mean_revert" || dailyTrend === "bearish")) {
-    action = "SHORT";
-    strength = funding.extremeHigh ? "strong" : "moderate";
-    conviction = 60 + (fundingPercentile > 90 ? 15 : 0) + (regime.adx < 20 ? 10 : 0);
-    trendEdge = dailyTrend === "bearish" ? "aligned" : "counter_trend";
-    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = extreme positive → longs overlevered, contrarian SHORT`);
-    rationale.push(`Regime: ${regime.label} (ADX ${regime.adx.toFixed(0)}) → ${regimeEdge === "mean_revert" ? "mean-reversion favors fading" : "bearish trend aligned"}`);
+    // P2: Block fade if momentum is still alive (OI rising + strong CVD)
+    if (momentumAlive) {
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme → contrarian SHORT signal`);
+      rationale.push(`BLOCKED: Microstructure shows momentum alive (OI ${micro?.oiTrend} ${micro?.oiChange4hPct.toFixed(1)}%, CVD ${micro?.cvd1h > 0 ? "buy" : "sell"}). Blind fade = dangerous. Wait for OI to decline or absorption.`);
+    } else {
+      action = "SHORT";
+      strength = (funding.extremeHigh && microConfirmed) ? "strong" : funding.extremeHigh ? "moderate" : "weak";
+      conviction = 55 + (microConfirmed ? 15 : 0) + (fundingZScore > 2.5 ? 10 : 0);
+      trendEdge = dailyTrend === "bearish" ? "aligned" : "counter_trend";
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}, ${fundingPercentile.toFixed(0)}th %ile) → contrarian SHORT`);
+      if (microConfirmed) rationale.push(`CONFIRMED: Microstructure shows ${micro?.confirmation} — OI ${micro?.oiTrend}, ${micro?.absorptionDetected ? "absorption detected" : "CVD divergence"}`);
+      else rationale.push(`Microstructure: ${micro?.description ?? "no data"}`);
+    }
   } else if (fundingEdge === "contrarian_long" && (regimeEdge === "mean_revert" || dailyTrend === "bullish")) {
-    action = "LONG";
-    strength = funding.extremeLow ? "strong" : "moderate";
-    conviction = 60 + (fundingPercentile < 10 ? 15 : 0) + (regime.adx < 20 ? 10 : 0);
-    trendEdge = dailyTrend === "bullish" ? "aligned" : "counter_trend";
-    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = extreme negative → shorts overlevered, contrarian LONG`);
-    rationale.push(`Regime: ${regime.label} (ADX ${regime.adx.toFixed(0)}) → ${regimeEdge === "mean_revert" ? "mean-reversion favors bounce" : "bullish trend aligned"}`);
+    if (momentumAlive) {
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme negative → contrarian LONG signal`);
+      rationale.push(`BLOCKED: Microstructure shows momentum alive. Wait for confirmation.`);
+    } else {
+      action = "LONG";
+      strength = (funding.extremeLow && microConfirmed) ? "strong" : funding.extremeLow ? "moderate" : "weak";
+      conviction = 55 + (microConfirmed ? 15 : 0) + (fundingZScore < -2.5 ? 10 : 0);
+      trendEdge = dailyTrend === "bullish" ? "aligned" : "counter_trend";
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}, ${fundingPercentile.toFixed(0)}th %ile) → contrarian LONG`);
+      if (microConfirmed) rationale.push(`CONFIRMED: Microstructure shows ${micro?.confirmation}`);
+      else rationale.push(`Microstructure: ${micro?.description ?? "no data"}`);
+    }
   } else if (regimeEdge === "trend_follow" && dailyTrend !== "neutral") {
-    // No funding signal, but trend is strong — trend follow
     if (dailyTrend === "bullish") {
       action = "LONG";
       strength = regime.adx > 30 ? "strong" : "moderate";
       conviction = 50 + Math.min(20, regime.adx - 25);
       trendEdge = "aligned";
-      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following LONG (daily SMA bullish)`);
-      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = neutral (no contrarian signal)`);
+      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following LONG`);
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
     } else if (dailyTrend === "bearish") {
       action = "SHORT";
       strength = regime.adx > 30 ? "strong" : "moderate";
       conviction = 50 + Math.min(20, regime.adx - 25);
       trendEdge = "aligned";
-      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following SHORT (daily SMA bearish)`);
-      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = neutral (no contrarian signal)`);
+      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following SHORT`);
+      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
     }
   } else if (regimeEdge === "mean_revert" && (rsi < 30 || rsi > 70)) {
-    // Ranging regime with RSI extreme — mean revert
     if (rsi < 30) {
       action = "LONG";
       strength = rsi < 25 ? "strong" : "moderate";
       conviction = 45 + (rsi < 25 ? 10 : 0);
       trendEdge = "no_trend";
-      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion active`);
-      rationale.push(`RSI ${rsi.toFixed(0)} = oversold → bounce expected`);
+      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion LONG (RSI ${rsi.toFixed(0)} oversold)`);
     } else {
       action = "SHORT";
       strength = rsi > 75 ? "strong" : "moderate";
       conviction = 45 + (rsi > 75 ? 10 : 0);
       trendEdge = "no_trend";
-      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion active`);
-      rationale.push(`RSI ${rsi.toFixed(0)} = overbought → pullback expected`);
+      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion SHORT (RSI ${rsi.toFixed(0)} overbought)`);
     }
-    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = neutral`);
+    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
   } else if (fundingEdge !== "neutral") {
-    // Funding signal exists but regime doesn't confirm — weak signal
     action = fundingEdge === "contrarian_short" ? "SHORT" : "LONG";
     strength = "weak";
-    conviction = 35;
+    conviction = 30;
     trendEdge = "counter_trend";
-    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h = extreme → contrarian ${action}`);
-    rationale.push(`WARNING: Regime not confirming (ADX ${regime.adx.toFixed(0)}, trend ${dailyTrend})`);
+    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme → contrarian ${action}`);
+    rationale.push(`WARNING: Regime not confirming (ADX ${regime.adx.toFixed(0)}, trend ${dailyTrend}). Microstructure: ${micro?.confirmation ?? "unknown"}`);
   } else {
-    // No edge — flat
     action = "FLAT";
     strength = "none";
     conviction = 0;
-    rationale.push(`No aligned edge: funding neutral (${fundingPct.toFixed(4)}%/8h), regime ${regime.label} (ADX ${regime.adx.toFixed(0)})`);
+    rationale.push(`No aligned edge: funding neutral (${fundingPct.toFixed(4)}%/8h, z=${fundingZScore.toFixed(2)}), regime ${regime.label} (ADX ${regime.adx.toFixed(0)})`);
     rationale.push(`FLAT is a position. Not trading IS the signal when no edge exists.`);
   }
 
-  // Volatility scaling note
-  if (volEdge === "high_vol_size_down") {
-    rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = high volatility → position size halved`);
-  } else if (volEdge === "low_vol_size_up") {
-    rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = low volatility → position size slightly increased`);
-  }
+  if (volEdge === "high_vol_size_down") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = high vol → size halved`);
+  else if (volEdge === "low_vol_size_up") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = low vol → size increased`);
 
-  // === RISK PARAMETERS ===
-  const riskAmount = capitalIdr * RISK_PER_TRADE_PCT * volScale;
-
+  // RISK PARAMETERS
   let stopLoss: number, takeProfit1: number, takeProfit2: number;
   if (action === "LONG") {
-    stopLoss = price - 2 * atr; // 2 ATR stop
-    takeProfit1 = price + 1.5 * atr; // 1.5R (since risk = 2 ATR, reward = 3 ATR → 1.5R)
-
-    takeProfit2 = price + 3 * atr; // 3R target
+    stopLoss = price - 2 * atr;
+    takeProfit1 = price + 1.5 * atr;
+    takeProfit2 = price + 3 * atr;
   } else if (action === "SHORT") {
     stopLoss = price + 2 * atr;
     takeProfit1 = price - 1.5 * atr;
     takeProfit2 = price - 3 * atr;
   } else {
-    stopLoss = price;
-    takeProfit1 = price;
-    takeProfit2 = price;
+    stopLoss = price; takeProfit1 = price; takeProfit2 = price;
   }
-
   const rewardRisk = action !== "FLAT" ? Math.abs(takeProfit1 - price) / Math.abs(price - stopLoss) : 0;
 
-  // === FRACTIONAL KELLY POSITION SIZING ===
-  // Estimate win probability from conviction + regime
-  const estWinRate = 0.45 + (conviction / 100) * 0.15; // 45-60% based on conviction
-  const b = rewardRisk > 0 ? rewardRisk : 1.5; // reward/risk ratio
-  const p = estWinRate;
-  const q = 1 - p;
-  const kelly = b > 0 && p > 0 ? (b * p - q) / b : 0;
-  const fractionalKelly = Math.max(0, kelly * KELLY_FRACTION);
-  const positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale : 0; // cap at 5%
+  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS
+  const wfResult = walkForwardBacktest(candles1h, regime, action);
+
+  // Kelly from OOS trades (not in-sample)
+  const oosKelly = wfResult.kellyFraction;
+  const fractionalKelly = Math.max(0, oosKelly * KELLY_FRACTION);
+  let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale : 0;
+
+  // P5: NOTIONAL CAP — prevent notional explosion when ATR is small
+  // notional = (riskAmount / stopDistance) × entryPrice
+  // If ATR is tiny, stop is tight, so notional = riskAmount / (2*ATR) × price → can be huge
+  const riskAmount = capitalIdr * (positionSizePct > 0 ? RISK_PER_TRADE_PCT : 0) * volScale;
+  const stopDistance = action !== "FLAT" ? Math.abs(price - stopLoss) : 0;
+  let notionalIdr = stopDistance > 0 ? (riskAmount / stopDistance) * price : 0;
+  const maxNotionalPct = 0.30; // cap notional at 30% of capital
+  const maxLeverage = 3.0;     // cap leverage at 3x
+  let notionalCapPct = notionalIdr / capitalIdr;
+  let leverage = notionalCapPct;
+
+  if (notionalCapPct > maxNotionalPct) {
+    const scaleDown = maxNotionalPct / notionalCapPct;
+    notionalIdr *= scaleDown;
+    positionSizePct *= scaleDown;
+    notionalCapPct = maxNotionalPct;
+    leverage = notionalCapPct;
+    rationale.push(`NOTIONAL CAP: original notional ${(notionalIdr / scaleDown / capitalIdr * 100).toFixed(0)}% of capital → scaled down to ${maxNotionalPct * 100}% (leverage cap ${maxLeverage}x)`);
+  }
+
   const positionSizeIdr = capitalIdr * positionSizePct;
 
-  // === HONEST BACKTEST (regime-matched) ===
-  const backtest = computeRegimeMatchedBacktest(candles1h, regime, action);
-
-  // === INVALIDATION ===
+  // INVALIDATION
   const invalidation = action === "LONG"
-    ? `Invalidation: price closes below ${stopLoss.toFixed(0)} (2 ATR stop) OR funding flips to extreme positive OR ADX drops below 15 (trend dies)`
+    ? `Invalidation: price closes below ${stopLoss.toFixed(0)} (2 ATR) OR funding z-score flips to >+2 OR ADX < 15 OR OI starts rising again`
     : action === "SHORT"
-      ? `Invalidation: price closes above ${stopLoss.toFixed(0)} (2 ATR stop) OR funding flips to extreme negative OR ADX drops below 15`
+      ? `Invalidation: price closes above ${stopLoss.toFixed(0)} (2 ATR) OR funding z-score flips to <-2 OR ADX < 15 OR OI starts rising again`
       : "No active position — no invalidation needed.";
 
-  // === WARNING (honest caveat) ===
+  // WARNINGS — honest caveats
   let warning: string | null = null;
-  if (action !== "FLAT" && backtest.sampleSize < 10) {
-    warning = `WARNING: Only ${backtest.sampleSize} historical regime-matched instances. Statistical confidence is LOW. Treat this as a hypothesis, not a certainty.`;
+  if (action !== "FLAT" && wfResult.oosSampleSize < 5) {
+    warning = `WARNING: Only ${wfResult.oosSampleSize} OOS trades. Statistical confidence is LOW. Kelly=${(oosKelly * 100).toFixed(1)}% (from OOS).`;
   }
-  if (action !== "FLAT" && backtest.winRate < 0.50) {
-    warning = `WARNING: Regime-matched backtest shows ${(backtest.winRate * 100).toFixed(0)}% win rate — below 50%. This signal historically LOSES more than wins. Expected value may still be positive if reward/risk > 2:1, but proceed with caution.`;
+  if (action !== "FLAT" && wfResult.oosWinRate < 0.50) {
+    warning = `WARNING: OOS win rate ${(wfResult.oosWinRate * 100).toFixed(0)}% — below 50%. Edge NOT confirmed out-of-sample. Kelly set to ${(oosKelly * 100).toFixed(1)}%.`;
+  }
+  if (action !== "FLAT" && !wfResult.honest) {
+    warning = `WARNING: Walk-forward validation says edge is NOT confirmed (OOS=${(wfResult.oosWinRate * 100).toFixed(0)}%, overfit gap ${(wfResult.overfitGap * 100).toFixed(0)}%). Treat as hypothesis, not certainty.`;
   }
   if (action !== "FLAT" && trendEdge === "counter_trend") {
-    warning = `WARNING: This signal is counter-trend. The daily trend is against you. This is a contrarian bet — it can work (fading extremes) but carries higher risk.`;
+    warning = `WARNING: Counter-trend signal. Daily trend is against you. Higher risk.`;
+  }
+  if (ctx.dataStale && action !== "FLAT") {
+    warning = `WARNING: Candle data is STALE (source: ${ctx.dataSource}). Signal may be based on outdated prices. Verify before executing.`;
   }
 
   return {
     pair,
     timestamp: new Date().toISOString(),
+    dataStale: ctx.dataStale,
+    dataSource: ctx.dataSource,
     action,
     strength,
     conviction,
+    confirmed: microConfirmed,
     entry: price,
     stopLoss,
     takeProfit1,
     takeProfit2,
     positionSizePct,
     positionSizeIdr,
+    notionalIdr,
+    notionalCapPct,
+    leverage,
     rewardRiskRatio: rewardRisk,
-    edges: { funding: fundingEdge, regime: regimeEdge, volatility: volEdge, trend: trendEdge },
-    backtest,
+    edges: { funding: fundingEdge, fundingZScore, regime: regimeEdge, volatility: volEdge, trend: trendEdge },
+    microstructure: micro ? {
+      oiTrend: micro.oiTrend,
+      oiChange4hPct: micro.oiChange4hPct,
+      cvd1h: micro.cvd1h,
+      cvdDivergence: micro.cvdDivergence,
+      absorptionDetected: micro.absorptionDetected,
+      takerBuyRatio: micro.takerBuyRatio1h,
+      confirmation: micro.confirmation,
+    } : null,
+    backtest: {
+      oosWinRate: wfResult.oosWinRate,
+      oosAvgReturn: wfResult.oosAvgReturn,
+      oosSampleSize: wfResult.oosSampleSize,
+      oosSharpe: wfResult.oosSharpe,
+      oosMaxDrawdown: wfResult.oosMaxDrawdown,
+      kellyFraction: wfResult.kellyFraction,
+      inSampleWinRate: wfResult.inSampleWinRate,
+      overfitGap: wfResult.overfitGap,
+      honest: wfResult.honest,
+      description: wfResult.description,
+    },
     rationale,
     invalidation,
     warning,
     raw: {
-      price,
-      atr,
-      atrPercent,
-      rsi,
+      price, atr, atrPercent, rsi,
       adx: regime.adx,
-      fundingRate,
-      fundingPercentile,
+      fundingRate, fundingZScore, fundingPercentile,
       regime: regime.regime,
     },
   };
-}
-
-// Compute where the current funding rate sits relative to the 30d range.
-function computeFundingPercentile(currentRate: number): number {
-  // Without the full 30-rate history (would need another API call),
-  // approximate: rates near 0 = 50th percentile. Extreme positive = >90th.
-  // This is a rough heuristic — the SDK returns avgRate which we can use.
-  // For now, use a simple mapping based on typical funding distributions.
-  if (currentRate > 0.0008) return 95;
-  if (currentRate > 0.0005) return 90;
-  if (currentRate > 0.0003) return 80;
-  if (currentRate > 0.0001) return 65;
-  if (currentRate > 0.00005) return 55;
-  if (currentRate > -0.00005) return 50;
-  if (currentRate > -0.0001) return 45;
-  if (currentRate > -0.0003) return 35;
-  if (currentRate > -0.0005) return 20;
-  if (currentRate > -0.0008) return 10;
-  return 5;
-}
-
-// Regime-matched backtest: find historical candles with similar regime
-// (same ADX band, same ATR ratio band) and compute forward returns.
-function computeRegimeMatchedBacktest(candles: Candle[], currentRegime: RegimeInfo, action: string): AlphaSignal["backtest"] {
-  if (candles.length < 100 || action === "FLAT") {
-    return {
-      winRate: 0, avgReturn: 0, avgHoldHours: 0, sampleSize: 0,
-      maxDrawdown: 0, sharpeRatio: 0,
-      regimeMatched: "insufficient data or no action",
-    };
-  }
-
-  const adxBand = currentRegime.adx < 20 ? "low" : currentRegime.adx > 25 ? "high" : "mid";
-  const atrBand = currentRegime.atrRatio > 1.5 ? "high" : currentRegime.atrRatio < 0.8 ? "low" : "normal";
-
-  // Scan historical candles for regime matches
-  const forwardReturns: { ret: number; holdHours: number; maxDD: number }[] = [];
-  const lookback = Math.min(candles.length - 48, 150); // don't use last 48 (we need forward data)
-
-  for (let i = 50; i < lookback; i++) {
-    // Compute regime at this historical point
-    const histSlice = candles.slice(0, i + 1);
-    const histATR = calcATR(histSlice, 14);
-    const histATRRatio = histATR / (calcAvgATR(histSlice, 50) || histATR);
-
-    // Simple ADX approximation: use price momentum strength
-    const histADX = approximateADX(histSlice);
-
-    const histAdxBand = histADX < 20 ? "low" : histADX > 25 ? "high" : "mid";
-    const histAtrBand = histATRRatio > 1.5 ? "high" : histATRRatio < 0.8 ? "low" : "normal";
-
-    if (histAdxBand === adxBand && histAtrBand === atrBand) {
-      // Regime matches! Compute forward return for this entry
-      const entry = candles[i].close;
-      let maxDD = 0;
-      let bestReturn = 0;
-      const holdHours = 24; // 24h forward window
-
-      for (let j = 1; j <= 24 && i + j < candles.length; j++) {
-        const future = candles[i + j].close;
-        const ret = action === "LONG" ? (future - entry) / entry : action === "SHORT" ? (entry - future) / entry : 0;
-        if (ret > bestReturn) bestReturn = ret;
-        const dd = action === "LONG" ? (entry - future) / entry : action === "SHORT" ? (future - entry) / entry : 0;
-        if (dd > maxDD) maxDD = dd;
-      }
-
-      const finalReturn = action === "LONG"
-        ? (candles[Math.min(i + 24, candles.length - 1)].close - entry) / entry
-        : action === "SHORT"
-          ? (entry - candles[Math.min(i + 24, candles.length - 1)].close) / entry
-          : 0;
-
-      forwardReturns.push({ ret: finalReturn, holdHours, maxDD });
-    }
-  }
-
-  if (forwardReturns.length === 0) {
-    return {
-      winRate: 0, avgReturn: 0, avgHoldHours: 0, sampleSize: 0,
-      maxDrawdown: 0, sharpeRatio: 0,
-      regimeMatched: `ADX band=${adxBand}, ATR band=${atrBand} — no historical matches`,
-    };
-  }
-
-  const wins = forwardReturns.filter((r) => r.ret > 0);
-  const winRate = wins.length / forwardReturns.length;
-  const avgReturn = forwardReturns.reduce((a, r) => a + r.ret, 0) / forwardReturns.length;
-  const avgHold = forwardReturns.reduce((a, r) => a + r.holdHours, 0) / forwardReturns.length;
-  const maxDD = Math.max(...forwardReturns.map((r) => r.maxDD));
-  const avgRet = avgReturn;
-  const stdRet = Math.sqrt(forwardReturns.reduce((a, r) => a + Math.pow(r.ret - avgRet, 2), 0) / forwardReturns.length);
-  const sharpe = stdRet > 0 ? (avgRet / stdRet) * Math.sqrt(365 * 24 / avgHold) : 0;
-
-  return {
-    winRate,
-    avgReturn,
-    avgHoldHours: avgHold,
-    sampleSize: forwardReturns.length,
-    maxDrawdown: maxDD,
-    sharpeRatio: sharpe,
-    regimeMatched: `ADX band=${adxBand} (${currentRegime.adx.toFixed(0)}), ATR band=${atrBand} (${currentRegime.atrRatio.toFixed(2)}x), action=${action}`,
-  };
-}
-
-function calcAvgATR(candles: Candle[], period: number): number {
-  if (candles.length < period + 1) return calcATR(candles, 14);
-  const slice = candles.slice(candles.length - period);
-  return calcATR(slice, Math.min(14, period));
-}
-
-// Lightweight ADX approximation (full ADX requires directional movement calc)
-function approximateADX(candles: Candle[]): number {
-  const n = candles.length;
-  if (n < 30) return 20;
-  const period = 14;
-  let plusDM = 0, minusDM = 0;
-  for (let i = n - period; i < n; i++) {
-    if (i < 1) continue;
-    const up = candles[i].high - candles[i - 1].high;
-    const dn = candles[i - 1].low - candles[i].low;
-    if (up > dn && up > 0) plusDM += up;
-    if (dn > up && dn > 0) minusDM += dn;
-  }
-  const total = plusDM + minusDM;
-  if (total === 0) return 15;
-  const di = Math.abs(plusDM - minusDM) / total * 100;
-  return Math.min(60, di * 1.3); // scale up to approximate ADX range
 }
 
 function summarizeRegime(signals: AlphaSignal[]): string {
@@ -565,12 +536,16 @@ function summarizeRegime(signals: AlphaSignal[]): string {
   const shortSignals = signals.filter((s) => s.action === "SHORT").length;
   const flatSignals = signals.filter((s) => s.action === "FLAT").length;
   const fundingExtreme = signals.filter((s) => s.edges.funding !== "neutral").length;
+  const confirmed = signals.filter((s) => s.confirmed).length;
+  const stale = signals.filter((s) => s.dataStale).length;
 
   let summary = `Market: `;
   if (trendCount > rangeCount) summary += `trending (${trendCount}/${signals.length} pairs). `;
   else if (rangeCount > trendCount) summary += `ranging (${rangeCount}/${signals.length} pairs). `;
   else summary += `mixed. `;
   summary += `Signals: ${longSignals} long, ${shortSignals} short, ${flatSignals} flat. `;
-  if (fundingExtreme > 0) summary += `${fundingExtreme} pair(s) with extreme funding (contrarian signal active). `;
+  if (fundingExtreme > 0) summary += `${fundingExtreme} pair(s) with extreme funding (z-score >2). `;
+  if (confirmed > 0) summary += `${confirmed} confirmed by microstructure. `;
+  if (stale > 0) summary += `${stale} pair(s) with STALE data. `;
   return summary;
 }

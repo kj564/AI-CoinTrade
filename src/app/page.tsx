@@ -13,35 +13,36 @@ interface AlphaSignal {
   action: "LONG" | "SHORT" | "REDUCE" | "FLAT" | "CLOSE";
   strength: string;
   conviction: number;
+  confirmed: boolean;
+  dataStale: boolean;
+  dataSource: string;
   entry: number;
   stopLoss: number;
   takeProfit1: number;
   takeProfit2: number;
   positionSizePct: number;
   positionSizeIdr: number;
+  notionalIdr: number;
+  notionalCapPct: number;
+  leverage: number;
   rewardRiskRatio: number;
-  edges: { funding: string; regime: string; volatility: string; trend: string };
+  edges: { funding: string; fundingZScore: number; regime: string; volatility: string; trend: string };
+  microstructure: {
+    oiTrend: string; oiChange4hPct: number; cvd1h: number;
+    cvdDivergence: boolean; absorptionDetected: boolean;
+    takerBuyRatio: number; confirmation: string;
+  } | null;
   backtest: {
-    winRate: number;
-    avgReturn: number;
-    avgHoldHours: number;
-    sampleSize: number;
-    maxDrawdown: number;
-    sharpeRatio: number;
-    regimeMatched: string;
+    oosWinRate: number; oosAvgReturn: number; oosSampleSize: number;
+    oosSharpe: number; oosMaxDrawdown: number; kellyFraction: number;
+    inSampleWinRate: number; overfitGap: number; honest: boolean; description: string;
   };
   rationale: string[];
   invalidation: string;
   warning: string | null;
   raw: {
-    price: number;
-    atr: number;
-    atrPercent: number;
-    rsi: number;
-    adx: number;
-    fundingRate: number;
-    fundingPercentile: number;
-    regime: string;
+    price: number; atr: number; atrPercent: number; rsi: number; adx: number;
+    fundingRate: number; fundingZScore: number; fundingPercentile: number; regime: string;
   };
 }
 
@@ -183,7 +184,7 @@ export default function AlphaDashboard() {
                   </div>
                   <div style={{ fontSize: "12px", color: "#737373" }}>
                     <div>Price: {fmtIdr(s.raw.price)}</div>
-                    <div>Funding: {(s.raw.fundingRate * 100).toFixed(4)}% · ADX: {s.raw.adx.toFixed(0)} · RSI: {s.raw.rsi.toFixed(0)}</div>
+                    <div>Funding: {(s.raw.fundingRate * 100).toFixed(4)}% (z={s.raw.fundingZScore.toFixed(2)}) · ADX: {s.raw.adx.toFixed(0)} · RSI: {s.raw.rsi.toFixed(0)}</div>
                     <div style={{ marginTop: "6px", color: "#525252" }}>{s.rationale[0]}</div>
                   </div>
                 </div>
@@ -268,34 +269,75 @@ function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
           </div>
         </div>
 
-        {/* BACKTEST STATS */}
-        <div style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
+        {/* MICROSTRUCTURE CONFIRMATION */}
+        {s.microstructure && (
+          <div style={{ background: s.confirmed ? "#0a1a0a" : "#0f0f0f", border: `1px solid ${s.confirmed ? "#16a34a40" : "#1a1a1a"}`, borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
+            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
+              Microstructure {s.confirmed && <span style={{ color: "#16a34a", fontWeight: 700 }}>✓ CONFIRMED</span>}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
+              <div>
+                <div style={{ fontSize: "10px", color: "#525252" }}>OI Trend</div>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.oiTrend === "declining" ? "#16a34a" : s.microstructure.oiTrend === "rising" ? "#dc2626" : "#737373" }}>
+                  {s.microstructure.oiTrend} ({s.microstructure.oiChange4hPct.toFixed(1)}%)
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: "#525252" }}>CVD 1h</div>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.cvd1h > 0 ? "#16a34a" : "#dc2626" }}>
+                  {s.microstructure.cvd1h > 0 ? "net buy" : "net sell"}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: "#525252" }}>Absorption</div>
+                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.absorptionDetected ? "#f59e0b" : "#525252" }}>
+                  {s.microstructure.absorptionDetected ? "DETECTED" : "none"}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: "#525252" }}>Taker Buy %</div>
+                <div style={{ fontSize: "13px", fontWeight: 600 }}>{(s.microstructure.takerBuyRatio * 100).toFixed(0)}%</div>
+              </div>
+            </div>
+            <div style={{ fontSize: "11px", color: "#737373", marginTop: "6px" }}>
+              Verdict: {s.microstructure.confirmation}
+            </div>
+          </div>
+        )}
+
+        {/* OOS BACKTEST (walk-forward, not in-sample) */}
+        <div style={{ background: "#0f0f0f", border: `1px solid ${s.backtest.honest ? "#16a34a40" : "#1a1a1a"}`, borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
           <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
-            Regime-Matched Backtest <span style={{ color: "#404040" }}>(sample: {s.backtest.sampleSize})</span>
+            Walk-Forward OOS Backtest <span style={{ color: "#404040" }}>(n={s.backtest.oosSampleSize})</span>
+            {s.backtest.honest && s.backtest.oosSampleSize > 0 && <span style={{ color: "#16a34a", marginLeft: "8px", fontWeight: 700 }}>✓ EDGE CONFIRMED OOS</span>}
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Win Rate</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.winRate > 0.5 ? "#16a34a" : "#dc2626" }}>
-                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.winRate, 0) : "—"}
+              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Win Rate</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosWinRate > 0.5 ? "#16a34a" : "#dc2626" }}>
+                {s.backtest.oosSampleSize > 0 ? fmtPct(s.backtest.oosWinRate, 0) : "—"}
               </div>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Avg Return</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.avgReturn > 0 ? "#16a34a" : "#dc2626" }}>
-                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.avgReturn) : "—"}
+              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Avg Return</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosAvgReturn > 0 ? "#16a34a" : "#dc2626" }}>
+                {s.backtest.oosSampleSize > 0 ? fmtPct(s.backtest.oosAvgReturn) : "—"}
               </div>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Max DD</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: "#f59e0b" }}>
-                {s.backtest.sampleSize > 0 ? fmtPct(s.backtest.maxDrawdown) : "—"}
+              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Sharpe</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosSharpe > 1 ? "#16a34a" : "#737373" }}>
+                {s.backtest.oosSampleSize > 0 ? s.backtest.oosSharpe.toFixed(1) : "—"}
               </div>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Sharpe</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.sharpeRatio > 1 ? "#16a34a" : "#737373" }}>
-                {s.backtest.sampleSize > 0 ? s.backtest.sharpeRatio.toFixed(1) : "—"}
+              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly (OOS)</div>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>{fmtPct(s.backtest.kellyFraction, 1)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Overfit Gap</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.overfitGap > 0.15 ? "#dc2626" : "#737373" }}>
+                {fmtPct(s.backtest.overfitGap, 0)}
               </div>
             </div>
           </div>
@@ -338,16 +380,14 @@ function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
               <div><span style={{ fontSize: "10px", color: "#525252" }}>ATR: </span><span style={{ fontSize: "12px" }}>{s.raw.atr.toFixed(0)} ({s.raw.atrPercent.toFixed(2)}%)</span></div>
               <div><span style={{ fontSize: "10px", color: "#525252" }}>RSI: </span><span style={{ fontSize: "12px" }}>{s.raw.rsi.toFixed(0)}</span></div>
               <div><span style={{ fontSize: "10px", color: "#525252" }}>ADX: </span><span style={{ fontSize: "12px" }}>{s.raw.adx.toFixed(0)}</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding: </span><span style={{ fontSize: "12px" }}>{(s.raw.fundingRate * 100).toFixed(4)}%</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding %ile: </span><span style={{ fontSize: "12px" }}>{s.raw.fundingPercentile}</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding z: </span><span style={{ fontSize: "12px", color: Math.abs(s.raw.fundingZScore) > 2 ? "#dc2626" : Math.abs(s.raw.fundingZScore) > 1 ? "#f59e0b" : "#737373" }}>{s.raw.fundingZScore.toFixed(2)} ({s.raw.fundingPercentile.toFixed(0)}th)</span></div>
               <div><span style={{ fontSize: "10px", color: "#525252" }}>R:R: </span><span style={{ fontSize: "12px" }}>{s.rewardRiskRatio.toFixed(2)}:1</span></div>
               <div><span style={{ fontSize: "10px", color: "#525252" }}>Conviction: </span><span style={{ fontSize: "12px" }}>{s.conviction}/100</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Notional: </span><span style={{ fontSize: "12px" }}>Rp {s.notionalIdr.toLocaleString("id-ID", { maximumFractionDigits: 0 })} ({(s.notionalCapPct * 100).toFixed(0)}%, {s.leverage.toFixed(1)}x)</span></div>
+              <div><span style={{ fontSize: "10px", color: "#525252" }}>Data: </span><span style={{ fontSize: "12px", color: s.dataStale ? "#dc2626" : "#16a34a" }}>{s.dataStale ? "STALE" : "fresh"} ({s.dataSource})</span></div>
             </div>
             <div style={{ fontSize: "11px", color: "#525252" }}>
-              <strong>Edges:</strong> funding={s.edges.funding} · regime={s.edges.regime} · vol={s.edges.volatility} · trend={s.edges.trend}
-            </div>
-            <div style={{ fontSize: "10px", color: "#404040", marginTop: "6px" }}>
-              Backtest match: {s.backtest.regimeMatched}
+              <strong>Edges:</strong> funding={s.edges.funding} (z={s.edges.fundingZScore.toFixed(2)}) · regime={s.edges.regime} · vol={s.edges.volatility} · trend={s.edges.trend}
             </div>
           </div>
         )}
