@@ -156,3 +156,87 @@ model L2CollectorHealth {
   updatedAt           DateTime @updatedAt
 }
 
+// ── PSYOP//TERMINAL models ──
+// Behavioral confrontation system. The market is the stage; the trader's
+// psychology is the subject. These models track the user's behavioral
+// patterns, not the market's.
+
+// Every trade intention the user logged (before execution). The system
+// requires a "plan" + "confession" before allowing execution. Deviations
+// from plan are tracked as tilt indicators.
+model PsyopTradeIntention {
+  id              String   @id @default(cuid())
+  pair            String
+  side            String   // long | short | flat
+  plannedEntry    Float
+  plannedStop     Float
+  plannedTarget   Float
+  plannedHoldMin  Int      // planned hold time in minutes
+  // The confession: user must type >=20 words explaining WHY this trade
+  // fits their plan. The system classifies it as plan-driven or tilt-driven.
+  confession      String
+  confessionClass String   @default("unclassified") // plan_driven | tilt_driven | unclassified
+  tiltAtConfession Float   @default(0) // tilt score when confession was submitted
+  // Execution tracking
+  executed        Boolean  @default(false)
+  executedAt      DateTime?
+  exitReason      String?  // plan_exit | manual_exit | panic_exit | revenge_exit
+  actualPnl       Float?
+  actualPnlPct    Float?
+  heldMinutes     Int?
+  // Was this a deviation from a previously stated plan?
+  deviatedFromPlan Boolean @default(false)
+  createdAt       DateTime @default(now())
+  @@index([pair, createdAt])
+  @@index([executed])
+}
+
+// Behavioral profile — aggregated stats about the trader's patterns.
+// Updated after every trade intention + execution. This is the
+// "shadow self" data source.
+model PsyopProfile {
+  id                  String   @id @default("singleton")
+  // Aggregate stats
+  totalIntentions     Int      @default(0)
+  totalExecutions     Int      @default(0)
+  totalDeviations     Int      @default(0) // times they deviated from plan
+  // Tilt history (rolling)
+  currentTilt         Float    @default(0) // 0-100
+  maxTilt             Float    @default(0)
+  avgTilt             Float    @default(0)
+  tiltHistoryJson     String   @default("[]") // JSON: [{ts, tilt}, ...] last 100
+  // Behavioral fingerprints (Markov transition probabilities)
+  // What do they typically do after a loss? after a win? after a long hold?
+  afterLossBehavior   String   @default("{}") // JSON: {immediate_reentry: 0.6, wait_1h: 0.2, ...}
+  afterWinBehavior    String   @default("{}")
+  // Discipline metrics
+  planAdherenceRate   Float    @default(0) // % of trades that followed plan
+  avgConfessionLen    Float    @default(0)
+  // Achievement badges (inverted — for BAD behaviors)
+  badgesJson          String   @default("[]") // JSON: [{id, earnedAt, severity}, ...]
+  // Session tracking
+  currentSessionStart Int?
+  currentSessionTrades Int    @default(0)
+  lastTradeAt         Int?
+  updatedAt           DateTime @updatedAt
+}
+
+// Confession log — every confession is stored for analysis. The system
+// uses these to build the behavioral fingerprint and to shame the user
+// with their own words when they're about to deviate.
+model PsyopConfession {
+  id           String   @id @default(cuid())
+  intentionId  String?
+  text         String   // the raw confession text (min 20 words)
+  wordCount    Int
+  classified   String   @default("unclassified") // plan_driven | tilt_driven | rationalization
+  // Tilt indicators detected in the text
+  hasFomo      Boolean  @default(false)
+  hasRevenge   Boolean  @default(false)
+  hasLossAversion Boolean @default(false)
+  hasOverconfidence Boolean @default(false)
+  tiltScore    Float    @default(0) // tilt score at time of confession
+  createdAt    DateTime @default(now())
+  @@index([createdAt])
+}
+
