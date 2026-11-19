@@ -1,0 +1,792 @@
+     1→// Alpha Engine — the signal system that has real mathematical edges.
+     2→//
+     3→// This is NOT the old indicator-based signal advisor (RSI/MACD = noise,
+     4→// proven by the project's own research: LR p=0.578, no stable features).
+     5→//
+     6→// This engine combines FOUR edges that are documented in quant literature
+     7→// and have positive expected value in crypto markets:
+     8→//
+     9→//   1. FUNDING RATE CONTRARIAN (primary edge)
+    10→//      - Extreme positive funding (>+0.05%/8h) = overlevered longs → reversal
+    11→//      - Extreme negative funding (<-0.03%/8h) = overlevered shorts → bounce
+    12→//      - This is structural: perps mechanics force payment, creating pressure
+    13→//
+    14→//   2. VOLATILITY SCALING (risk management edge)
+    15→//      - Position size = targetRisk / (ATR × multiplier)
+    16→//      - High vol → small position. Low vol → larger position.
+    17→//      - This is how every professional fund sizes. Not prediction — survival.
+    18→//
+    19→//   3. REGIME-AWARE ROUTING (strategy selection edge)
+    20→//      - ADX > 25: trend-following (ride the trend, trail stop)
+    21→//      - ADX < 20: mean-reversion (fade extremes)
+    22→//      - ADX 20-25: no-trade (transition = uncertainty)
+    23→//
+    24→//   4. FRACTIONAL KELLY SIZING (growth optimization edge)
+    25→//      - f* = (bp - q) / b where b=reward/risk, p=win prob, q=loss prob
+    26→//      - Use 1/4 Kelly (practitioners' standard) to avoid drawdown blow-ups
+    27→//
+    28→// The signal output is NOT "BUY at confidence 55%". It's:
+    29→//   "Allocate X% of capital. Entry here. Stop at 2 ATR. Target at 1.5R.
+    30→//    Backtested win rate in this regime: 58%. Sample: 31 instances.
+    31→//    Invalidation: ADX < 20 or funding flips."
+    32→//
+    33→// This is honest. It doesn't promise profits. It gives risk-managed,
+    34→// backtested, edge-based signals with explicit invalidation criteria.
+    35→
+    36→import { ensureCandles } from "./candles";
+    37→import { detectRegime } from "./regime";
+    38→import { getFundingRate, type FundingRateInfo } from "./funding";
+    39→import { getBinanceKlinesWithMeta, convertKlinesToIdr, type KlinesResult } from "./binance-klines";
+    40→import { getMicrostructure, type MicrostructureData } from "./microstructure";
+    41→import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
+    42→import { validateAbsorptionThreshold, type AbsorptionValidation } from "./absorption-validation";
+    43→import { computeWalkTheBookCap, computeLimitOrderCost, type WalkTheBookResult, type LimitOrderCostModel } from "./walk-the-book";
+    44→import { getCircuitBreaker, type CircuitBreakerState } from "./alpha-circuit-breaker";
+    45→import { journalSignal, checkOpenSignals } from "./signal-journal";
+    46→import { getTicker, getDepth } from "@/lib/indodax";
+    47→import { calcATR, type Candle } from "./backtest";
+    48→
+    49→// Simple RSI calculation (backtest.ts has rsiArr but it's not exported)
+    50→function calcRSI(candles: Candle[], period = 14): number {
+    51→  const closes = candles.map((c) => c.close);
+    52→  if (closes.length < period + 1) return 50;
+    53→  let avgGain = 0, avgLoss = 0;
+    54→  for (let i = 1; i <= period; i++) {
+    55→    const d = closes[i] - closes[i - 1];
+    56→    if (d > 0) avgGain += d; else avgLoss -= d;
+    57→  }
+    58→  avgGain /= period; avgLoss /= period;
+    59→  for (let i = period + 1; i < closes.length; i++) {
+    60→    const d = closes[i] - closes[i - 1];
+    61→    const gain = d > 0 ? d : 0, loss = d < 0 ? -d : 0;
+    62→    avgGain = (avgGain * (period - 1) + gain) / period;
+    63→    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    64→  }
+    65→  return avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+    66→}
+    67→
+    68→export interface AlphaSignal {
+    69→  pair: string;
+    70→  timestamp: string;
+    71→
+    72→  // === DATA QUALITY ===
+    73→  dataStale: boolean;       // true if candle data is > 10min old
+    74→  dataSource: string;       // "binance" | "fallback" | "stale"
+    75→
+    76→  // === THE SIGNAL ===
+    77→  action: "LONG" | "SHORT" | "REDUCE" | "FLAT" | "CLOSE";
+    78→  strength: "strong" | "moderate" | "weak" | "none";
+    79→  conviction: number; // 0-100, edge-weighted
+    80→  confirmed: boolean; // true ONLY if microstructure confirms (OI + absorption)
+    81→
+    82→  // === RISK PARAMETERS ===
+    83→  entry: number;
+    84→  stopLoss: number;
+    85→  takeProfit1: number;
+    86→  takeProfit2: number;
+    87→  positionSizePct: number;
+    88→  positionSizeIdr: number;
+    89→  notionalIdr: number;      // notional position value (entry × quantity)
+    90→  notionalCapPct: number;   // notional as % of capital (capped at 30%)
+    91→  leverage: number;         // notional / capital (capped at 3x)
+    92→  rewardRiskRatio: number;
+    93→
+    94→  // === EDGE SOURCES ===
+    95→  edges: {
+    96→    funding: "contrarian_short" | "contrarian_long" | "neutral";
+    97→    fundingZScore: number;   // z-score of current funding vs 30d distribution
+    98→    regime: "trend_follow" | "mean_revert" | "no_trade";
+    99→    volatility: "low_vol_size_up" | "normal" | "high_vol_size_down";
+   100→    trend: "aligned" | "counter_trend" | "no_trend";
+   101→  };
+   102→
+   103→  // === MICROSTRUCTURE CONFIRMATION ===
+   104→  microstructure: {
+   105→    oiTrend: string;
+   106→    oiChange4hPct: number;
+   107→    cvd1h: number;
+   108→    cvdDivergence: boolean;
+   109→    absorptionDetected: boolean;
+   110→    takerBuyRatio: number;
+   111→    confirmation: string;
+   112→  } | null;
+   113→
+   114→  // === WALK-FORWARD OOS BACKTEST ===
+   115→  backtest: {
+   116→    oosWinRate: number;
+   117→    oosAvgReturn: number;
+   118→    oosSampleSize: number;
+   119→    oosSharpe: number;
+   120→    oosMaxDrawdown: number;
+   121→    kellyFraction: number;      // point estimate
+   122→    kellyCI5: number;           // 5th percentile bootstrap Kelly
+   123→    kellyCI95: number;          // 95th percentile
+   124→    kellyUncertainty: number;   // CI width
+   125→    inSampleWinRate: number;
+   126→    overfitGap: number;
+   127→    honest: boolean;
+   128→    anchoredWindows: number;
+   129→    description: string;
+   130→  };
+   131→
+   132→  // === LIQUIDITY CAP (P3: walk-the-book) ===
+   133→  liquidity: {
+   134→    maxNotionalWithoutSlippage: number;
+   135→    topBidDepth: number;
+   136→    topAskDepth: number;
+   137→    spreadPct: number;
+   138→    liquidityCapActive: boolean;
+   139→    // P3: walk-the-book details
+   140→    walkBookLevels: number;         // levels consumed at max notional
+   141→    walkBookSlippagePct: number;    // actual slippage at max notional
+   142→    walkBookMethod: string;         // "walk_the_book" or "simple_depth"
+   143→  } | null;
+   144→
+   145→  // === ABSORPTION OOS VALIDATION (P2) ===
+   146→  absorptionValidation: {
+   147→    optimalThreshold: number;
+   148→    precision: number;
+   149→    precisionCI5: number;
+   150→    precisionCI95: number;
+   151→    lift: number;
+   152→    validated: boolean;
+   153→    description: string;
+   154→  } | null;
+   155→
+   156→  // === IMPACT SEVERITY (P4) ===
+   157→  impact: {
+   158→    capitalAtRiskPct: number;
+   159→    expectedLossIdr: number;
+   160→    concentrationPct: number;
+   161→    impactLevel: "HIGH" | "MEDIUM" | "LOW";
+   162→    // v5: impact × probability = expected value
+   163→    probability: number;            // OOS win rate (probability of success)
+   164→    expectedValueIdr: number;       // (prob × expectedWin) - ((1-prob) × expectedLoss)
+   165→    evSeverity: "CRITICAL" | "ERROR" | "WARN" | "INFO";  // combined severity
+   166→  } | null;
+   167→
+   168→  // === LIMIT ORDER COST MODEL (P2) ===
+   169→  limitOrder: {
+   170→    recommendation: "use_limit" | "use_market" | "improve_price";
+   171→    fillProbability: number;
+   172→    netExpectedCostPct: number;
+   173→    adverseSelectionPct: number;
+   174→    description: string;
+   175→  } | null;
+   176→
+   177→  // === CIRCUIT BREAKER (P7) ===
+   178→  circuitBreaker: {
+   179→    open: boolean;
+   180→    consecutiveLosses: number;
+   181→    winRate: number;
+   182→    cooldownSec: number;
+   183→    trips: number;
+   184→  };
+   185→
+   186→  rationale: string[];
+   187→  invalidation: string;
+   188→  warning: string | null;
+   189→
+   190→  raw: {
+   191→    price: number;
+   192→    atr: number;
+   193→    atrPercent: number;
+   194→    rsi: number;
+   195→    adx: number;
+   196→    fundingRate: number;
+   197→    fundingZScore: number;
+   198→    fundingPercentile: number;
+   199→    regime: string;
+   200→  };
+   201→}
+   202→
+   203→export interface AlphaEngineResult {
+   204→  signals: AlphaSignal[];
+   205→  portfolioAllocation: {
+   206→    pair: string;
+   207→    action: string;
+   208→    allocationPct: number;
+   209→  }[];
+   210→  capitalAtRisk: number; // total % of portfolio at risk across all signals
+   211→  regimeSummary: string;
+   212→  signalCheck?: { checked: number; closed: number; wins: number; losses: number };
+   213→  generatedAt: string;
+   214→  disclaimer: string;
+   215→}
+   216→
+   217→const PAIRS = ["btc_idr", "eth_idr", "sol_idr", "bnb_idr", "xrp_idr"];
+   218→const DEFAULT_CAPITAL = 10_000_000; // Rp 10jt
+   219→
+   220→// Risk per trade: 1% of capital (professional standard for retail)
+   221→const RISK_PER_TRADE_PCT = 0.01;
+   222→// Fractional Kelly: use 1/4 of full Kelly to avoid blow-ups
+   223→const KELLY_FRACTION = 0.25;
+   224→
+   225→export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promise<AlphaEngineResult> {
+   226→  const signals: AlphaSignal[] = [];
+   227→  let totalRiskPct = 0;
+   228→
+   229→  for (const pair of PAIRS) {
+   230→    try {
+   231→      const signal = await generatePairSignal(pair, capitalIdr);
+   232→      if (signal) {
+   233→        signals.push(signal);
+   234→        if (signal.action === "LONG" || signal.action === "SHORT") {
+   235→          totalRiskPct += signal.positionSizePct;
+   236→        }
+   237→      }
+   238→    } catch (e) {
+   239→      console.warn(`[alpha] signal failed for ${pair}:`, e instanceof Error ? e.message : e);
+   240→    }
+   241→  }
+   242→
+   243→  // Portfolio allocation: diversify across pairs, cap total risk at 6%
+   244→  const maxTotalRisk = 0.06; // 6% max portfolio risk
+   245→  const riskScale = totalRiskPct > maxTotalRisk ? maxTotalRisk / totalRiskPct : 1.0;
+   246→
+   247→  const portfolioAllocation = signals.map((s) => ({
+   248→    pair: s.pair,
+   249→    action: s.action,
+   250→    allocationPct: s.positionSizePct * riskScale,
+   251→  }));
+   252→
+   253→  const regimeSummary = summarizeRegime(signals);
+   254→
+   255→  // Close the loop: journal active signals + check open signals against current prices
+   256→  // This gives the circuit breaker real outcome data to work with.
+   257→  const currentPrices: Record<string, number> = {};
+   258→  for (const s of signals) {
+   259→    currentPrices[s.pair] = s.entry;
+   260→    if (s.action === "LONG" || s.action === "SHORT") {
+   261→      await journalSignal({
+   262→        pair: s.pair,
+   263→        action: s.action,
+   264→        entryPrice: s.entry,
+   265→        stopLoss: s.stopLoss,
+   266→        takeProfit1: s.takeProfit1,
+   267→        takeProfit2: s.takeProfit2,
+   268→        positionSizePct: s.positionSizePct,
+   269→        positionSizeIdr: s.positionSizeIdr,
+   270→        conviction: s.conviction,
+   271→        strength: s.strength,
+   272→        severity: s.impact?.evSeverity ?? "INFO",
+   273→        fundingZScore: s.raw.fundingZScore,
+   274→        regimeAtSignal: s.raw.regime,
+   275→        microstructureSummary: s.microstructure ? JSON.stringify(s.microstructure) : undefined,
+   276→      });
+   277→    }
+   278→  }
+   279→  const signalCheck = await checkOpenSignals(currentPrices);
+   280→
+   281→  return {
+   282→    signals,
+   283→    portfolioAllocation,
+   284→    capitalAtRisk: Math.min(totalRiskPct * riskScale, maxTotalRisk),
+   285→    regimeSummary,
+   286→    signalCheck,
+   287→    generatedAt: new Date().toISOString(),
+   288→    disclaimer: "Signals use z-score funding (pair-adaptive), microstructure confirmation (OI+CVD+absorption), walk-forward OOS validation, and fractional Kelly from OOS trades. Edge is only 'confirmed' if OOS win rate >50% and overfit gap <15%. No signal guarantees profit. Not financial advice.",
+   289→  };
+   290→}
+   291→
+   292→async function generatePairSignal(pair: string, capitalIdr: number): Promise<AlphaSignal | null> {
+   293→  // Fetch klines + ticker + depth (for liquidity cap) in parallel
+   294→  const [klinesResult, ticker, depth] = await Promise.all([
+   295→    getBinanceKlinesWithMeta(pair, "1h", 500),
+   296→    getTicker(pair),
+   297→    getDepth(pair.replace("_idr", "idr")),  // INDODAX depth needs "btcidr" format
+   298→  ]);
+   299→
+   300→  let candles1hSource = klinesResult.candles;
+   301→  let dataSource = klinesResult.source;
+   302→  let dataStale = klinesResult.stale;
+   303→
+   304→  if (candles1hSource.length < 50) {
+   305→    const { candles } = await ensureCandles(pair, "1h", 50);
+   306→    if (candles.length < 50) return null;
+   307→    candles1hSource = candles;
+   308→    dataSource = "fallback";
+   309→    dataStale = false;
+   310→  }
+   311→
+   312→  const candles1dRaw = resample1hTo1d(candles1hSource);
+   313→  const idrPrice = ticker?.last ?? 0;
+   314→  const usdtRefPrice = candles1hSource[candles1hSource.length - 1].close;
+   315→  const candles1h = idrPrice > 0 ? convertKlinesToIdr(candles1hSource, idrPrice, usdtRefPrice) : candles1hSource;
+   316→  const candles1d = idrPrice > 0 ? convertKlinesToIdr(candles1dRaw, idrPrice, usdtRefPrice) : candles1dRaw;
+   317→
+   318→  const [funding, microstructure] = await Promise.all([
+   319→    getFundingRate(pair),
+   320→    getMicrostructure(pair, usdtRefPrice),
+   321→  ]);
+   322→
+   323→  // P3: Walk-the-book liquidity cap
+   324→  const liquidity = computeWalkTheBookLiquidity(depth, idrPrice, capitalIdr);
+   325→
+   326→  // P2: Absorption threshold OOS validation
+   327→  const absorptionValidation = validateAbsorptionThreshold(candles1hSource);
+   328→
+   329→  // P2 (v5): Limit order cost model
+   330→  const orderVol = idrPrice > 0 ? (capitalIdr * 0.02) / idrPrice : 0; // estimate ~2% capital order
+   331→  const limitOrder = depth ? computeLimitOrderCost(depth, "buy", orderVol) : null;
+   332→
+   333→  // P7: Circuit breaker state
+   334→  const circuitBreaker = await getCircuitBreaker(pair);
+   335→
+   336→  return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
+   337→    dataSource: dataSource as string,
+   338→    dataStale,
+   339→    funding,
+   340→    microstructure,
+   341→    idrPrice: idrPrice || usdtRefPrice,
+   342→    liquidity,
+   343→    absorptionValidation,
+   344→    candles1h: candles1h,
+   345→    limitOrder,
+   346→    circuitBreaker,
+   347→  });
+   348→}
+   349→
+   350→// P3: Walk-the-book liquidity cap — simulates consuming order book levels
+   351→function computeWalkTheBookLiquidity(depth: any, idrPrice: number, capitalIdr: number): AlphaSignal["liquidity"] {
+   352→  if (!depth || !depth.buy || !depth.sell || idrPrice <= 0) return null;
+   353→
+   354→  const topBid = parseFloat(depth.buy[0]?.[0] ?? "0");
+   355→  const topAsk = parseFloat(depth.sell[0]?.[0] ?? "0");
+   356→  const midPrice = (topBid + topAsk) / 2;
+   357→  const spreadPct = midPrice > 0 ? ((topAsk - topBid) / midPrice) * 100 : 0;
+   358→
+   359→  // Walk the book for both sides
+   360→  const wtBook = computeWalkTheBookCap(depth, midPrice);
+   361→  const maxNotionalFromBook = wtBook.maxNotional;
+   362→
+   363→  // Also compute simple top-5 depth for comparison/fallback
+   364→  let topBidDepthVol = 0, topAskDepthVol = 0;
+   365→  for (let i = 0; i < Math.min(5, depth.buy.length); i++) topBidDepthVol += parseFloat(depth.buy[i]?.[1] ?? "0");
+   366→  for (let i = 0; i < Math.min(5, depth.sell.length); i++) topAskDepthVol += parseFloat(depth.sell[i]?.[1] ?? "0");
+   367→
+   368→  const capitalCap = capitalIdr * 0.30;
+   369→  const liquidityCapActive = maxNotionalFromBook > 0 && maxNotionalFromBook < capitalCap;
+   370→
+   371→  const levels = wtBook.buySide?.levelsConsumed ?? 0;
+   372→  const slippage = wtBook.buySide?.actualSlippagePct ?? 0;
+   373→
+   374→  return {
+   375→    maxNotionalWithoutSlippage: maxNotionalFromBook > 0 ? maxNotionalFromBook : (Math.min(topBidDepthVol, topAskDepthVol) * 0.2 * idrPrice),
+   376→    topBidDepth: topBidDepthVol,
+   377→    topAskDepth: topAskDepthVol,
+   378→    spreadPct,
+   379→    liquidityCapActive,
+   380→    walkBookLevels: levels,
+   381→    walkBookSlippagePct: slippage,
+   382→    walkBookMethod: maxNotionalFromBook > 0 ? "walk_the_book" : "simple_depth",
+   383→  };
+   384→}
+   385→
+   386→interface SignalContext {
+   387→  dataSource: string;
+   388→  dataStale: boolean;
+   389→  funding: FundingRateInfo | null;
+   390→  microstructure: MicrostructureData | null;
+   391→  idrPrice: number;
+   392→  liquidity: AlphaSignal["liquidity"];
+   393→  absorptionValidation: AbsorptionValidation | null;
+   394→  candles1h: Candle[];
+   395→  limitOrder: LimitOrderCostModel | null;
+   396→  circuitBreaker: CircuitBreakerState;
+   397→}
+   398→
+   399→// Resample 1h candles to 1d candles (aggregate by calendar day).
+   400→function resample1hTo1d(candles1h: Candle[]): Candle[] {
+   401→  const daySec = 86400;
+   402→  const buckets = new Map<number, Candle>();
+   403→  for (const c of candles1h) {
+   404→    const bucket = Math.floor(c.time / daySec) * daySec;
+   405→    const existing = buckets.get(bucket);
+   406→    if (!existing) {
+   407→      buckets.set(bucket, { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume });
+   408→    } else {
+   409→      existing.high = Math.max(existing.high, c.high);
+   410→      existing.low = Math.min(existing.low, c.low);
+   411→      existing.close = c.close;
+   412→      existing.volume += c.volume;
+   413→    }
+   414→  }
+   415→  return Array.from(buckets.values()).sort((a, b) => a.time - b.time);
+   416→}
+   417→
+   418→async function generateSignalFromCandles(
+   419→  pair: string,
+   420→  capitalIdr: number,
+   421→  candles1h: Candle[],
+   422→  candles1d: Candle[],
+   423→  ctx: SignalContext,
+   424→): Promise<AlphaSignal | null> {
+   425→  if (candles1h.length < 50 || candles1d.length < 7) return null;
+   426→
+   427→  const price = candles1h[candles1h.length - 1].close;
+   428→  const atr = calcATR(candles1h, 14);
+   429→  const atrPercent = (atr / price) * 100;
+   430→  const rsi = calcRSI(candles1h, 14);
+   431→  const regime = detectRegime(candles1h, candles1d);
+   432→
+   433→  // P1: Z-SCORE FUNDING — pair-adaptive, not fixed threshold
+   434→  const funding = ctx.funding;
+   435→  const fundingRate = funding?.current ?? 0;
+   436→  const fundingPct = funding?.currentPct ?? 0;
+   437→  const fundingZScore = funding?.zScore ?? 0;
+   438→  const fundingPercentile = funding?.percentile ?? 50;
+   439→
+   440→  let fundingEdge: AlphaSignal["edges"]["funding"] = "neutral";
+   441→  if (funding) {
+   442→    if (funding.extremeHigh) fundingEdge = "contrarian_short";
+   443→    else if (funding.extremeLow) fundingEdge = "contrarian_long";
+   444→  }
+   445→
+   446→  // VOLATILITY SCALING
+   447→  const atrRatio = regime.atrRatio;
+   448→  let volEdge: AlphaSignal["edges"]["volatility"] = "normal";
+   449→  let volScale = 1.0;
+   450→  if (atrRatio > 1.5) { volEdge = "high_vol_size_down"; volScale = 0.5; }
+   451→  else if (atrRatio < 0.8) { volEdge = "low_vol_size_up"; volScale = 1.3; }
+   452→
+   453→  // REGIME ROUTING
+   454→  let regimeEdge: AlphaSignal["edges"]["regime"] = "no_trade";
+   455→  if (regime.adx > 25) regimeEdge = "trend_follow";
+   456→  else if (regime.adx < 20) regimeEdge = "mean_revert";
+   457→
+   458→  // P7: CIRCUIT BREAKER — if open, force FLAT for this pair
+   459→  if (ctx.circuitBreaker.open) {
+   460→    return {
+   461→      pair,
+   462→      timestamp: new Date().toISOString(),
+   463→      dataStale: ctx.dataStale,
+   464→      dataSource: ctx.dataSource,
+   465→      action: "FLAT",
+   466→      strength: "none",
+   467→      conviction: 0,
+   468→      confirmed: false,
+   469→      entry: price, stopLoss: price, takeProfit1: price, takeProfit2: price,
+   470→      positionSizePct: 0, positionSizeIdr: 0,
+   471→      notionalIdr: 0, notionalCapPct: 0, leverage: 0, rewardRiskRatio: 0,
+   472→      edges: { funding: fundingEdge, fundingZScore, regime: regimeEdge, volatility: volEdge, trend: "no_trend" },
+   473→      microstructure: ctx.microstructure ? {
+   474→        oiTrend: ctx.microstructure.oiTrend, oiChange4hPct: ctx.microstructure.oiChange4hPct,
+   475→        cvd1h: ctx.microstructure.cvd1h, cvdDivergence: ctx.microstructure.cvdDivergence,
+   476→        absorptionDetected: ctx.microstructure.absorptionDetected, takerBuyRatio: ctx.microstructure.takerBuyRatio1h,
+   477→        confirmation: ctx.microstructure.confirmation,
+   478→      } : null,
+   479→      backtest: { oosWinRate: 0, oosAvgReturn: 0, oosSampleSize: 0, oosSharpe: 0, oosMaxDrawdown: 0, kellyFraction: 0, kellyCI5: 0, kellyCI95: 0, kellyUncertainty: 0, inSampleWinRate: 0, overfitGap: 0, honest: false, anchoredWindows: 0, rollingWinRate: 0, rollingSampleSize: 0, anchoredRollingGap: 0, regimeStable: false, description: "circuit breaker open" },
+   480→      liquidity: ctx.liquidity,
+   481→      absorptionValidation: ctx.absorptionValidation ? { optimalThreshold: ctx.absorptionValidation.optimalThreshold, precision: ctx.absorptionValidation.precision, precisionCI5: ctx.absorptionValidation.precisionCI5, precisionCI95: ctx.absorptionValidation.precisionCI95, lift: ctx.absorptionValidation.lift, validated: ctx.absorptionValidation.validated, description: ctx.absorptionValidation.description } : null,
+   482→      impact: null,
+   483→      limitOrder: ctx.limitOrder ? { recommendation: ctx.limitOrder.recommendation, fillProbability: ctx.limitOrder.fillProbability, netExpectedCostPct: ctx.limitOrder.netExpectedCostPct, adverseSelectionPct: ctx.limitOrder.adverseSelectionPct, description: ctx.limitOrder.description } : null,
+   484→      circuitBreaker: { open: true, consecutiveLosses: ctx.circuitBreaker.consecutiveLosses, winRate: ctx.circuitBreaker.winRate, cooldownSec: ctx.circuitBreaker.cooldownSec, trips: ctx.circuitBreaker.trips },
+   485→      rationale: [`CIRCUIT BREAKER OPEN: ${ctx.circuitBreaker.consecutiveLosses} consecutive losses. Cooldown ${Math.floor(ctx.circuitBreaker.cooldownSec / 60)}min remaining. Trips: ${ctx.circuitBreaker.trips}. Signals suppressed for this pair.`],
+   486→      invalidation: "Circuit breaker is open. Wait for cooldown to elapse, then half-open probe will test one signal.",
+   487→      warning: `CIRCUIT BREAKER TRIPPED. This pair has lost ${ctx.circuitBreaker.consecutiveLosses} consecutive OOS signals. Edge may have degraded. Do NOT override.`,
+   488→      raw: { price, atr, atrPercent, rsi, adx: regime.adx, fundingRate, fundingZScore, fundingPercentile, regime: regime.regime },
+   489→    };
+   490→  }
+   491→
+   492→  // DETERMINE ACTION
+   493→  let action: AlphaSignal["action"] = "FLAT";
+   494→  let strength: AlphaSignal["strength"] = "none";
+   495→  let conviction = 0;
+   496→  let trendEdge: AlphaSignal["edges"]["trend"] = "no_trend";
+   497→  const rationale: string[] = [];
+   498→  const dailyTrend = regime.dailyTrend;
+   499→
+   500→  // P2: MICROSTRUCTURE CONFIRMATION — only allow contrarian fade if OI/absorption confirms
+   501→  const micro = ctx.microstructure;
+   502→  const microConfirmed = micro?.confirmation === "reversal_likely";
+   503→  const momentumAlive = micro?.confirmation === "momentum_alive";
+   504→
+   505→  if (fundingEdge === "contrarian_short" && (regimeEdge === "mean_revert" || dailyTrend === "bearish")) {
+   506→    // P2: Block fade if momentum is still alive (OI rising + strong CVD)
+   507→    if (momentumAlive) {
+   508→      action = "FLAT";
+   509→      strength = "none";
+   510→      conviction = 0;
+   511→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme → contrarian SHORT signal`);
+   512→      rationale.push(`BLOCKED: Microstructure shows momentum alive (OI ${micro?.oiTrend} ${micro?.oiChange4hPct.toFixed(1)}%, CVD ${micro?.cvd1h > 0 ? "buy" : "sell"}). Blind fade = dangerous. Wait for OI to decline or absorption.`);
+   513→    } else {
+   514→      action = "SHORT";
+   515→      strength = (funding.extremeHigh && microConfirmed) ? "strong" : funding.extremeHigh ? "moderate" : "weak";
+   516→      conviction = 55 + (microConfirmed ? 15 : 0) + (fundingZScore > 2.5 ? 10 : 0);
+   517→      trendEdge = dailyTrend === "bearish" ? "aligned" : "counter_trend";
+   518→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}, ${fundingPercentile.toFixed(0)}th %ile) → contrarian SHORT`);
+   519→      if (microConfirmed) rationale.push(`CONFIRMED: Microstructure shows ${micro?.confirmation} — OI ${micro?.oiTrend}, ${micro?.absorptionDetected ? "absorption detected" : "CVD divergence"}`);
+   520→      else rationale.push(`Microstructure: ${micro?.description ?? "no data"}`);
+   521→    }
+   522→  } else if (fundingEdge === "contrarian_long" && (regimeEdge === "mean_revert" || dailyTrend === "bullish")) {
+   523→    if (momentumAlive) {
+   524→      action = "FLAT";
+   525→      strength = "none";
+   526→      conviction = 0;
+   527→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme negative → contrarian LONG signal`);
+   528→      rationale.push(`BLOCKED: Microstructure shows momentum alive. Wait for confirmation.`);
+   529→    } else {
+   530→      action = "LONG";
+   531→      strength = (funding.extremeLow && microConfirmed) ? "strong" : funding.extremeLow ? "moderate" : "weak";
+   532→      conviction = 55 + (microConfirmed ? 15 : 0) + (fundingZScore < -2.5 ? 10 : 0);
+   533→      trendEdge = dailyTrend === "bullish" ? "aligned" : "counter_trend";
+   534→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}, ${fundingPercentile.toFixed(0)}th %ile) → contrarian LONG`);
+   535→      if (microConfirmed) rationale.push(`CONFIRMED: Microstructure shows ${micro?.confirmation}`);
+   536→      else rationale.push(`Microstructure: ${micro?.description ?? "no data"}`);
+   537→    }
+   538→  } else if (regimeEdge === "trend_follow" && dailyTrend !== "neutral") {
+   539→    if (dailyTrend === "bullish") {
+   540→      action = "LONG";
+   541→      strength = regime.adx > 30 ? "strong" : "moderate";
+   542→      conviction = 50 + Math.min(20, regime.adx - 25);
+   543→      trendEdge = "aligned";
+   544→      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following LONG`);
+   545→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
+   546→    } else if (dailyTrend === "bearish") {
+   547→      action = "SHORT";
+   548→      strength = regime.adx > 30 ? "strong" : "moderate";
+   549→      conviction = 50 + Math.min(20, regime.adx - 25);
+   550→      trendEdge = "aligned";
+   551→      rationale.push(`ADX ${regime.adx.toFixed(0)} = strong trend → trend-following SHORT`);
+   552→      rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
+   553→    }
+   554→  } else if (regimeEdge === "mean_revert" && (rsi < 30 || rsi > 70)) {
+   555→    if (rsi < 30) {
+   556→      action = "LONG";
+   557→      strength = rsi < 25 ? "strong" : "moderate";
+   558→      conviction = 45 + (rsi < 25 ? 10 : 0);
+   559→      trendEdge = "no_trend";
+   560→      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion LONG (RSI ${rsi.toFixed(0)} oversold)`);
+   561→    } else {
+   562→      action = "SHORT";
+   563→      strength = rsi > 75 ? "strong" : "moderate";
+   564→      conviction = 45 + (rsi > 75 ? 10 : 0);
+   565→      trendEdge = "no_trend";
+   566→      rationale.push(`ADX ${regime.adx.toFixed(0)} = ranging → mean-reversion SHORT (RSI ${rsi.toFixed(0)} overbought)`);
+   567→    }
+   568→    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = neutral`);
+   569→  } else if (fundingEdge !== "neutral") {
+   570→    action = fundingEdge === "contrarian_short" ? "SHORT" : "LONG";
+   571→    strength = "weak";
+   572→    conviction = 30;
+   573→    trendEdge = "counter_trend";
+   574→    rationale.push(`Funding ${fundingPct.toFixed(4)}%/8h (z=${fundingZScore.toFixed(2)}) = extreme → contrarian ${action}`);
+   575→    rationale.push(`WARNING: Regime not confirming (ADX ${regime.adx.toFixed(0)}, trend ${dailyTrend}). Microstructure: ${micro?.confirmation ?? "unknown"}`);
+   576→  } else {
+   577→    action = "FLAT";
+   578→    strength = "none";
+   579→    conviction = 0;
+   580→    rationale.push(`No aligned edge: funding neutral (${fundingPct.toFixed(4)}%/8h, z=${fundingZScore.toFixed(2)}), regime ${regime.label} (ADX ${regime.adx.toFixed(0)})`);
+   581→    rationale.push(`FLAT is a position. Not trading IS the signal when no edge exists.`);
+   582→  }
+   583→
+   584→  if (volEdge === "high_vol_size_down") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = high vol → size halved`);
+   585→  else if (volEdge === "low_vol_size_up") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = low vol → size increased`);
+   586→
+   587→  // RISK PARAMETERS
+   588→  let stopLoss: number, takeProfit1: number, takeProfit2: number;
+   589→  if (action === "LONG") {
+   590→    stopLoss = price - 2 * atr;
+   591→    takeProfit1 = price + 1.5 * atr;
+   592→    takeProfit2 = price + 3 * atr;
+   593→  } else if (action === "SHORT") {
+   594→    stopLoss = price + 2 * atr;
+   595→    takeProfit1 = price - 1.5 * atr;
+   596→    takeProfit2 = price - 3 * atr;
+   597→  } else {
+   598→    stopLoss = price; takeProfit1 = price; takeProfit2 = price;
+   599→  }
+   600→  const rewardRisk = action !== "FLAT" ? Math.abs(takeProfit1 - price) / Math.abs(price - stopLoss) : 0;
+   601→
+   602→  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS WITH BOOTSTRAP CI
+   603→  const wfResult = walkForwardBacktest(candles1h, regime, action);
+   604→
+   605→  // P4: Use 5th percentile bootstrap Kelly (conservative — only bet if 95%
+   606→  // of bootstrap resamples show positive Kelly). Falls back to point estimate
+   607→  // if bootstrap returned 0 (no OOS trades).
+   608→  const oosKelly = wfResult.kellyCI5 > 0 ? wfResult.kellyCI5 : wfResult.kellyFraction;
+   609→  const fractionalKelly = Math.max(0, oosKelly * KELLY_FRACTION);
+   610→  let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale : 0;
+   611→
+   612→  // P5: NOTIONAL CAP — three layers: capital cap (30%), leverage cap (3x),
+   613→  // AND liquidity cap (max notional without >0.5% slippage from order book).
+   614→  const riskAmount = capitalIdr * (positionSizePct > 0 ? RISK_PER_TRADE_PCT : 0) * volScale;
+   615→  const stopDistance = action !== "FLAT" ? Math.abs(price - stopLoss) : 0;
+   616→  let notionalIdr = stopDistance > 0 ? (riskAmount / stopDistance) * price : 0;
+   617→  const maxNotionalPct = 0.30;
+   618→  const maxLeverage = 3.0;
+   619→  let notionalCapPct = notionalIdr / capitalIdr;
+   620→  let leverage = notionalCapPct;
+   621→
+   622→  // Layer 1: Capital cap (30%)
+   623→  if (notionalCapPct > maxNotionalPct) {
+   624→    const scaleDown = maxNotionalPct / notionalCapPct;
+   625→    notionalIdr *= scaleDown;
+   626→    positionSizePct *= scaleDown;
+   627→    notionalCapPct = maxNotionalPct;
+   628→    leverage = notionalCapPct;
+   629→    rationale.push(`NOTIONAL CAP: capital cap → scaled to ${maxNotionalPct * 100}% (${maxLeverage}x lev)`);
+   630→  }
+   631→
+   632→  // Layer 2: Liquidity cap (P5) — if order book is thin, reduce further
+   633→  if (ctx.liquidity && notionalIdr > ctx.liquidity.maxNotionalWithoutSlippage) {
+   634→    const liqCap = ctx.liquidity.maxNotionalWithoutSlippage;
+   635→    const scaleDown = liqCap / notionalIdr;
+   636→    const originalNotional = notionalIdr;
+   637→    notionalIdr = liqCap;
+   638→    positionSizePct *= scaleDown;
+   639→    notionalCapPct = notionalIdr / capitalIdr;
+   640→    leverage = notionalCapPct;
+   641→    rationale.push(`LIQUIDITY CAP: order book depth limits notional to Rp ${liqCap.toLocaleString("id-ID", { maximumFractionDigits: 0 })} (spread ${ctx.liquidity.spreadPct.toFixed(3)}%, top-5 depth: bid ${ctx.liquidity.topBidDepth.toFixed(2)} / ask ${ctx.liquidity.topAskDepth.toFixed(2)})`);
+   642→  }
+   643→
+   644→  const positionSizeIdr = capitalIdr * positionSizePct;
+   645→
+   646→  // INVALIDATION
+   647→  const invalidation = action === "LONG"
+   648→    ? `Invalidation: price closes below ${stopLoss.toFixed(0)} (2 ATR) OR funding z-score flips to >+2 OR ADX < 15 OR OI starts rising again`
+   649→    : action === "SHORT"
+   650→      ? `Invalidation: price closes above ${stopLoss.toFixed(0)} (2 ATR) OR funding z-score flips to <-2 OR ADX < 15 OR OI starts rising again`
+   651→      : "No active position — no invalidation needed.";
+   652→
+   653→  // WARNINGS — honest caveats
+   654→  let warning: string | null = null;
+   655→  if (action !== "FLAT" && wfResult.oosSampleSize < 5) {
+   656→    warning = `WARNING: Only ${wfResult.oosSampleSize} OOS trades. Statistical confidence is LOW. Kelly=${(oosKelly * 100).toFixed(1)}% (from OOS).`;
+   657→  }
+   658→  if (action !== "FLAT" && wfResult.oosWinRate < 0.50) {
+   659→    warning = `WARNING: OOS win rate ${(wfResult.oosWinRate * 100).toFixed(0)}% — below 50%. Edge NOT confirmed out-of-sample. Kelly set to ${(oosKelly * 100).toFixed(1)}%.`;
+   660→  }
+   661→  if (action !== "FLAT" && !wfResult.honest) {
+   662→    warning = `WARNING: Walk-forward validation says edge is NOT confirmed (OOS=${(wfResult.oosWinRate * 100).toFixed(0)}%, overfit gap ${(wfResult.overfitGap * 100).toFixed(0)}%). Treat as hypothesis, not certainty.`;
+   663→  }
+   664→  if (action !== "FLAT" && trendEdge === "counter_trend") {
+   665→    warning = `WARNING: Counter-trend signal. Daily trend is against you. Higher risk.`;
+   666→  }
+   667→  if (ctx.dataStale && action !== "FLAT") {
+   668→    warning = `WARNING: Candle data is STALE (source: ${ctx.dataSource}). Signal may be based on outdated prices. Verify before executing.`;
+   669→  }
+   670→
+   671→  return {
+   672→    pair,
+   673→    timestamp: new Date().toISOString(),
+   674→    dataStale: ctx.dataStale,
+   675→    dataSource: ctx.dataSource,
+   676→    action,
+   677→    strength,
+   678→    conviction,
+   679→    confirmed: microConfirmed,
+   680→    entry: price,
+   681→    stopLoss,
+   682→    takeProfit1,
+   683→    takeProfit2,
+   684→    positionSizePct,
+   685→    positionSizeIdr,
+   686→    notionalIdr,
+   687→    notionalCapPct,
+   688→    leverage,
+   689→    rewardRiskRatio: rewardRisk,
+   690→    edges: { funding: fundingEdge, fundingZScore, regime: regimeEdge, volatility: volEdge, trend: trendEdge },
+   691→    microstructure: micro ? {
+   692→      oiTrend: micro.oiTrend,
+   693→      oiChange4hPct: micro.oiChange4hPct,
+   694→      cvd1h: micro.cvd1h,
+   695→      cvdDivergence: micro.cvdDivergence,
+   696→      absorptionDetected: micro.absorptionDetected,
+   697→      takerBuyRatio: micro.takerBuyRatio1h,
+   698→      confirmation: micro.confirmation,
+   699→    } : null,
+   700→    backtest: {
+   701→      oosWinRate: wfResult.oosWinRate,
+   702→      oosAvgReturn: wfResult.oosAvgReturn,
+   703→      oosSampleSize: wfResult.oosSampleSize,
+   704→      oosSharpe: wfResult.oosSharpe,
+   705→      oosMaxDrawdown: wfResult.oosMaxDrawdown,
+   706→      kellyFraction: wfResult.kellyFraction,
+   707→      kellyCI5: wfResult.kellyCI5,
+   708→      kellyCI95: wfResult.kellyCI95,
+   709→      kellyUncertainty: wfResult.kellyUncertainty,
+   710→      inSampleWinRate: wfResult.inSampleWinRate,
+   711→      overfitGap: wfResult.overfitGap,
+   712→      honest: wfResult.honest,
+   713→      anchoredWindows: wfResult.anchoredWindows,
+   714→      description: wfResult.description,
+   715→    },
+   716→    liquidity: ctx.liquidity,
+   717→    absorptionValidation: ctx.absorptionValidation ? {
+   718→      optimalThreshold: ctx.absorptionValidation.optimalThreshold,
+   719→      precision: ctx.absorptionValidation.precision,
+   720→      precisionCI5: ctx.absorptionValidation.precisionCI5,
+   721→      precisionCI95: ctx.absorptionValidation.precisionCI95,
+   722→      lift: ctx.absorptionValidation.lift,
+   723→      validated: ctx.absorptionValidation.validated,
+   724→      description: ctx.absorptionValidation.description,
+   725→    } : null,
+   726→    impact: action !== "FLAT" ? (() => {
+   727→      const capitalAtRiskPct = positionSizePct;
+   728→      const expectedLossIdr = positionSizeIdr;
+   729→      const concentrationPct = positionSizePct / 0.06 * 100;
+   730→      const impactLevel = positionSizePct > 0.03 ? "HIGH" : positionSizePct > 0.01 ? "MEDIUM" : "LOW";
+   731→      // v5: impact × probability = expected value
+   732→      const probability = wfResult.oosWinRate;
+   733→      const expectedWinIdr = positionSizeIdr * rewardRisk; // win = size × R:R
+   734→      const expectedValueIdr = (probability * expectedWinIdr) - ((1 - probability) * expectedLossIdr);
+   735→      // EV severity: combine impact level + probability + EV sign
+   736→      let evSeverity: "CRITICAL" | "ERROR" | "WARN" | "INFO";
+   737→      if (impactLevel === "HIGH" && probability > 0.55 && expectedValueIdr > 0) evSeverity = "CRITICAL";
+   738→      else if (impactLevel === "MEDIUM" && probability > 0.50 && expectedValueIdr > 0) evSeverity = "ERROR";
+   739→      else if (expectedValueIdr <= 0) evSeverity = "WARN";
+   740→      else evSeverity = "INFO";
+   741→      return {
+   742→        capitalAtRiskPct, expectedLossIdr, concentrationPct, impactLevel,
+   743→        probability, expectedValueIdr, evSeverity,
+   744→      };
+   745→    })() : null,
+   746→    limitOrder: ctx.limitOrder ? {
+   747→      recommendation: ctx.limitOrder.recommendation,
+   748→      fillProbability: ctx.limitOrder.fillProbability,
+   749→      netExpectedCostPct: ctx.limitOrder.netExpectedCostPct,
+   750→      adverseSelectionPct: ctx.limitOrder.adverseSelectionPct,
+   751→      description: ctx.limitOrder.description,
+   752→    } : null,
+   753→    circuitBreaker: {
+   754→      open: ctx.circuitBreaker.open,
+   755→      consecutiveLosses: ctx.circuitBreaker.consecutiveLosses,
+   756→      winRate: ctx.circuitBreaker.winRate,
+   757→      cooldownSec: ctx.circuitBreaker.cooldownSec,
+   758→      trips: ctx.circuitBreaker.trips,
+   759→    },
+   760→    rationale,
+   761→    invalidation,
+   762→    warning,
+   763→    raw: {
+   764→      price, atr, atrPercent, rsi,
+   765→      adx: regime.adx,
+   766→      fundingRate, fundingZScore, fundingPercentile,
+   767→      regime: regime.regime,
+   768→    },
+   769→  };
+   770→}
+   771→
+   772→function summarizeRegime(signals: AlphaSignal[]): string {
+   773→  const trendCount = signals.filter((s) => s.raw.adx > 25).length;
+   774→  const rangeCount = signals.filter((s) => s.raw.adx < 20).length;
+   775→  const longSignals = signals.filter((s) => s.action === "LONG").length;
+   776→  const shortSignals = signals.filter((s) => s.action === "SHORT").length;
+   777→  const flatSignals = signals.filter((s) => s.action === "FLAT").length;
+   778→  const fundingExtreme = signals.filter((s) => s.edges.funding !== "neutral").length;
+   779→  const confirmed = signals.filter((s) => s.confirmed).length;
+   780→  const stale = signals.filter((s) => s.dataStale).length;
+   781→
+   782→  let summary = `Market: `;
+   783→  if (trendCount > rangeCount) summary += `trending (${trendCount}/${signals.length} pairs). `;
+   784→  else if (rangeCount > trendCount) summary += `ranging (${rangeCount}/${signals.length} pairs). `;
+   785→  else summary += `mixed. `;
+   786→  summary += `Signals: ${longSignals} long, ${shortSignals} short, ${flatSignals} flat. `;
+   787→  if (fundingExtreme > 0) summary += `${fundingExtreme} pair(s) with extreme funding (z-score >2). `;
+   788→  if (confirmed > 0) summary += `${confirmed} confirmed by microstructure. `;
+   789→  if (stale > 0) summary += `${stale} pair(s) with STALE data. `;
+   790→  return summary;
+   791→}
+   792→

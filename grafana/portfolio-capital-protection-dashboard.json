@@ -1,0 +1,193 @@
+{
+  "annotations": { "list": [] },
+  "description": "Portfolio capital protection dashboard — drawdown %, risk multiplier, recovery ramp, weekly loss, VaR/ES, halt events. Requires Prometheus scraping /api/signal/drawdown + /api/signal/tail-risk (expose as metrics endpoint).",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "title": "Current Drawdown %",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": -3 },
+              { "color": "orange", "value": -5 },
+              { "color": "red", "value": -8 },
+              { "color": "dark-red", "value": -10 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "portfolio_drawdown_pct", "refId": "A" }]
+    },
+    {
+      "title": "Effective Risk Multiplier",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "dark-red", "value": null },
+              { "color": "red", "value": 0.25 },
+              { "color": "orange", "value": 0.5 },
+              { "color": "yellow", "value": 0.75 },
+              { "color": "green", "value": 1.0 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "portfolio_risk_multiplier", "refId": "A" }]
+    },
+    {
+      "title": "Halt Status",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "ACTIVE", "color": "green" }, "1": { "text": "HALTED", "color": "red" } }, "type": "value" }
+          ]
+        }
+      },
+      "targets": [{ "expr": "portfolio_halt_active", "refId": "A" }]
+    },
+    {
+      "title": "Weekly Loss % (7-day rolling)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": -1 },
+              { "color": "orange", "value": -2 },
+              { "color": "red", "value": -3 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "portfolio_weekly_loss_pct", "refId": "A" }]
+    },
+    {
+      "title": "Drawdown % Over Time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [{ "expr": "portfolio_drawdown_pct", "legendFormat": "drawdown", "refId": "A" }],
+      "thresholds": [
+        { "value": -3, "color": "yellow" },
+        { "value": -5, "color": "orange" },
+        { "value": -8, "color": "red" },
+        { "value": -10, "color": "dark-red" }
+      ]
+    },
+    {
+      "title": "Risk Multiplier + Ramp Cap Over Time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1 } },
+      "targets": [
+        { "expr": "portfolio_risk_multiplier", "legendFormat": "effective", "refId": "A" },
+        { "expr": "portfolio_drawdown_multiplier", "legendFormat": "drawdown tier", "refId": "B" },
+        { "expr": "portfolio_ramp_multiplier_cap", "legendFormat": "ramp cap", "refId": "C" }
+      ]
+    },
+    {
+      "title": "Cumulative P&L (IDR)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "currencyIDR" } },
+      "targets": [
+        { "expr": "portfolio_cumulative_pnl_idr", "legendFormat": "cumulative", "refId": "A" },
+        { "expr": "portfolio_peak_pnl_idr", "legendFormat": "peak", "refId": "B" },
+        { "expr": "portfolio_trough_pnl_idr", "legendFormat": "trough", "refId": "C" }
+      ]
+    },
+    {
+      "title": "VaR 95% + ES 95% (per-trade %)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "portfolio_var95_pct", "legendFormat": "VaR 95", "refId": "A" },
+        { "expr": "portfolio_es95_pct", "legendFormat": "ES 95", "refId": "B" },
+        { "expr": "portfolio_var99_pct", "legendFormat": "VaR 99", "refId": "C" },
+        { "expr": "portfolio_es99_pct", "legendFormat": "ES 99", "refId": "D" }
+      ]
+    },
+    {
+      "title": "Recovery Ramp Stage",
+      "type": "state-timeline",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "none", "color": "green" }, "1": { "text": "probe (0.25x)", "color": "red" }, "2": { "text": "cautious (0.50x)", "color": "orange" }, "3": { "text": "steady (0.75x)", "color": "yellow" }, "4": { "text": "full (1.00x)", "color": "green" } }, "type": "value" }
+          ]
+        }
+      },
+      "targets": [{ "expr": "portfolio_ramp_stage", "legendFormat": "stage", "refId": "A" }]
+    },
+    {
+      "title": "Halt Events (count by type)",
+      "type": "bargauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "increase(portfolio_alert_events_total{type=\"drawdown_breach\"}[7d])", "legendFormat": "drawdown breach", "refId": "A" },
+        { "expr": "increase(portfolio_alert_events_total{type=\"circuit_tripped\"}[7d])", "legendFormat": "circuit tripped", "refId": "B" },
+        { "expr": "increase(portfolio_alert_events_total{type=\"weekly_loss_pause\"}[7d])", "legendFormat": "weekly loss pause", "refId": "C" },
+        { "expr": "increase(portfolio_alert_events_total{type=\"signal_fired\"}[7d])", "legendFormat": "signal fired", "refId": "D" },
+        { "expr": "increase(portfolio_alert_events_total{type=\"signal_closed\"}[7d])", "legendFormat": "signal closed", "refId": "E" }
+      ]
+    },
+    {
+      "title": "Per-Pair Circuit Breaker Trips",
+      "type": "bargauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{ "expr": "alpha_circuit_trips", "legendFormat": "{{pair}}", "refId": "A" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["alpha", "portfolio", "drawdown", "capital-protection"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Portfolio Capital Protection",
+  "uid": "portfolio-capital-protection",
+  "version": 1
+}

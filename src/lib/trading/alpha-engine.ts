@@ -181,6 +181,11 @@ export interface AlphaSignal {
     winRate: number;
     cooldownSec: number;
     trips: number;
+    // Wilson score 95% CI for win rate — honest when sample is small
+    winRateCI5: number;
+    winRateCI95: number;
+    ciWidth: number;
+    ciSampleAdequate: boolean;
   };
 
   rationale: string[];
@@ -226,9 +231,41 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
   const signals: AlphaSignal[] = [];
   let totalRiskPct = 0;
 
+  // P8: Fetch portfolio drawdown state ONCE per cycle (avoid N+1).
+  // This drives the dynamic risk multiplier + portfolio-level halt.
+  const { getDrawdownState } = await import("./drawdown-monitor");
+  const ddState = await getDrawdownState(capitalIdr).catch(() => ({
+    riskMultiplier: 1.0,
+    drawdownPct: 0,
+    isHalted: false,
+    haltReason: null,
+    weeklyLossPauseActive: false,
+    weeklyLossPct: 0,
+    rampStage: 0,
+    rampStageLabel: "none",
+    rampMultiplierCap: 1.0,
+    currentDrawdownPct: 0,
+    cumulativePnlIdr: 0,
+    cumulativePnlPct: 0,
+    peakPnlIdr: 0,
+    troughPnlIdr: 0,
+    closedSignals: 0,
+    riskTierLabel: "neutral",
+    alertThresholdPct: -5,
+    recoveryThresholdPct: -8,
+    computedAt: new Date().toISOString(),
+  }));
+
+  if (ddState.isHalted) {
+    console.warn(`[alpha] PORTFOLIO HALT ACTIVE — reason=${ddState.haltReason}, drawdown ${ddState.currentDrawdownPct.toFixed(2)}%, weekly ${ddState.weeklyLossPct.toFixed(2)}%. All new positions suppressed.`);
+  } else if (ddState.riskMultiplier < 1.0) {
+    const rampInfo = ddState.rampStage > 0 ? ` [ramp stage ${ddState.rampStage}: ${ddState.rampStageLabel}]` : "";
+    console.log(`[alpha] Drawdown scaling active — multiplier ${ddState.riskMultiplier.toFixed(2)}x (drawdown ${ddState.currentDrawdownPct.toFixed(2)}%).${rampInfo}`);
+  }
+
   for (const pair of PAIRS) {
     try {
-      const signal = await generatePairSignal(pair, capitalIdr);
+      const signal = await generatePairSignal(pair, capitalIdr, ddState.riskMultiplier, ddState.currentDrawdownPct, ddState.isHalted);
       if (signal) {
         signals.push(signal);
         if (signal.action === "LONG" || signal.action === "SHORT") {
@@ -273,6 +310,8 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
         fundingZScore: s.raw.fundingZScore,
         regimeAtSignal: s.raw.regime,
         microstructureSummary: s.microstructure ? JSON.stringify(s.microstructure) : undefined,
+        rationale: s.rationale,
+        capitalIdr,
       });
     }
   }
@@ -289,7 +328,13 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
   };
 }
 
-async function generatePairSignal(pair: string, capitalIdr: number): Promise<AlphaSignal | null> {
+async function generatePairSignal(
+  pair: string,
+  capitalIdr: number,
+  riskMultiplier: number = 1.0,
+  drawdownPct: number = 0,
+  isHalted: boolean = false,
+): Promise<AlphaSignal | null> {
   // Fetch klines + ticker + depth (for liquidity cap) in parallel
   const [klinesResult, ticker, depth] = await Promise.all([
     getBinanceKlinesWithMeta(pair, "1h", 500),
@@ -333,6 +378,27 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
   // P7: Circuit breaker state
   const circuitBreaker = await getCircuitBreaker(pair);
 
+  // P9: Correlation-aware concentration penalty.
+  // We don't yet know the final action (determined inside generateSignalFromCandles),
+  // but funding z-score implies likely direction: positive funding → SHORT (contrarian),
+  // negative funding → LONG. If funding neutral, action will likely be FLAT (no penalty needed).
+  // This is a conservative heuristic — penalty is slightly off if action differs, but
+  // under-sizing is always safer than over-sizing.
+  const fundingZ = funding?.zScore ?? 0;
+  const likelyAction = fundingZ > 0.5 ? "SHORT" : fundingZ < -0.5 ? "LONG" : "FLAT";
+  let concentrationPenalty = 1.0;
+  let concentrationExposure = 0;
+  if (likelyAction !== "FLAT") {
+    try {
+      const { computeConcentrationPenalty } = await import("./correlation-matrix");
+      const concResult = await computeConcentrationPenalty(pair, likelyAction, capitalIdr);
+      concentrationPenalty = concResult.penalty;
+      concentrationExposure = concResult.effectiveExposure;
+    } catch (e) {
+      console.warn(`[alpha] concentration penalty failed for ${pair}:`, e instanceof Error ? e.message : e);
+    }
+  }
+
   return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
     dataSource: dataSource as string,
     dataStale,
@@ -344,6 +410,11 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     candles1h: candles1h,
     limitOrder,
     circuitBreaker,
+    riskMultiplier,
+    drawdownPct,
+    isHalted,
+    concentrationPenalty,
+    concentrationExposure,
   });
 }
 
@@ -394,6 +465,13 @@ interface SignalContext {
   candles1h: Candle[];
   limitOrder: LimitOrderCostModel | null;
   circuitBreaker: CircuitBreakerState;
+  // P8: dynamic risk scaling context
+  riskMultiplier: number;     // 0.0 → 1.0, from portfolio drawdown state
+  drawdownPct: number;        // current drawdown % (negative if in drawdown)
+  isHalted: boolean;          // true if portfolio-level halt is active
+  // P9: correlation-aware concentration penalty
+  concentrationPenalty: number;   // 0.0 → 1.0 (multiply position size by this)
+  concentrationExposure: number;  // effective correlated exposure (0 → maxExposure)
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -481,7 +559,7 @@ async function generateSignalFromCandles(
       absorptionValidation: ctx.absorptionValidation ? { optimalThreshold: ctx.absorptionValidation.optimalThreshold, precision: ctx.absorptionValidation.precision, precisionCI5: ctx.absorptionValidation.precisionCI5, precisionCI95: ctx.absorptionValidation.precisionCI95, lift: ctx.absorptionValidation.lift, validated: ctx.absorptionValidation.validated, description: ctx.absorptionValidation.description } : null,
       impact: null,
       limitOrder: ctx.limitOrder ? { recommendation: ctx.limitOrder.recommendation, fillProbability: ctx.limitOrder.fillProbability, netExpectedCostPct: ctx.limitOrder.netExpectedCostPct, adverseSelectionPct: ctx.limitOrder.adverseSelectionPct, description: ctx.limitOrder.description } : null,
-      circuitBreaker: { open: true, consecutiveLosses: ctx.circuitBreaker.consecutiveLosses, winRate: ctx.circuitBreaker.winRate, cooldownSec: ctx.circuitBreaker.cooldownSec, trips: ctx.circuitBreaker.trips },
+      circuitBreaker: { open: true, consecutiveLosses: ctx.circuitBreaker.consecutiveLosses, winRate: ctx.circuitBreaker.winRate, cooldownSec: ctx.circuitBreaker.cooldownSec, trips: ctx.circuitBreaker.trips, winRateCI5: ctx.circuitBreaker.winRateCI5, winRateCI95: ctx.circuitBreaker.winRateCI95, ciWidth: ctx.circuitBreaker.ciWidth, ciSampleAdequate: ctx.circuitBreaker.ciSampleAdequate },
       rationale: [`CIRCUIT BREAKER OPEN: ${ctx.circuitBreaker.consecutiveLosses} consecutive losses. Cooldown ${Math.floor(ctx.circuitBreaker.cooldownSec / 60)}min remaining. Trips: ${ctx.circuitBreaker.trips}. Signals suppressed for this pair.`],
       invalidation: "Circuit breaker is open. Wait for cooldown to elapse, then half-open probe will test one signal.",
       warning: `CIRCUIT BREAKER TRIPPED. This pair has lost ${ctx.circuitBreaker.consecutiveLosses} consecutive OOS signals. Edge may have degraded. Do NOT override.`,
@@ -607,11 +685,30 @@ async function generateSignalFromCandles(
   // if bootstrap returned 0 (no OOS trades).
   const oosKelly = wfResult.kellyCI5 > 0 ? wfResult.kellyCI5 : wfResult.kellyFraction;
   const fractionalKelly = Math.max(0, oosKelly * KELLY_FRACTION);
-  let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale : 0;
+
+  // P8: DYNAMIC RISK SCALING — anti-martingale.
+  // Portfolio drawdown shrinks risk per trade. If drawdown > -10%, halt new positions.
+  // riskMultiplier is fetched in SignalContext (already computed once per cycle to avoid N+1).
+  const riskMultiplier = ctx.riskMultiplier ?? 1.0;
+  const drawdownPct = ctx.drawdownPct ?? 0;
+  const isHalted = ctx.isHalted ?? false;
+
+  // If halted, force action to FLAT — portfolio-level circuit breaker.
+  if (isHalted && action !== "FLAT") {
+    rationale.push(`PORTFOLIO HALT: drawdown ${drawdownPct.toFixed(2)}% beyond threshold OR weekly loss pause active. New positions suppressed until recovery ramp completes.`);
+    action = "FLAT";
+    strength = "none";
+    conviction = 0;
+    stopLoss = price; takeProfit1 = price; takeProfit2 = price;
+  }
+
+  let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale * riskMultiplier : 0;
 
   // P5: NOTIONAL CAP — three layers: capital cap (30%), leverage cap (3x),
   // AND liquidity cap (max notional without >0.5% slippage from order book).
-  const riskAmount = capitalIdr * (positionSizePct > 0 ? RISK_PER_TRADE_PCT : 0) * volScale;
+  // Risk per trade is the base 1% scaled by vol AND drawdown multiplier.
+  const scaledRiskPct = RISK_PER_TRADE_PCT * riskMultiplier;
+  const riskAmount = capitalIdr * (positionSizePct > 0 ? scaledRiskPct : 0) * volScale;
   const stopDistance = action !== "FLAT" ? Math.abs(price - stopLoss) : 0;
   let notionalIdr = stopDistance > 0 ? (riskAmount / stopDistance) * price : 0;
   const maxNotionalPct = 0.30;
@@ -639,6 +736,29 @@ async function generateSignalFromCandles(
     notionalCapPct = notionalIdr / capitalIdr;
     leverage = notionalCapPct;
     rationale.push(`LIQUIDITY CAP: order book depth limits notional to Rp ${liqCap.toLocaleString("id-ID", { maximumFractionDigits: 0 })} (spread ${ctx.liquidity.spreadPct.toFixed(3)}%, top-5 depth: bid ${ctx.liquidity.topBidDepth.toFixed(2)} / ask ${ctx.liquidity.topAskDepth.toFixed(2)})`);
+  }
+
+  // Layer 3: Drawdown risk scaling — annotate when active (the multiplier was
+  // already applied above; this just makes it visible in the rationale).
+  if (action !== "FLAT" && riskMultiplier < 1.0) {
+    rationale.push(`DRAWDOWN RISK SCALE: multiplier ${riskMultiplier.toFixed(2)}x (drawdown ${drawdownPct.toFixed(2)}%). Base risk ${RISK_PER_TRADE_PCT * 100}% → effective ${(scaledRiskPct * 100).toFixed(3)}%.`);
+  }
+
+  // Layer 4: Correlation-aware concentration penalty (P9).
+  // If there are already open positions in correlated pairs (e.g., LONG BTC
+  // and we're sizing LONG ETH), reduce this position to avoid over-concentration.
+  // The penalty is computed once per cycle in SignalContext (avoid N+1).
+  const concentrationPenalty = ctx.concentrationPenalty ?? 1.0;
+  if (action !== "FLAT" && concentrationPenalty < 1.0) {
+    const scaledDownNotional = notionalIdr * concentrationPenalty;
+    const scaledDownSizePct = positionSizePct * concentrationPenalty;
+    rationale.push(`CONCENTRATION CAP: correlated exposure ${ctx.concentrationExposure?.toFixed(2) ?? 0} → penalty ${concentrationPenalty.toFixed(2)}x. Notional Rp ${notionalIdr.toLocaleString("id-ID", { maximumFractionDigits: 0 })} → Rp ${scaledDownNotional.toLocaleString("id-ID", { maximumFractionDigits: 0 })}.`);
+    notionalIdr = scaledDownNotional;
+    positionSizePct = scaledDownSizePct;
+    notionalCapPct = notionalIdr / capitalIdr;
+    leverage = notionalCapPct;
+  } else if (action !== "FLAT" && (ctx.concentrationExposure ?? 0) > 0.3) {
+    rationale.push(`CONCENTRATION OK: effective exposure ${ctx.concentrationExposure?.toFixed(2)} (within limits). Penalty ${concentrationPenalty.toFixed(2)}x.`);
   }
 
   const positionSizeIdr = capitalIdr * positionSizePct;
@@ -756,6 +876,10 @@ async function generateSignalFromCandles(
       winRate: ctx.circuitBreaker.winRate,
       cooldownSec: ctx.circuitBreaker.cooldownSec,
       trips: ctx.circuitBreaker.trips,
+      winRateCI5: ctx.circuitBreaker.winRateCI5,
+      winRateCI95: ctx.circuitBreaker.winRateCI95,
+      ciWidth: ctx.circuitBreaker.ciWidth,
+      ciSampleAdequate: ctx.circuitBreaker.ciSampleAdequate,
     },
     rationale,
     invalidation,

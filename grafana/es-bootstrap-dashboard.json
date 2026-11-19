@@ -1,0 +1,144 @@
+{
+  "annotations": { "list": [] },
+  "description": "Expected Shortfall (ES) bootstrap confidence interval dashboard — ES 95/99 point estimates with bootstrap CI bands, CI width over time (uncertainty indicator), VaR 95/99 for comparison, sample adequacy tracking.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "title": "ES 95% + Bootstrap CI Band",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "portfolio_es95_pct", "legendFormat": "ES 95 (point)", "refId": "A" },
+        { "expr": "portfolio_es95_bootstrap_ci5", "legendFormat": "CI 5 (lower)", "refId": "B" },
+        { "expr": "portfolio_es95_bootstrap_ci95", "legendFormat": "CI 95 (upper)", "refId": "C" }
+      ],
+      "thresholds": [
+        { "value": -0.03, "color": "yellow" },
+        { "value": -0.05, "color": "orange" },
+        { "value": -0.08, "color": "red" }
+      ]
+    },
+    {
+      "title": "ES 99% + Bootstrap CI Band",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "portfolio_es99_pct", "legendFormat": "ES 99 (point)", "refId": "A" },
+        { "expr": "portfolio_es99_bootstrap_ci5", "legendFormat": "CI 5 (lower)", "refId": "B" },
+        { "expr": "portfolio_es99_bootstrap_ci95", "legendFormat": "CI 95 (upper)", "refId": "C" }
+      ]
+    },
+    {
+      "title": "VaR 95% + Bootstrap CI Band",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "portfolio_var95_pct", "legendFormat": "VaR 95 (point)", "refId": "A" },
+        { "expr": "portfolio_var95_bootstrap_ci5", "legendFormat": "CI 5", "refId": "B" },
+        { "expr": "portfolio_var95_bootstrap_ci95", "legendFormat": "CI 95", "refId": "C" }
+      ]
+    },
+    {
+      "title": "VaR 99% + Bootstrap CI Band",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "percent" } },
+      "targets": [
+        { "expr": "portfolio_var99_pct", "legendFormat": "VaR 99 (point)", "refId": "A" },
+        { "expr": "portfolio_var99_bootstrap_ci5", "legendFormat": "CI 5", "refId": "B" },
+        { "expr": "portfolio_var99_bootstrap_ci95", "legendFormat": "CI 95", "refId": "C" }
+      ]
+    },
+    {
+      "title": "ES 95 CI Width (uncertainty)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "percent", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.03 }, { "color": "orange", "value": 0.05 }, { "color": "red", "value": 0.08 }] } } },
+      "targets": [
+        { "expr": "portfolio_es95_bootstrap_ci_width", "legendFormat": "ES 95 CI width", "refId": "A" },
+        { "expr": "portfolio_var95_bootstrap_ci_width", "legendFormat": "VaR 95 CI width", "refId": "B" }
+      ]
+    },
+    {
+      "title": "Sample Size + Tail Sample",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "portfolio_tail_risk_sample_size", "legendFormat": "total sample", "refId": "A" },
+        { "expr": "portfolio_tail_risk_tail_sample_size", "legendFormat": "tail sample (worst 5%)", "refId": "B" }
+      ],
+      "thresholds": [
+        { "value": 30, "color": "yellow" },
+        { "value": 50, "color": "green" }
+      ]
+    },
+    {
+      "title": "CI Adequacy Flag",
+      "type": "state-timeline",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 36 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "INADEQUATE (n<30 or tail<3)", "color": "red" }, "1": { "text": "ADEQUATE", "color": "green" } }, "type": "value" }
+          ]
+        }
+      },
+      "targets": [{ "expr": "portfolio_tail_risk_ci_adequate", "legendFormat": "CI adequate", "refId": "A" }]
+    },
+    {
+      "title": "Worst Single Trade",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "percent", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": -0.02 }, { "color": "orange", "value": -0.05 }, { "color": "red", "value": -0.08 }] } } },
+      "targets": [{ "expr": "portfolio_worst_trade_pct", "refId": "A" }]
+    },
+    {
+      "title": "Portfolio VaR 95 (IDR)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "currencyIDR" } },
+      "targets": [{ "expr": "portfolio_var95_idr", "refId": "A" }]
+    },
+    {
+      "title": "Portfolio ES 95 (IDR)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 42 },
+      "fieldConfig": { "defaults": { "unit": "currencyIDR", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100000 }, { "color": "red", "value": 500000 }] } } },
+      "targets": [{ "expr": "portfolio_es95_idr", "refId": "A" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["alpha", "tail-risk", "var", "es", "bootstrap", "confidence-interval"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ES Bootstrap Confidence Intervals",
+  "uid": "es-bootstrap-ci",
+  "version": 1
+}

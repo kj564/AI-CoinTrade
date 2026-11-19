@@ -1,0 +1,166 @@
+# Portfolio Capital Protection — Grafana Alert Rules
+#
+# Proactive monitoring thresholds for the trading system. These rules fire
+# when capital-protection layers activate OR when risk metrics exceed tolerance.
+#
+# Deploy: load this file into Grafana's alerting system (Provisioning > Rules).
+# Requires Prometheus scraping the /api/signal/drawdown + /api/signal/tail-risk
+# endpoints (expose as metrics endpoint).
+#
+# Severity routing:
+#   CRITICAL → Telegram + Slack + Email + SMS + Discord + Webhook (all channels)
+#   WARNING  → Telegram + Slack + Webhook
+#   INFO     → log only
+
+groups:
+  - name: PortfolioDrawdownProtection
+    interval: 60s
+    rules:
+      # ── DRAWDOWN LAYERS ──
+      - alert: PortfolioDrawdownWarn
+        expr: portfolio_drawdown_pct <= -5 and portfolio_drawdown_pct > -8
+        for: 2m
+        labels:
+          severity: warning
+          layer: drawdown
+        annotations:
+          summary: "Portfolio drawdown entered cautious tier (-5% to -8%)"
+          description: "Drawdown {{ $value }}% — risk multiplier scaled to 0.50x. Position sizes halved."
+
+      - alert: PortfolioDrawdownCritical
+        expr: portfolio_drawdown_pct <= -8 and portfolio_drawdown_pct > -10
+        for: 2m
+        labels:
+          severity: critical
+          layer: drawdown
+        annotations:
+          summary: "Portfolio drawdown entered quarter-size tier (-8% to -10%)"
+          description: "Drawdown {{ $value }}% — risk multiplier scaled to 0.25x. Only high-conviction signals allowed."
+
+      - alert: PortfolioHaltDrawdown
+        expr: portfolio_drawdown_pct <= -10
+        for: 1m
+        labels:
+          severity: critical
+          layer: drawdown_halt
+        annotations:
+          summary: "PORTFOLIO HALT — drawdown exceeded -10%"
+          description: "Drawdown {{ $value }}%. All new positions suppressed. Recovery ramp will engage when drawdown recovers above -8%."
+
+      # ── RISK MULTIPLIER ──
+      - alert: RiskMultiplierReduced
+        expr: portfolio_risk_multiplier < 0.75 and portfolio_risk_multiplier > 0
+        for: 5m
+        labels:
+          severity: warning
+          layer: risk_multiplier
+        annotations:
+          summary: "Risk multiplier below 0.75x"
+          description: "Effective multiplier {{ $value }}. Drawdown scaling or recovery ramp active."
+
+      - alert: RiskMultiplierZero
+        expr: portfolio_risk_multiplier == 0
+        for: 1m
+        labels:
+          severity: critical
+          layer: risk_multiplier
+        annotations:
+          summary: "Risk multiplier is 0 — no new positions allowed"
+          description: "Portfolio halt OR weekly loss pause OR daily loss pause is active."
+
+      # ── RECOVERY RAMP ──
+      - alert: RecoveryRampStuck
+        expr: portfolio_ramp_stage == 1 and portfolio_ramp_age_hours > 24
+        for: 10m
+        labels:
+          severity: warning
+          layer: recovery_ramp
+        annotations:
+          summary: "Recovery ramp stuck at probe stage >24h"
+          description: "Ramp age {{ $value }}h. Drawdown may be re-worsening, preventing ramp progression. Investigate."
+
+      # ── WEEKLY LOSS PAUSE ──
+      - alert: WeeklyLossPauseTriggered
+        expr: portfolio_weekly_loss_pct <= -3
+        for: 2m
+        labels:
+          severity: critical
+          layer: weekly_loss
+        annotations:
+          summary: "Weekly loss pause triggered"
+          description: "7-day rolling P&L {{ $value }}%. New positions paused until next Monday 00:00 WIB."
+
+      # ── DAILY LOSS PAUSE ──
+      - alert: DailyLossPauseTriggered
+        expr: portfolio_daily_loss_pct <= -1.5
+        for: 1m
+        labels:
+          severity: warning
+          layer: daily_loss
+        annotations:
+          summary: "Daily loss pause triggered"
+          description: "24h rolling P&L {{ $value }}%. New positions paused until next midnight WIB."
+
+      # ── TAIL RISK (VaR/ES) ──
+      - alert: VaR95High
+        expr: portfolio_var95_pct < -0.05
+        for: 10m
+        labels:
+          severity: warning
+          layer: tail_risk
+        annotations:
+          summary: "VaR 95% exceeds 5% per trade"
+          description: "VaR 95 = {{ $value }}. Worst 5% of trades losing >5%. Consider reducing risk per trade."
+
+      - alert: ES95Extreme
+        expr: portfolio_es95_pct < -0.08
+        for: 10m
+        labels:
+          severity: critical
+          layer: tail_risk
+        annotations:
+          summary: "ES 95% exceeds 8% — extreme tail risk"
+          description: "ES 95 = {{ $value }}. Average loss in worst 5% is >8%. Halt live trading and investigate stop placement."
+
+      # ── CIRCUIT BREAKERS ──
+      - alert: CircuitBreakerTripped
+        expr: increase(alpha_circuit_trips[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          layer: circuit_breaker
+        annotations:
+          summary: "Per-pair circuit breaker tripped in last hour"
+          description: "{{ $value }} trip(s) in last hour. Check /api/signal/circuit-breakers for which pair."
+
+      - alert: EdgeCircuitBreakerTripped
+        expr: increase(alpha_edge_circuit_trips[1h]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          layer: edge_circuit_breaker
+        annotations:
+          summary: "Per-edge circuit breaker tripped in last hour"
+          description: "{{ $value }} edge trip(s). Check /api/signal/edge-breakers for which pair × edge degraded."
+
+      # ── CONCENTRATION ──
+      - alert: ConcentrationExposureHigh
+        expr: portfolio_concentration_exposure > 0.7
+        for: 5m
+        labels:
+          severity: warning
+          layer: concentration
+        annotations:
+          summary: "Correlated exposure >70% of max"
+          description: "Effective exposure {{ $value }}. New positions in correlated pairs will be heavily penalized."
+
+      # ── DATA FRESHNESS ──
+      - alert: PortfolioStateStale
+        expr: time() - portfolio_last_computed_at > 3600
+        for: 5m
+        labels:
+          severity: warning
+          layer: data_freshness
+        annotations:
+          summary: "Portfolio risk state not computed in >1h"
+          description: "Last computed {{ $value }}s ago. Cron job may have failed. Check /api/signal/portfolio manually."

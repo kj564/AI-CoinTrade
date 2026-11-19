@@ -1,0 +1,162 @@
+{
+  "annotations": { "list": [] },
+  "description": "Correlation + concentration risk dashboard — dynamic correlation matrix (30d rolling returns), effective exposure gauge, concentration penalty over time, per-pair correlation heatmap. Requires Prometheus scraping /api/signal/correlation.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "title": "Matrix Source (dynamic vs static)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "text": "STATIC FALLBACK", "color": "orange" }, "1": { "text": "DYNAMIC (30d)", "color": "green" } }, "type": "value" }
+          ]
+        }
+      },
+      "targets": [{ "expr": "correlation_matrix_is_dynamic", "refId": "A" }]
+    },
+    {
+      "title": "Matrix Sample Size (daily returns)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 10 }, { "color": "green", "value": 20 }] } } },
+      "targets": [{ "expr": "correlation_matrix_sample_size", "refId": "A" }]
+    },
+    {
+      "title": "Matrix Cache Age (hours)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1800 }, { "color": "red", "value": 3600 }] } } },
+      "targets": [{ "expr": "correlation_matrix_cache_age_sec", "refId": "A" }]
+    },
+    {
+      "title": "Effective Exposure Gauge",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1, "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "orange", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "portfolio_concentration_exposure", "refId": "A" }]
+    },
+    {
+      "title": "Per-Pair Correlation Heatmap (BTC vs all)",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": -1, "max": 1 } },
+      "targets": [{ "expr": "correlation_pair{base=\"btc_idr\"}", "legendFormat": "{{target}}", "refId": "A" }]
+    },
+    {
+      "title": "Per-Pair Correlation Heatmap (ETH vs all)",
+      "type": "heatmap",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": -1, "max": 1 } },
+      "targets": [{ "expr": "correlation_pair{base=\"eth_idr\"}", "legendFormat": "{{target}}", "refId": "A" }]
+    },
+    {
+      "title": "Effective Exposure Over Time",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [{ "expr": "portfolio_concentration_exposure", "legendFormat": "effective exposure", "refId": "A" }],
+      "thresholds": [
+        { "value": 0.5, "color": "yellow" },
+        { "value": 0.7, "color": "orange" },
+        { "value": 0.9, "color": "red" }
+      ]
+    },
+    {
+      "title": "Concentration Penalty Over Time (per pair)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [{ "expr": "concentration_penalty", "legendFormat": "{{pair}}", "refId": "A" }],
+      "thresholds": [
+        { "value": 0.5, "color": "yellow" },
+        { "value": 0.25, "color": "orange" },
+        { "value": 0, "color": "red" }
+      ]
+    },
+    {
+      "title": "BTC-ETH Correlation Over Time (30d rolling)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": -1, "max": 1 } },
+      "targets": [
+        { "expr": "correlation_pair{base=\"btc_idr\",target=\"eth_idr\"}", "legendFormat": "BTC-ETH", "refId": "A" },
+        { "expr": "correlation_pair{base=\"btc_idr\",target=\"sol_idr\"}", "legendFormat": "BTC-SOL", "refId": "B" },
+        { "expr": "correlation_pair{base=\"btc_idr\",target=\"bnb_idr\"}", "legendFormat": "BTC-BNB", "refId": "C" },
+        { "expr": "correlation_pair{base=\"btc_idr\",target=\"xrp_idr\"}", "legendFormat": "BTC-XRP", "refId": "D" }
+      ],
+      "thresholds": [
+        { "value": 0.8, "color": "red" },
+        { "value": 0.5, "color": "yellow" },
+        { "value": 0, "color": "green" }
+      ]
+    },
+    {
+      "title": "Open Positions Count",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [{ "expr": "portfolio_open_positions_count", "refId": "A" }]
+    },
+    {
+      "title": "Concentration Penalty Active (count)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }] } } },
+      "targets": [{ "expr": "count(concentration_penalty < 1.0)", "refId": "A" }]
+    },
+    {
+      "title": "Correlation Matrix Last Recomputed",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 28 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{ "expr": "time() - correlation_matrix_computed_at", "refId": "A" }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["alpha", "correlation", "concentration", "risk-management"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-7d", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Correlation & Concentration Risk",
+  "uid": "correlation-concentration-risk",
+  "version": 1
+}

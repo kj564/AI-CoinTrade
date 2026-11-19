@@ -285,8 +285,126 @@ model SignalJournal {
   // Context at signal time
   regimeAtSignal  String?
   microstructureSummary String?  // JSON: {oiTrend, cvd, absorption}
+  // Dynamic risk context (anti-martingale: drawn-down portfolios trade smaller)
+  riskMultiplier  Float    @default(1.0)  // 1.0 = full size, 0.25 = quarter size, 0 = halted
+  drawdownAtSignal Float   @default(0)    // % drawdown when this signal fired
+  alertSent       Boolean  @default(false) // Telegram notification dispatched for open
+  closeAlertSent  Boolean  @default(false) // Telegram notification dispatched for close
   createdAt       DateTime @default(now())
   @@index([pair, createdAt])
   @@index([status])
+  @@index([createdAt])
 }
+
+// Portfolio-level alert log — every capital-protection alert is persisted here.
+// Supports: drawdown_breach, circuit_tripped, paper_vs_replay_deviation,
+// signal_fired, signal_closed, recovery.
+// De-duplication is done in code (cooldown) using the createdAt timestamp.
+model PortfolioAlertEvent {
+  id          String   @id @default(cuid())
+  type        String   // drawdown_breach | circuit_tripped | signal_fired | signal_closed | paper_vs_replay_deviation | recovery
+  severity    String   // info | warn | error | critical
+  pair        String?  // null for portfolio-level events
+  message     String
+  metadataJson String  @default("{}") // extra context (drawdown%, threshold, dev%, etc.)
+  traceId     String?
+  channels    String   @default("[]") // JSON: ["telegram","slack",...]
+  delivered   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  @@index([type, createdAt])
+  @@index([severity, createdAt])
+  @@index([pair])
+}
+
+// Weekly auto-review — generated every Monday 9am Jakarta by cron.
+// Snapshots: portfolio stats, replay stats, circuit breaker states, drawdown state.
+// Produces natural-language recommendations (enable/disable pair, adjust risk, etc.).
+model WeeklyReview {
+  id              String   @id @default(cuid())
+  weekStart       String   @unique // ISO date of the week's Monday (e.g. "2026-11-17")
+  portfolioStats  String   // JSON: {totalSignals, winRate, totalPnlIdr, ...}
+  replayStats     String   // JSON: perPair array
+  circuitBreakers String   // JSON: perPair array with CI
+  drawdownState   String   // JSON: {currentDrawdownPct, peakPnlIdr, troughPnlIdr}
+  recommendations String   // newline-separated natural-language recommendations
+  status          String   @default("published") // draft | published
+  createdAt       DateTime @default(now())
+}
+
+// Portfolio risk state — singleton row tracking halt/recovery/weekly-loss.
+// Persists across hot-reloads + restarts so the recovery ramp timeline is
+// not reset when the dev server bounces. The drawdown monitor reads + writes
+// this row on every cycle.
+//
+// Recovery ramp (anti-V-shape): when halt triggers, record haltedAt. When
+// drawdown recovers above -8%, record recoveryStartedAt. The multiplier
+// ramps in 4 stages over 7 days:
+//   Stage 1 (probe,  0-24h):   0.25x
+//   Stage 2 (cautious, 24-72h): 0.50x
+//   Stage 3 (steady, 72-168h):  0.75x
+//   Stage 4 (full, >168h):      1.00x
+//
+// Weekly loss pause: if rolling 7-day P&L < -3% of capital, pause new
+// positions until next Monday 00:00 Jakarta. Auto-recovers on Monday.
+model PortfolioRiskState {
+  id                      String   @id @default("singleton")
+  // Halt state
+  haltedAt                Int?      // unix sec when -10% drawdown halt triggered
+  haltDrawdownPct         Float    @default(0)
+  // Recovery ramp state
+  recoveryStartedAt       Int?      // unix sec when drawdown first recovered above -8%
+  recoveryStage           Int      @default(0) // 0=none, 1=probe, 2=cautious, 3=steady, 4=full
+  recoveryMultiplierCap   Float    @default(1.0) // current cap from ramp (0.25 → 1.00)
+  // Weekly loss pause state
+  weeklyLossPauseActive   Boolean  @default(false)
+  weeklyLossStartedAt     Int?      // unix sec when weekly loss pause triggered
+  weeklyLossPct           Float    @default(0) // current 7-day rolling P&L %
+  weeklyLossThresholdPct  Float    @default(-3.0) // -3% default
+  weeklyPauseExpiresAt    Int?      // unix sec when pause auto-expires (next Monday 00:00 Jakarta)
+  // Daily loss pause state (anti-overtrading within a single day)
+  dailyLossPauseActive    Boolean  @default(false)
+  dailyLossStartedAt      Int?      // unix sec when daily loss pause triggered
+  dailyLossPct            Float    @default(0) // current 24h rolling P&L %
+  dailyLossThresholdPct   Float    @default(-1.5) // -1.5% default
+  dailyPauseExpiresAt     Int?      // unix sec when pause auto-expires (next midnight Jakarta)
+  // Last computed state (for UI / debugging)
+  lastDrawdownPct         Float    @default(0)
+  lastMultiplier          Float    @default(1.0)
+  lastComputedAt          Int?
+  updatedAt               DateTime @updatedAt
+}
+
+// Per-edge circuit breaker — finer granularity than per-pair.
+// Tracks consecutive losses for a specific (pair × edge_source) combination.
+// E.g., BTC funding_contrarian can trip independently of BTC trend_follow.
+// Edge sources: funding_contrarian, trend_follow, mean_revert, absorption_reversal.
+//
+// Includes per-edge recovery ramp (mirrors portfolio ramp): when an edge CB
+// trips and then recovers (half-open probe wins), risk multiplier ramps back
+// up over 7 days in 4 stages (probe 0.25x → cautious 0.50x → steady 0.75x → full 1.00x).
+model AlphaEdgeCircuitBreaker {
+  id                  String   @id @default(cuid())
+  pair                String
+  edgeSource          String   // funding_contrarian | trend_follow | mean_revert | absorption_reversal
+  consecutiveLosses   Int      @default(0)
+  totalSignals        Int      @default(0)
+  totalWins           Int      @default(0)
+  totalLosses         Int      @default(0)
+  circuitOpen         Boolean  @default(false)
+  circuitOpenedAt     Int?
+  circuitOpenUntil    Int?
+  circuitTrips        Int      @default(0)
+  lastSignalAt        Int?
+  lastSignalOutcome   String?
+  // Per-edge recovery ramp state (mirrors PortfolioRiskState.ramp fields)
+  edgeRecoveryStartedAt Int?     // unix sec when edge CB half-open probe first succeeded
+  edgeRecoveryStage     Int      @default(0) // 0=none, 1=probe, 2=cautious, 3=steady, 4=full
+  edgeRecoveryMultiplierCap Float @default(1.0) // current cap from edge ramp (0.25 → 1.00)
+  updatedAt           DateTime @updatedAt
+  @@unique([pair, edgeSource])
+  @@index([pair])
+  @@index([edgeSource])
+}
+
+
 
