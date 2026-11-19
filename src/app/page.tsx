@@ -37,12 +37,31 @@ interface AlphaSignal {
     oosSharpe: number; oosMaxDrawdown: number; kellyFraction: number;
     kellyCI5: number; kellyCI95: number; kellyUncertainty: number;
     inSampleWinRate: number; overfitGap: number; honest: boolean;
-    anchoredWindows: number; description: string;
+    anchoredWindows: number; rollingWinRate: number; rollingSampleSize: number;
+    anchoredRollingGap: number; regimeStable: boolean; description: string;
   };
   liquidity: {
     maxNotionalWithoutSlippage: number; topBidDepth: number; topAskDepth: number;
     spreadPct: number; liquidityCapActive: boolean;
+    walkBookLevels: number; walkBookSlippagePct: number; walkBookMethod: string;
   } | null;
+  absorptionValidation: {
+    optimalThreshold: number; precision: number; precisionCI5: number;
+    precisionCI95: number; lift: number; validated: boolean; description: string;
+  } | null;
+  impact: {
+    capitalAtRiskPct: number; expectedLossIdr: number; concentrationPct: number;
+    impactLevel: string; probability: number; expectedValueIdr: number;
+    evSeverity: string;
+  } | null;
+  limitOrder: {
+    recommendation: string; fillProbability: number; netExpectedCostPct: number;
+    adverseSelectionPct: number; description: string;
+  } | null;
+  circuitBreaker: {
+    open: boolean; consecutiveLosses: number; winRate: number;
+    cooldownSec: number; trips: number;
+  };
   rationale: string[];
   invalidation: string;
   warning: string | null;
@@ -57,6 +76,7 @@ interface AlphaResult {
   portfolioAllocation: { pair: string; action: string; allocationPct: number }[];
   capitalAtRisk: number;
   regimeSummary: string;
+  signalCheck?: { checked: number; closed: number; wins: number; losses: number };
   generatedAt: string;
   disclaimer: string;
 }
@@ -183,14 +203,29 @@ export default function AlphaDashboard() {
             </h2>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px" }}>
               {flatSignals.map((s) => (
-                <div key={s.pair} style={{ background: "#111", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+                <div key={s.pair} style={{ background: "#111", border: s.circuitBreaker?.open ? "1px solid #dc2626" : "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
                     <span style={{ fontSize: "14px", fontWeight: 600 }}>{s.pair.toUpperCase()}</span>
-                    <span style={{ fontSize: "12px", fontWeight: 700, color: "#525252" }}>FLAT</span>
+                    <span style={{ fontSize: "12px", fontWeight: 700, color: s.circuitBreaker?.open ? "#dc2626" : "#525252" }}>
+                      {s.circuitBreaker?.open ? "CIRCUIT OPEN" : "FLAT"}
+                    </span>
                   </div>
                   <div style={{ fontSize: "12px", color: "#737373" }}>
                     <div>Price: {fmtIdr(s.raw.price)}</div>
                     <div>Funding: {(s.raw.fundingRate * 100).toFixed(4)}% (z={s.raw.fundingZScore.toFixed(2)}) · ADX: {s.raw.adx.toFixed(0)} · RSI: {s.raw.rsi.toFixed(0)}</div>
+                    {s.limitOrder && (
+                      <div style={{ marginTop: "4px" }}>
+                        <span style={{ color: s.limitOrder.recommendation === "use_market" ? "#dc2626" : s.limitOrder.recommendation === "use_limit" ? "#16a34a" : "#f59e0b", fontWeight: 600 }}>
+                          {s.limitOrder.recommendation.toUpperCase()}
+                        </span>
+                        <span style={{ color: "#525252" }}> · fill {(s.limitOrder.fillProbability * 100).toFixed(0)}% · net cost {s.limitOrder.netExpectedCostPct.toFixed(3)}%</span>
+                      </div>
+                    )}
+                    {s.circuitBreaker && s.circuitBreaker.consecutiveLosses > 0 && (
+                      <div style={{ marginTop: "4px", color: s.circuitBreaker.open ? "#dc2626" : "#f59e0b" }}>
+                        CB: {s.circuitBreaker.consecutiveLosses} losses · winRate {(s.circuitBreaker.winRate * 100).toFixed(0)}% · trips {s.circuitBreaker.trips}
+                      </div>
+                    )}
                     <div style={{ marginTop: "6px", color: "#525252" }}>{s.rationale[0]}</div>
                   </div>
                 </div>
@@ -207,7 +242,17 @@ export default function AlphaDashboard() {
             </div>
             <div style={{ fontSize: "11px", color: "#404040", marginTop: "8px", textAlign: "center" }}>
               Generated: {data.generatedAt} · Next refresh: 60s
+              {data.signalCheck && data.signalCheck.checked > 0 && (
+                <span style={{ marginLeft: "8px" }}>· Signal check: {data.signalCheck.checked} open → {data.signalCheck.closed} closed ({data.signalCheck.wins}W/{data.signalCheck.losses}L)</span>
+              )}
               {loading && <span style={{ marginLeft: "8px", color: "#525252" }}>· refreshing…</span>}
+            </div>
+            <div style={{ fontSize: "11px", color: "#404040", marginTop: "4px", textAlign: "center" }}>
+              <a href="/api/signal/portfolio" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Portfolio P&L →</a>
+              {" · "}
+              <a href="/api/signal/metrics" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Prometheus Metrics →</a>
+              {" · "}
+              <a href="/api/signal/alert" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Alert Check →</a>
             </div>
           </footer>
         )}

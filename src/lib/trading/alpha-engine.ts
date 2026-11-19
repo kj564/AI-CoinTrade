@@ -42,6 +42,7 @@ import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
 import { validateAbsorptionThreshold, type AbsorptionValidation } from "./absorption-validation";
 import { computeWalkTheBookCap, computeLimitOrderCost, type WalkTheBookResult, type LimitOrderCostModel } from "./walk-the-book";
 import { getCircuitBreaker, type CircuitBreakerState } from "./alpha-circuit-breaker";
+import { journalSignal, checkOpenSignals } from "./signal-journal";
 import { getTicker, getDepth } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
 
@@ -208,6 +209,7 @@ export interface AlphaEngineResult {
   }[];
   capitalAtRisk: number; // total % of portfolio at risk across all signals
   regimeSummary: string;
+  signalCheck?: { checked: number; closed: number; wins: number; losses: number };
   generatedAt: string;
   disclaimer: string;
 }
@@ -250,11 +252,38 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
 
   const regimeSummary = summarizeRegime(signals);
 
+  // Close the loop: journal active signals + check open signals against current prices
+  // This gives the circuit breaker real outcome data to work with.
+  const currentPrices: Record<string, number> = {};
+  for (const s of signals) {
+    currentPrices[s.pair] = s.entry;
+    if (s.action === "LONG" || s.action === "SHORT") {
+      await journalSignal({
+        pair: s.pair,
+        action: s.action,
+        entryPrice: s.entry,
+        stopLoss: s.stopLoss,
+        takeProfit1: s.takeProfit1,
+        takeProfit2: s.takeProfit2,
+        positionSizePct: s.positionSizePct,
+        positionSizeIdr: s.positionSizeIdr,
+        conviction: s.conviction,
+        strength: s.strength,
+        severity: s.impact?.evSeverity ?? "INFO",
+        fundingZScore: s.raw.fundingZScore,
+        regimeAtSignal: s.raw.regime,
+        microstructureSummary: s.microstructure ? JSON.stringify(s.microstructure) : undefined,
+      });
+    }
+  }
+  const signalCheck = await checkOpenSignals(currentPrices);
+
   return {
     signals,
     portfolioAllocation,
     capitalAtRisk: Math.min(totalRiskPct * riskScale, maxTotalRisk),
     regimeSummary,
+    signalCheck,
     generatedAt: new Date().toISOString(),
     disclaimer: "Signals use z-score funding (pair-adaptive), microstructure confirmation (OI+CVD+absorption), walk-forward OOS validation, and fractional Kelly from OOS trades. Edge is only 'confirmed' if OOS win rate >50% and overfit gap <15%. No signal guarantees profit. Not financial advice.",
   };

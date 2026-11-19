@@ -241,8 +241,6 @@ model PsyopConfession {
 }
 
 // Alpha signal circuit breaker — per-pair consecutive loss tracking.
-// After 3 consecutive OOS-validated losing signals, the circuit trips
-// and signals for that pair are suppressed for a cooldown period.
 model AlphaCircuitBreaker {
   id                  String   @id @default(cuid())
   pair                String   @unique
@@ -258,5 +256,37 @@ model AlphaCircuitBreaker {
   lastSignalAction    String?  // LONG | SHORT | FLAT
   lastSignalOutcome   String?  // win | loss | pending
   updatedAt           DateTime @updatedAt
+}
+
+// Signal journal — every signal generated is recorded here with its outcome.
+// This closes the loop: signal → journal → outcome check → circuit breaker update.
+// Enables portfolio-level P&L tracking and end-to-end backtesting.
+model SignalJournal {
+  id              String   @id @default(cuid())
+  pair            String
+  action          String   // LONG | SHORT
+  entryPrice      Float
+  stopLoss        Float
+  takeProfit1     Float
+  takeProfit2     Float
+  positionSizePct Float
+  positionSizeIdr Float
+  conviction      Int
+  strength        String
+  severity        String   // CRITICAL | ERROR | WARN | INFO
+  fundingZScore   Float
+  // Outcome tracking (filled when stop/target hit or manually closed)
+  status          String   @default("open") // open | stopped_out | target_hit | manual_close | expired
+  exitPrice       Float?
+  exitTime        Int?      // unix sec
+  pnlIdr          Float?
+  pnlPct          Float?
+  holdHours       Int?
+  // Context at signal time
+  regimeAtSignal  String?
+  microstructureSummary String?  // JSON: {oiTrend, cvd, absorption}
+  createdAt       DateTime @default(now())
+  @@index([pair, createdAt])
+  @@index([status])
 }
 
