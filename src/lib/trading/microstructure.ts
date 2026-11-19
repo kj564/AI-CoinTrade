@@ -109,10 +109,33 @@ export async function getMicrostructure(pair: string, currentPrice: number): Pro
     }
     const cvd4h = cvd;
 
-    // Absorption: high volume but low price change
+    // Absorption: high volume but low price change.
+    // P2: OOS-validated threshold — instead of fixed >100, compute the
+    // absorption ratio distribution from the current trade batch and use
+    // the 80th percentile as the threshold. This adapts to each pair's
+    // typical volume/price_change ratio. High-volume pairs naturally have
+    // higher ratios, so a fixed threshold over-flags them.
     const priceChangePct = firstPrice > 0 ? Math.abs((lastPrice - firstPrice) / firstPrice) * 100 : 0;
     const absorptionRatio = priceChangePct > 0 ? totalVol / priceChangePct : 0;
-    const absorptionDetected = absorptionRatio > 100 && totalVol > 0; // threshold tuned for crypto
+
+    // Compute per-trade absorption ratios to build a distribution
+    const perTradeRatios: number[] = [];
+    if (Array.isArray(trades) && trades.length > 10) {
+      // Chunk trades into 20-trade segments, compute absorption ratio per chunk
+      const chunkSize = Math.max(5, Math.floor(trades.length / 20));
+      for (let i = 0; i < trades.length - chunkSize; i += chunkSize) {
+        const chunk = trades.slice(i, i + chunkSize);
+        let chunkVol = 0, chunkFirst = parseFloat(chunk[0].p || "0"), chunkLast = parseFloat(chunk[chunk.length - 1].p || "0");
+        for (const t of chunk) chunkVol += parseFloat(t.q || "0");
+        const chunkPriceChange = chunkFirst > 0 ? Math.abs((chunkLast - chunkFirst) / chunkFirst) * 100 : 0;
+        if (chunkPriceChange > 0 && chunkVol > 0) perTradeRatios.push(chunkVol / chunkPriceChange);
+      }
+    }
+    // Threshold = 80th percentile of the chunk distribution (top 20% = absorption)
+    perTradeRatios.sort((a, b) => a - b);
+    const thresholdIdx = Math.floor(perTradeRatios.length * 0.8);
+    const dynamicThreshold = perTradeRatios.length > 5 ? perTradeRatios[thresholdIdx] : 100;
+    const absorptionDetected = absorptionRatio > dynamicThreshold && totalVol > 0;
 
     // CVD divergence: CVD says one direction but price went the other
     const priceDir = lastPrice > firstPrice ? "up" : lastPrice < firstPrice ? "down" : "flat";

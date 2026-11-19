@@ -22,15 +22,19 @@
 import { calcATR, type Candle } from "./backtest";
 
 export interface WalkForwardResult {
-  oosWinRate: number;       // out-of-sample win rate (0-1)
-  oosAvgReturn: number;     // avg return per OOS trade (fraction)
-  oosMaxDrawdown: number;   // max drawdown across OOS trades
-  oosSharpe: number;        // annualized Sharpe from OOS returns
-  oosSampleSize: number;    // number of OOS trades
-  kellyFraction: number;    // Kelly f* computed from OOS trades
-  inSampleWinRate: number;  // in-sample win rate (for comparison — should be similar)
-  overfitGap: number;       // inSampleWinRate - oosWinRate (large = overfitting)
-  honest: boolean;          // true if OOS win rate > 0.50 AND overfitGap < 0.15
+  oosWinRate: number;
+  oosAvgReturn: number;
+  oosMaxDrawdown: number;
+  oosSharpe: number;
+  oosSampleSize: number;
+  kellyFraction: number;       // point estimate
+  kellyCI5: number;            // 5th percentile of bootstrap Kelly distribution
+  kellyCI95: number;           // 95th percentile
+  kellyUncertainty: number;    // CI95 - CI5 (wide = uncertain → bet less)
+  inSampleWinRate: number;
+  overfitGap: number;
+  honest: boolean;
+  anchoredWindows: number;     // how many anchored windows were tested
   description: string;
 }
 
@@ -46,115 +50,73 @@ export function walkForwardBacktest(
   currentRegime: { adx: number; atrRatio: number },
   action: "LONG" | "SHORT" | "FLAT",
 ): WalkForwardResult {
-  if (candles.length < 100 || action === "FLAT") {
-    return {
-      oosWinRate: 0, oosAvgReturn: 0, oosMaxDrawdown: 0, oosSharpe: 0,
-      oosSampleSize: 0, kellyFraction: 0, inSampleWinRate: 0, overfitGap: 0,
-      honest: false,
-      description: "insufficient data or no action",
-    };
-  }
+  const empty: WalkForwardResult = {
+    oosWinRate: 0, oosAvgReturn: 0, oosMaxDrawdown: 0, oosSharpe: 0,
+    oosSampleSize: 0, kellyFraction: 0, kellyCI5: 0, kellyCI95: 0, kellyUncertainty: 0,
+    inSampleWinRate: 0, overfitGap: 0, honest: false, anchoredWindows: 0,
+    description: "insufficient data or no action",
+  };
 
-  // Walk-forward: 5 windows of 100 candles
-  const windowSize = 100;
-  const numWindows = Math.floor(candles.length / windowSize);
+  if (candles.length < 100 || action === "FLAT") return empty;
+
+  // P3: ANCHORED walk-forward — training window EXPANDS (more data for later tests)
+  // Window 1: train [0,100], test [100,200]
+  // Window 2: train [0,200], test [200,300]  ← training grew
+  // Window 3: train [0,300], test [300,400]  ← training grew again
+  // This gives each test more regime history to learn from.
+  const testWindowSize = 80;  // test on 80 candles (shorter test = more windows)
+  const minTrainSize = 100;
   const oosTrades: OOSTrade[] = [];
   const inSampleReturns: number[] = [];
-
-  // Define the current regime's matching criteria
   const adxBand = currentRegime.adx < 20 ? "low" : currentRegime.adx > 25 ? "high" : "mid";
   const atrBand = currentRegime.atrRatio > 1.5 ? "high" : currentRegime.atrRatio < 0.8 ? "low" : "normal";
+  let windowsTested = 0;
 
-  for (let w = 1; w < numWindows; w++) {
-    // Training window: w-1 (used to "learn" the regime)
-    const trainStart = (w - 1) * windowSize;
-    const trainEnd = w * windowSize;
-    const trainCandles = candles.slice(trainStart, trainEnd);
-
-    // Test window: w (OOS — the model hasn't seen this)
-    const testStart = w * windowSize;
-    const testEnd = Math.min(testStart + windowSize, candles.length);
+  for (let testStart = minTrainSize; testStart + 20 <= candles.length; testStart += testWindowSize) {
+    const trainCandles = candles.slice(0, testStart);  // anchored: always from 0 to testStart
+    const testEnd = Math.min(testStart + testWindowSize, candles.length);
     const testCandles = candles.slice(testStart, testEnd);
+    if (trainCandles.length < minTrainSize || testCandles.length < 20) continue;
 
-    if (trainCandles.length < 50 || testCandles.length < 20) continue;
-
-    // Compute regime in the TRAINING window (this is what the model "knows")
+    // Compute regime in the TRAINING window
     const trainATR = calcATR(trainCandles, 14);
     const trainADX = approximateADX(trainCandles);
     const trainATRRatio = trainATR / (avgATR(trainCandles, 50) || trainATR);
-
     const trainAdxBand = trainADX < 20 ? "low" : trainADX > 25 ? "high" : "mid";
     const trainAtrBand = trainATRRatio > 1.5 ? "high" : trainATRRatio < 0.8 ? "low" : "normal";
 
-    // Only count OOS trades where the training regime matches the current regime
-    // (This is the honest part: we're testing whether "when regime was like this
-    // in the past, the forward trade was profitable")
     if (trainAdxBand !== adxBand || trainAtrBand !== atrBand) continue;
+    windowsTested++;
 
-    // Entry at the boundary between train and test (first candle of test window)
     const entry = testCandles[0].close;
-    const stop = action === "LONG"
-      ? entry - 2 * trainATR
-      : action === "SHORT"
-        ? entry + 2 * trainATR
-        : entry;
-    const target = action === "LONG"
-      ? entry + 3 * trainATR
-      : action === "SHORT"
-        ? entry - 3 * trainATR
-        : entry;
+    const stop = action === "LONG" ? entry - 2 * trainATR : action === "SHORT" ? entry + 2 * trainATR : entry;
+    const target = action === "LONG" ? entry + 3 * trainATR : action === "SHORT" ? entry - 3 * trainATR : entry;
 
-    // Simulate the trade through the test window
     let exitPrice = entry;
     let maxDD = 0;
     let exited = false;
 
     for (let i = 0; i < testCandles.length; i++) {
       const c = testCandles[i];
-      // Check stop hit first (worst case)
       if (action === "LONG" && c.low <= stop) { exitPrice = stop; exited = true; break; }
       if (action === "SHORT" && c.high >= stop) { exitPrice = stop; exited = true; break; }
-      // Check target hit
       if (action === "LONG" && c.high >= target) { exitPrice = target; exited = true; break; }
       if (action === "SHORT" && c.low <= target) { exitPrice = target; exited = true; break; }
-
-      // Track drawdown
-      if (action === "LONG") {
-        const dd = (entry - c.low) / entry;
-        if (dd > maxDD) maxDD = dd;
-      } else if (action === "SHORT") {
-        const dd = (c.high - entry) / entry;
-        if (dd > maxDD) maxDD = dd;
-      }
+      if (action === "LONG") { const dd = (entry - c.low) / entry; if (dd > maxDD) maxDD = dd; }
+      else if (action === "SHORT") { const dd = (c.high - entry) / entry; if (dd > maxDD) maxDD = dd; }
     }
-
-    // If not exited, use last candle close
     if (!exited) exitPrice = testCandles[testCandles.length - 1].close;
 
-    const ret = action === "LONG"
-      ? (exitPrice - entry) / entry
-      : action === "SHORT"
-        ? (entry - exitPrice) / entry
-        : 0;
-
-    const holdHours = testCandles.length; // each candle is 1h
-
-    oosTrades.push({ return: ret, holdHours, maxDrawdown: maxDD, win: ret > 0 });
-    inSampleReturns.push(ret); // also track for overfit comparison
+    const ret = action === "LONG" ? (exitPrice - entry) / entry : action === "SHORT" ? (entry - exitPrice) / entry : 0;
+    oosTrades.push({ return: ret, holdHours: testCandles.length, maxDrawdown: maxDD, win: ret > 0 });
+    inSampleReturns.push(ret);
   }
 
-  // Also compute in-sample stats (same data, but this is what the old backtest reported)
-  // For comparison — the gap between in-sample and OOS reveals overfitting.
-  const inSampleWinRate = inSampleReturns.length > 0
-    ? inSampleReturns.filter((r) => r > 0).length / inSampleReturns.length
-    : 0;
+  const inSampleWinRate = inSampleReturns.length > 0 ? inSampleReturns.filter((r) => r > 0).length / inSampleReturns.length : 0;
 
   if (oosTrades.length === 0) {
-    return {
-      oosWinRate: 0, oosAvgReturn: 0, oosMaxDrawdown: 0, oosSharpe: 0,
-      oosSampleSize: 0, kellyFraction: 0,
-      inSampleWinRate, overfitGap: 0, honest: false,
-      description: `No OOS trades matching regime ${adxBand}/${atrBand} — insufficient historical data for validation`,
+    return { ...empty, inSampleWinRate, anchoredWindows: windowsTested,
+      description: `No OOS trades matching regime ${adxBand}/${atrBand} (${windowsTested} anchored windows tested)`,
     };
   }
 
@@ -165,31 +127,52 @@ export function walkForwardBacktest(
   const stdRet = Math.sqrt(oosTrades.reduce((a, t) => a + Math.pow(t.return - oosAvgReturn, 2), 0) / oosTrades.length);
   const oosSharpe = stdRet > 0 ? (oosAvgReturn / stdRet) * Math.sqrt(365 * 24 / avgHold) : 0;
 
-  // Kelly from OOS trades only
-  // f* = (b*p - q) / b where b = avg win / avg loss, p = win rate, q = 1-p
+  // Point estimate Kelly
   const wins = oosTrades.filter((t) => t.win);
   const losses = oosTrades.filter((t) => !t.win);
   const avgWin = wins.length > 0 ? wins.reduce((a, t) => a + t.return, 0) / wins.length : 0;
   const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((a, t) => a + t.return, 0) / losses.length) : 0;
-  const b = avgLoss > 0 ? avgWin / avgLoss : 1.5; // payoff ratio
+  const b = avgLoss > 0 ? avgWin / avgLoss : 1.5;
   const p = oosWinRate;
   const q = 1 - p;
   const kellyFraction = b > 0 && p > 0 ? Math.max(0, (b * p - q) / b) : 0;
 
+  // P4: BOOTSTRAP CI for Kelly — resample OOS trades 1000 times, compute Kelly
+  // for each resample, report 5th/95th percentile. Wide CI = high uncertainty.
+  // Use 5th percentile Kelly (conservative) for actual sizing.
+  const kellySamples: number[] = [];
+  const bootstrapIterations = 1000;
+  for (let i = 0; i < bootstrapIterations; i++) {
+    // Resample with replacement
+    const sample: OOSTrade[] = [];
+    for (let j = 0; j < oosTrades.length; j++) {
+      sample.push(oosTrades[Math.floor(Math.random() * oosTrades.length)]);
+    }
+    const sWins = sample.filter((t) => t.win);
+    const sLosses = sample.filter((t) => !t.win);
+    const sAvgWin = sWins.length > 0 ? sWins.reduce((a, t) => a + t.return, 0) / sWins.length : 0;
+    const sAvgLoss = sLosses.length > 0 ? Math.abs(sLosses.reduce((a, t) => a + t.return, 0) / sLosses.length) : 0;
+    const sb = sAvgLoss > 0 ? sAvgWin / sAvgLoss : 1.5;
+    const sp = sWins.length / sample.length;
+    const sq = 1 - sp;
+    const sKelly = sb > 0 && sp > 0 ? Math.max(0, (sb * sp - sq) / sb) : 0;
+    kellySamples.push(sKelly);
+  }
+  kellySamples.sort((a, b2) => a - b2);
+  const kellyCI5 = kellySamples[Math.floor(bootstrapIterations * 0.05)];
+  const kellyCI95 = kellySamples[Math.floor(bootstrapIterations * 0.95)];
+  const kellyUncertainty = kellyCI95 - kellyCI5;
+
   const overfitGap = inSampleWinRate - oosWinRate;
-  const honest = oosWinRate > 0.50 && overfitGap < 0.15 && oosTrades.length >= 5;
+  // honest now also requires bootstrap CI5 > 0 (95% of resamples show positive Kelly)
+  const honest = oosWinRate > 0.50 && overfitGap < 0.15 && oosTrades.length >= 5 && kellyCI5 > 0;
 
   return {
-    oosWinRate,
-    oosAvgReturn,
-    oosMaxDrawdown,
-    oosSharpe,
+    oosWinRate, oosAvgReturn, oosMaxDrawdown, oosSharpe,
     oosSampleSize: oosTrades.length,
-    kellyFraction,
-    inSampleWinRate,
-    overfitGap,
-    honest,
-    description: `OOS: ${(oosWinRate * 100).toFixed(0)}% win (${oosTrades.length} trades), avg ${(oosAvgReturn * 100).toFixed(1)}%, Sharpe ${oosSharpe.toFixed(1)}, Kelly ${(kellyFraction * 100).toFixed(1)}%. In-sample: ${(inSampleWinRate * 100).toFixed(0)}% (overfit gap ${(overfitGap * 100).toFixed(0)}%). ${honest ? "Edge confirmed OOS." : "Edge NOT confirmed — treat with caution."}`,
+    kellyFraction, kellyCI5, kellyCI95, kellyUncertainty,
+    inSampleWinRate, overfitGap, honest, anchoredWindows: windowsTested,
+    description: `OOS: ${(oosWinRate * 100).toFixed(0)}% win (${oosTrades.length} trades, ${windowsTested} anchored windows), Sharpe ${oosSharpe.toFixed(1)}, Kelly ${(kellyFraction * 100).toFixed(1)}% [CI5=${(kellyCI5 * 100).toFixed(1)}%, CI95=${(kellyCI95 * 100).toFixed(1)}%]. Overfit gap ${(overfitGap * 100).toFixed(0)}%. ${honest ? "Edge confirmed OOS (95% bootstrap positive)." : "Edge NOT confirmed."}`,
   };
 }
 

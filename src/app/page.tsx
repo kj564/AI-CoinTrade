@@ -35,8 +35,14 @@ interface AlphaSignal {
   backtest: {
     oosWinRate: number; oosAvgReturn: number; oosSampleSize: number;
     oosSharpe: number; oosMaxDrawdown: number; kellyFraction: number;
-    inSampleWinRate: number; overfitGap: number; honest: boolean; description: string;
+    kellyCI5: number; kellyCI95: number; kellyUncertainty: number;
+    inSampleWinRate: number; overfitGap: number; honest: boolean;
+    anchoredWindows: number; description: string;
   };
+  liquidity: {
+    maxNotionalWithoutSlippage: number; topBidDepth: number; topAskDepth: number;
+    spreadPct: number; liquidityCapActive: boolean;
+  } | null;
   rationale: string[];
   invalidation: string;
   warning: string | null;
@@ -305,11 +311,11 @@ function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
           </div>
         )}
 
-        {/* OOS BACKTEST (walk-forward, not in-sample) */}
+        {/* OOS BACKTEST with bootstrap CI */}
         <div style={{ background: "#0f0f0f", border: `1px solid ${s.backtest.honest ? "#16a34a40" : "#1a1a1a"}`, borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
           <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
-            Walk-Forward OOS Backtest <span style={{ color: "#404040" }}>(n={s.backtest.oosSampleSize})</span>
-            {s.backtest.honest && s.backtest.oosSampleSize > 0 && <span style={{ color: "#16a34a", marginLeft: "8px", fontWeight: 700 }}>✓ EDGE CONFIRMED OOS</span>}
+            Anchored Walk-Forward OOS <span style={{ color: "#404040" }}>(n={s.backtest.oosSampleSize}, {s.backtest.anchoredWindows} windows)</span>
+            {s.backtest.honest && s.backtest.oosSampleSize > 0 && <span style={{ color: "#16a34a", marginLeft: "8px", fontWeight: 700 }}>✓ EDGE CONFIRMED (95% bootstrap)</span>}
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
             <div>
@@ -319,20 +325,26 @@ function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
               </div>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Avg Return</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosAvgReturn > 0 ? "#16a34a" : "#dc2626" }}>
-                {s.backtest.oosSampleSize > 0 ? fmtPct(s.backtest.oosAvgReturn) : "—"}
-              </div>
-            </div>
-            <div>
               <div style={{ fontSize: "10px", color: "#525252" }}>OOS Sharpe</div>
               <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosSharpe > 1 ? "#16a34a" : "#737373" }}>
                 {s.backtest.oosSampleSize > 0 ? s.backtest.oosSharpe.toFixed(1) : "—"}
               </div>
             </div>
             <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly (OOS)</div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly (point)</div>
               <div style={{ fontSize: "14px", fontWeight: 600 }}>{fmtPct(s.backtest.kellyFraction, 1)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly CI5 (conservative)</div>
+              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.kellyCI5 > 0 ? "#16a34a" : "#dc2626" }}>
+                {fmtPct(s.backtest.kellyCI5, 1)}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly CI [5-95%]</div>
+              <div style={{ fontSize: "12px", fontWeight: 500, color: s.backtest.kellyUncertainty > 0.3 ? "#f59e0b" : "#737373" }}>
+                {(s.backtest.kellyCI5 * 100).toFixed(1)}–{(s.backtest.kellyCI95 * 100).toFixed(1)}%
+              </div>
             </div>
             <div>
               <div style={{ fontSize: "10px", color: "#525252" }}>Overfit Gap</div>

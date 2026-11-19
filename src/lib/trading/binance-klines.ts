@@ -10,10 +10,21 @@
 import type { Candle } from "./backtest";
 
 const BINANCE_API = "https://api.binance.com/api/v3";
-// For 1h candles, a new candle appears every 3600s. The latest candle is the
-// current (unclosed) one — its openTime is the start of the current hour.
-// It's only truly stale if no new candle has appeared for > 65 minutes.
-const STALE_THRESHOLD_SEC = 3900; // 65 minutes — allows for API delay
+// P6: Dynamic staleness threshold per pair — high-liquidity pairs (BTC, ETH)
+// update more frequently and can afford tighter thresholds. Low-liquidity
+// pairs (XRP, SOL) may have gaps, so allow more slack.
+const STALE_THRESHOLDS: Record<string, number> = {
+  btc_idr: 3900,   // 65 min (BTC: high liquidity, frequent updates)
+  eth_idr: 3900,   // 65 min
+  sol_idr: 5400,   // 90 min (medium liquidity)
+  bnb_idr: 5400,   // 90 min
+  xrp_idr: 7200,   // 120 min (lower liquidity, may have gaps)
+};
+const DEFAULT_STALE_THRESHOLD_SEC = 5400; // 90 min fallback
+
+function getStaleThreshold(pair: string): number {
+  return STALE_THRESHOLDS[pair] ?? DEFAULT_STALE_THRESHOLD_SEC;
+}
 
 function pairToBinanceSymbol(pair: string): string {
   const coin = pair.replace("_idr", "").toUpperCase();
@@ -28,10 +39,10 @@ export interface KlinesResult {
   source: "binance" | "fallback" | "none";
 }
 
-// Fetch historical klines from Binance with staleness check.
-// Returns candles + staleness metadata. If Binance fails, returns empty + stale=true.
+// Fetch historical klines from Binance with pair-specific staleness check.
 export async function getBinanceKlinesWithMeta(pair: string, interval: "1h" | "4h" | "1d" = "1h", limit = 200): Promise<KlinesResult> {
   const symbol = pairToBinanceSymbol(pair);
+  const threshold = getStaleThreshold(pair);
   try {
     const url = `${BINANCE_API}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     const r = await fetch(url, { next: { revalidate: 60 } });
@@ -51,7 +62,7 @@ export async function getBinanceKlinesWithMeta(pair: string, interval: "1h" | "4
     const now = Math.floor(Date.now() / 1000);
     const latestTime = candles[candles.length - 1].time;
     const ageSec = now - latestTime;
-    const stale = ageSec > STALE_THRESHOLD_SEC;
+    const stale = ageSec > threshold;
 
     return { candles, stale, latestCandleTime: latestTime, ageSec, source: "binance" };
   } catch (e) {

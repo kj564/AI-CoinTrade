@@ -39,7 +39,7 @@ import { getFundingRate, type FundingRateInfo } from "./funding";
 import { getBinanceKlinesWithMeta, convertKlinesToIdr, type KlinesResult } from "./binance-klines";
 import { getMicrostructure, type MicrostructureData } from "./microstructure";
 import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
-import { getTicker } from "@/lib/indodax";
+import { getTicker, getDepth } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
 
 // Simple RSI calculation (backtest.ts has rsiArr but it's not exported)
@@ -109,17 +109,30 @@ export interface AlphaSignal {
 
   // === WALK-FORWARD OOS BACKTEST ===
   backtest: {
-    oosWinRate: number;       // out-of-sample win rate
+    oosWinRate: number;
     oosAvgReturn: number;
     oosSampleSize: number;
     oosSharpe: number;
     oosMaxDrawdown: number;
-    kellyFraction: number;    // Kelly from OOS trades
-    inSampleWinRate: number;  // for comparison
-    overfitGap: number;       // in-sample - OOS (large = overfit)
-    honest: boolean;          // edge confirmed OOS
+    kellyFraction: number;      // point estimate
+    kellyCI5: number;           // 5th percentile bootstrap Kelly
+    kellyCI95: number;          // 95th percentile
+    kellyUncertainty: number;   // CI width
+    inSampleWinRate: number;
+    overfitGap: number;
+    honest: boolean;
+    anchoredWindows: number;
     description: string;
   };
+
+  // === LIQUIDITY CAP (P5) ===
+  liquidity: {
+    maxNotionalWithoutSlippage: number;  // max IDR notional before >0.5% slippage
+    topBidDepth: number;                 // total bid volume in top 5 levels
+    topAskDepth: number;
+    spreadPct: number;
+    liquidityCapActive: boolean;         // true if liquidity cap is binding (not 30% capital cap)
+  } | null;
 
   rationale: string[];
   invalidation: string;
@@ -200,40 +213,38 @@ export async function generateAlphaSignals(capitalIdr = DEFAULT_CAPITAL): Promis
 }
 
 async function generatePairSignal(pair: string, capitalIdr: number): Promise<AlphaSignal | null> {
-  // Fetch 500 1h klines from Binance + staleness metadata + INDODAX ticker
-  const [klinesResult, ticker] = await Promise.all([
+  // Fetch klines + ticker + depth (for liquidity cap) in parallel
+  const [klinesResult, ticker, depth] = await Promise.all([
     getBinanceKlinesWithMeta(pair, "1h", 500),
     getTicker(pair),
+    getDepth(pair.replace("_idr", "idr")),  // INDODAX depth needs "btcidr" format
   ]);
 
-  // P6: DATA STALENESS — if Binance fails or data is old, try DB fallback
   let candles1hSource = klinesResult.candles;
   let dataSource = klinesResult.source;
   let dataStale = klinesResult.stale;
 
   if (candles1hSource.length < 50) {
-    // Fallback to INDODAX DB candles
     const { candles } = await ensureCandles(pair, "1h", 50);
     if (candles.length < 50) return null;
     candles1hSource = candles;
     dataSource = "fallback";
-    dataStale = false; // DB candles are at least recent
+    dataStale = false;
   }
 
-  // Resample 1h → 1d (avoids second Binance API call)
   const candles1dRaw = resample1hTo1d(candles1hSource);
-
-  // Convert USDT prices to IDR using INDODAX ticker
   const idrPrice = ticker?.last ?? 0;
   const usdtRefPrice = candles1hSource[candles1hSource.length - 1].close;
   const candles1h = idrPrice > 0 ? convertKlinesToIdr(candles1hSource, idrPrice, usdtRefPrice) : candles1hSource;
   const candles1d = idrPrice > 0 ? convertKlinesToIdr(candles1dRaw, idrPrice, usdtRefPrice) : candles1dRaw;
 
-  // Fetch funding + microstructure in parallel
   const [funding, microstructure] = await Promise.all([
     getFundingRate(pair),
     getMicrostructure(pair, usdtRefPrice),
   ]);
+
+  // P5: Compute liquidity-based notional cap from INDODAX order book depth
+  const liquidity = computeLiquidityCap(depth, idrPrice, capitalIdr);
 
   return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
     dataSource: dataSource as string,
@@ -241,7 +252,39 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     funding,
     microstructure,
     idrPrice: idrPrice || usdtRefPrice,
+    liquidity,
   });
+}
+
+// P5: Liquidity-based notional cap — prevents slippage explosion.
+// Computes the max notional that can be placed without moving price >0.5%.
+// If this is less than the 30% capital cap, the liquidity cap is binding.
+function computeLiquidityCap(depth: any, idrPrice: number, capitalIdr: number): AlphaSignal["liquidity"] {
+  if (!depth || !depth.buy || !depth.sell || idrPrice <= 0) return null;
+
+  const topBid = parseFloat(depth.buy[0]?.[0] ?? "0");
+  const topAsk = parseFloat(depth.sell[0]?.[0] ?? "0");
+  const spreadPct = topBid > 0 && topAsk > 0 ? ((topAsk - topBid) / ((topBid + topAsk) / 2)) * 100 : 0;
+
+  // Sum volume in top 5 levels (both sides) to estimate available liquidity
+  let topBidDepthVol = 0, topAskDepthVol = 0;
+  for (let i = 0; i < Math.min(5, depth.buy.length); i++) topBidDepthVol += parseFloat(depth.buy[i]?.[1] ?? "0");
+  for (let i = 0; i < Math.min(5, depth.sell.length); i++) topAskDepthVol += parseFloat(depth.sell[i]?.[1] ?? "0");
+
+  // Max notional without >0.5% slippage: use ~20% of top-5 depth (conservative —
+  // don't eat through the entire book). Notional = vol × price.
+  const availableVol = Math.min(topBidDepthVol, topAskDepthVol) * 0.2;
+  const maxNotionalWithoutSlippage = availableVol * idrPrice;
+  const capitalCap = capitalIdr * 0.30; // 30% of capital
+  const liquidityCapActive = maxNotionalWithoutSlippage < capitalCap;
+
+  return {
+    maxNotionalWithoutSlippage,
+    topBidDepth: topBidDepthVol,
+    topAskDepth: topAskDepthVol,
+    spreadPct,
+    liquidityCapActive,
+  };
 }
 
 interface SignalContext {
@@ -250,6 +293,7 @@ interface SignalContext {
   funding: FundingRateInfo | null;
   microstructure: MicrostructureData | null;
   idrPrice: number;
+  liquidity: AlphaSignal["liquidity"];
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -421,32 +465,46 @@ async function generateSignalFromCandles(
   }
   const rewardRisk = action !== "FLAT" ? Math.abs(takeProfit1 - price) / Math.abs(price - stopLoss) : 0;
 
-  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS
+  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS WITH BOOTSTRAP CI
   const wfResult = walkForwardBacktest(candles1h, regime, action);
 
-  // Kelly from OOS trades (not in-sample)
-  const oosKelly = wfResult.kellyFraction;
+  // P4: Use 5th percentile bootstrap Kelly (conservative — only bet if 95%
+  // of bootstrap resamples show positive Kelly). Falls back to point estimate
+  // if bootstrap returned 0 (no OOS trades).
+  const oosKelly = wfResult.kellyCI5 > 0 ? wfResult.kellyCI5 : wfResult.kellyFraction;
   const fractionalKelly = Math.max(0, oosKelly * KELLY_FRACTION);
   let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale : 0;
 
-  // P5: NOTIONAL CAP — prevent notional explosion when ATR is small
-  // notional = (riskAmount / stopDistance) × entryPrice
-  // If ATR is tiny, stop is tight, so notional = riskAmount / (2*ATR) × price → can be huge
+  // P5: NOTIONAL CAP — three layers: capital cap (30%), leverage cap (3x),
+  // AND liquidity cap (max notional without >0.5% slippage from order book).
   const riskAmount = capitalIdr * (positionSizePct > 0 ? RISK_PER_TRADE_PCT : 0) * volScale;
   const stopDistance = action !== "FLAT" ? Math.abs(price - stopLoss) : 0;
   let notionalIdr = stopDistance > 0 ? (riskAmount / stopDistance) * price : 0;
-  const maxNotionalPct = 0.30; // cap notional at 30% of capital
-  const maxLeverage = 3.0;     // cap leverage at 3x
+  const maxNotionalPct = 0.30;
+  const maxLeverage = 3.0;
   let notionalCapPct = notionalIdr / capitalIdr;
   let leverage = notionalCapPct;
 
+  // Layer 1: Capital cap (30%)
   if (notionalCapPct > maxNotionalPct) {
     const scaleDown = maxNotionalPct / notionalCapPct;
     notionalIdr *= scaleDown;
     positionSizePct *= scaleDown;
     notionalCapPct = maxNotionalPct;
     leverage = notionalCapPct;
-    rationale.push(`NOTIONAL CAP: original notional ${(notionalIdr / scaleDown / capitalIdr * 100).toFixed(0)}% of capital → scaled down to ${maxNotionalPct * 100}% (leverage cap ${maxLeverage}x)`);
+    rationale.push(`NOTIONAL CAP: capital cap → scaled to ${maxNotionalPct * 100}% (${maxLeverage}x lev)`);
+  }
+
+  // Layer 2: Liquidity cap (P5) — if order book is thin, reduce further
+  if (ctx.liquidity && notionalIdr > ctx.liquidity.maxNotionalWithoutSlippage) {
+    const liqCap = ctx.liquidity.maxNotionalWithoutSlippage;
+    const scaleDown = liqCap / notionalIdr;
+    const originalNotional = notionalIdr;
+    notionalIdr = liqCap;
+    positionSizePct *= scaleDown;
+    notionalCapPct = notionalIdr / capitalIdr;
+    leverage = notionalCapPct;
+    rationale.push(`LIQUIDITY CAP: order book depth limits notional to Rp ${liqCap.toLocaleString("id-ID", { maximumFractionDigits: 0 })} (spread ${ctx.liquidity.spreadPct.toFixed(3)}%, top-5 depth: bid ${ctx.liquidity.topBidDepth.toFixed(2)} / ask ${ctx.liquidity.topAskDepth.toFixed(2)})`);
   }
 
   const positionSizeIdr = capitalIdr * positionSizePct;
@@ -512,11 +570,16 @@ async function generateSignalFromCandles(
       oosSharpe: wfResult.oosSharpe,
       oosMaxDrawdown: wfResult.oosMaxDrawdown,
       kellyFraction: wfResult.kellyFraction,
+      kellyCI5: wfResult.kellyCI5,
+      kellyCI95: wfResult.kellyCI95,
+      kellyUncertainty: wfResult.kellyUncertainty,
       inSampleWinRate: wfResult.inSampleWinRate,
       overfitGap: wfResult.overfitGap,
       honest: wfResult.honest,
+      anchoredWindows: wfResult.anchoredWindows,
       description: wfResult.description,
     },
+    liquidity: ctx.liquidity,
     rationale,
     invalidation,
     warning,
