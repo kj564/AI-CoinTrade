@@ -39,6 +39,8 @@ import { getFundingRate, type FundingRateInfo } from "./funding";
 import { getBinanceKlinesWithMeta, convertKlinesToIdr, type KlinesResult } from "./binance-klines";
 import { getMicrostructure, type MicrostructureData } from "./microstructure";
 import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
+import { validateAbsorptionThreshold, type AbsorptionValidation } from "./absorption-validation";
+import { computeWalkTheBookCap, type WalkTheBookResult } from "./walk-the-book";
 import { getTicker, getDepth } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
 
@@ -125,13 +127,36 @@ export interface AlphaSignal {
     description: string;
   };
 
-  // === LIQUIDITY CAP (P5) ===
+  // === LIQUIDITY CAP (P3: walk-the-book) ===
   liquidity: {
-    maxNotionalWithoutSlippage: number;  // max IDR notional before >0.5% slippage
-    topBidDepth: number;                 // total bid volume in top 5 levels
+    maxNotionalWithoutSlippage: number;
+    topBidDepth: number;
     topAskDepth: number;
     spreadPct: number;
-    liquidityCapActive: boolean;         // true if liquidity cap is binding (not 30% capital cap)
+    liquidityCapActive: boolean;
+    // P3: walk-the-book details
+    walkBookLevels: number;         // levels consumed at max notional
+    walkBookSlippagePct: number;    // actual slippage at max notional
+    walkBookMethod: string;         // "walk_the_book" or "simple_depth"
+  } | null;
+
+  // === ABSORPTION OOS VALIDATION (P2) ===
+  absorptionValidation: {
+    optimalThreshold: number;
+    precision: number;
+    precisionCI5: number;
+    precisionCI95: number;
+    lift: number;
+    validated: boolean;
+    description: string;
+  } | null;
+
+  // === IMPACT SEVERITY (P4) ===
+  impact: {
+    capitalAtRiskPct: number;       // positionSizePct (% of portfolio at risk)
+    expectedLossIdr: number;        // if stop hit: how much IDR lost
+    concentrationPct: number;       // what % of total portfolio risk this represents
+    impactLevel: "HIGH" | "MEDIUM" | "LOW";
   } | null;
 
   rationale: string[];
@@ -243,8 +268,11 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     getMicrostructure(pair, usdtRefPrice),
   ]);
 
-  // P5: Compute liquidity-based notional cap from INDODAX order book depth
-  const liquidity = computeLiquidityCap(depth, idrPrice, capitalIdr);
+  // P3: Walk-the-book liquidity cap (replaces simple depth estimate)
+  const liquidity = computeWalkTheBookLiquidity(depth, idrPrice, capitalIdr);
+
+  // P2: Absorption threshold OOS validation (from historical candles)
+  const absorptionValidation = validateAbsorptionThreshold(candles1hSource);
 
   return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
     dataSource: dataSource as string,
@@ -253,37 +281,44 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     microstructure,
     idrPrice: idrPrice || usdtRefPrice,
     liquidity,
+    absorptionValidation,
+    candles1h: candles1h,
   });
 }
 
-// P5: Liquidity-based notional cap — prevents slippage explosion.
-// Computes the max notional that can be placed without moving price >0.5%.
-// If this is less than the 30% capital cap, the liquidity cap is binding.
-function computeLiquidityCap(depth: any, idrPrice: number, capitalIdr: number): AlphaSignal["liquidity"] {
+// P3: Walk-the-book liquidity cap — simulates consuming order book levels
+function computeWalkTheBookLiquidity(depth: any, idrPrice: number, capitalIdr: number): AlphaSignal["liquidity"] {
   if (!depth || !depth.buy || !depth.sell || idrPrice <= 0) return null;
 
   const topBid = parseFloat(depth.buy[0]?.[0] ?? "0");
   const topAsk = parseFloat(depth.sell[0]?.[0] ?? "0");
-  const spreadPct = topBid > 0 && topAsk > 0 ? ((topAsk - topBid) / ((topBid + topAsk) / 2)) * 100 : 0;
+  const midPrice = (topBid + topAsk) / 2;
+  const spreadPct = midPrice > 0 ? ((topAsk - topBid) / midPrice) * 100 : 0;
 
-  // Sum volume in top 5 levels (both sides) to estimate available liquidity
+  // Walk the book for both sides
+  const wtBook = computeWalkTheBookCap(depth, midPrice);
+  const maxNotionalFromBook = wtBook.maxNotional;
+
+  // Also compute simple top-5 depth for comparison/fallback
   let topBidDepthVol = 0, topAskDepthVol = 0;
   for (let i = 0; i < Math.min(5, depth.buy.length); i++) topBidDepthVol += parseFloat(depth.buy[i]?.[1] ?? "0");
   for (let i = 0; i < Math.min(5, depth.sell.length); i++) topAskDepthVol += parseFloat(depth.sell[i]?.[1] ?? "0");
 
-  // Max notional without >0.5% slippage: use ~20% of top-5 depth (conservative —
-  // don't eat through the entire book). Notional = vol × price.
-  const availableVol = Math.min(topBidDepthVol, topAskDepthVol) * 0.2;
-  const maxNotionalWithoutSlippage = availableVol * idrPrice;
-  const capitalCap = capitalIdr * 0.30; // 30% of capital
-  const liquidityCapActive = maxNotionalWithoutSlippage < capitalCap;
+  const capitalCap = capitalIdr * 0.30;
+  const liquidityCapActive = maxNotionalFromBook > 0 && maxNotionalFromBook < capitalCap;
+
+  const levels = wtBook.buySide?.levelsConsumed ?? 0;
+  const slippage = wtBook.buySide?.actualSlippagePct ?? 0;
 
   return {
-    maxNotionalWithoutSlippage,
+    maxNotionalWithoutSlippage: maxNotionalFromBook > 0 ? maxNotionalFromBook : (Math.min(topBidDepthVol, topAskDepthVol) * 0.2 * idrPrice),
     topBidDepth: topBidDepthVol,
     topAskDepth: topAskDepthVol,
     spreadPct,
     liquidityCapActive,
+    walkBookLevels: levels,
+    walkBookSlippagePct: slippage,
+    walkBookMethod: maxNotionalFromBook > 0 ? "walk_the_book" : "simple_depth",
   };
 }
 
@@ -294,6 +329,8 @@ interface SignalContext {
   microstructure: MicrostructureData | null;
   idrPrice: number;
   liquidity: AlphaSignal["liquidity"];
+  absorptionValidation: AbsorptionValidation | null;
+  candles1h: Candle[];
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -580,6 +617,21 @@ async function generateSignalFromCandles(
       description: wfResult.description,
     },
     liquidity: ctx.liquidity,
+    absorptionValidation: ctx.absorptionValidation ? {
+      optimalThreshold: ctx.absorptionValidation.optimalThreshold,
+      precision: ctx.absorptionValidation.precision,
+      precisionCI5: ctx.absorptionValidation.precisionCI5,
+      precisionCI95: ctx.absorptionValidation.precisionCI95,
+      lift: ctx.absorptionValidation.lift,
+      validated: ctx.absorptionValidation.validated,
+      description: ctx.absorptionValidation.description,
+    } : null,
+    impact: action !== "FLAT" ? {
+      capitalAtRiskPct: positionSizePct,
+      expectedLossIdr: positionSizeIdr, // if stop hit, lose the risked amount
+      concentrationPct: positionSizePct / 0.06 * 100, // % of 6% max portfolio risk
+      impactLevel: positionSizePct > 0.03 ? "HIGH" : positionSizePct > 0.01 ? "MEDIUM" : "LOW",
+    } : null,
     rationale,
     invalidation,
     warning,

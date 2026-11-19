@@ -36,20 +36,68 @@ export async function POST() {
     let tgConfig: { telegramToken?: string | null; telegramChatId?: string | null } | null = null;
     try { tgConfig = await db.botConfig.findUnique({ where: { id: "singleton" } }); } catch { /* ignore */ }
 
-    const alerts: { pair: string; severity: string; action: string; sent: boolean; error?: string }[] = [];
+    // P5: Check which channels are configured
+    const slackUrl = process.env.L2_ALERT_SLACK_WEBHOOK_URL;
+    const discordUrl = process.env.L2_ALERT_DISCORD_WEBHOOK_URL;
+    const webhookUrl = process.env.L2_ALERT_WEBHOOK_URL;
+
+    const alerts: { pair: string; severity: string; action: string; sent: boolean; channels?: string[]; error?: string }[] = [];
 
     for (const { signal: s, severity } of actionable) {
       const message = formatAlertMessage(s, severity);
+      const channels: string[] = [];
+
+      // Telegram (always for actionable)
       if (tgConfig?.telegramToken && tgConfig?.telegramChatId) {
         try {
-          const ok = await sendTelegram(tgConfig.telegramToken, tgConfig.telegramChatId, message);
-          alerts.push({ pair: s.pair, severity, action: s.action, sent: ok });
-        } catch (e) {
-          alerts.push({ pair: s.pair, severity, action: s.action, sent: false, error: e instanceof Error ? e.message : String(e) });
-        }
-      } else {
-        alerts.push({ pair: s.pair, severity, action: s.action, sent: false, error: "Telegram not configured" });
+          await sendTelegram(tgConfig.telegramToken, tgConfig.telegramChatId, message);
+          channels.push("telegram");
+        } catch (e) { /* log but continue to other channels */ }
       }
+
+      // Slack (CRITICAL + ERROR)
+      if (slackUrl) {
+        try {
+          const r = await fetch(slackUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: `[${severity}] ${s.action} ${s.pair.toUpperCase()}`,
+              attachments: [{ color: severity === "CRITICAL" ? "#dc2626" : "#ef4444", title: `Alpha Signal: ${s.action} ${s.pair}`, text: message.slice(0, 500) }],
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+          if (r.ok) channels.push("slack");
+        } catch { /* ignore */ }
+      }
+
+      // Discord (CRITICAL only)
+      if (discordUrl && severity === "CRITICAL") {
+        try {
+          const r = await fetch(discordUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: message.slice(0, 2000) }),
+            signal: AbortSignal.timeout(8000),
+          });
+          if (r.ok) channels.push("discord");
+        } catch { /* ignore */ }
+      }
+
+      // Generic webhook (CRITICAL only)
+      if (webhookUrl && severity === "CRITICAL") {
+        try {
+          const r = await fetch(webhookUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ severity, pair: s.pair, action: s.action, message }),
+            signal: AbortSignal.timeout(8000),
+          });
+          if (r.ok) channels.push("webhook");
+        } catch { /* ignore */ }
+      }
+
+      alerts.push({ pair: s.pair, severity, action: s.action, sent: channels.length > 0, channels });
     }
 
     // Log WARN signals (edge forming — don't send but track)

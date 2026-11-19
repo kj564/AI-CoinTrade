@@ -27,14 +27,19 @@ export interface WalkForwardResult {
   oosMaxDrawdown: number;
   oosSharpe: number;
   oosSampleSize: number;
-  kellyFraction: number;       // point estimate
-  kellyCI5: number;            // 5th percentile of bootstrap Kelly distribution
-  kellyCI95: number;           // 95th percentile
-  kellyUncertainty: number;    // CI95 - CI5 (wide = uncertain → bet less)
+  kellyFraction: number;
+  kellyCI5: number;
+  kellyCI95: number;
+  kellyUncertainty: number;
   inSampleWinRate: number;
   overfitGap: number;
   honest: boolean;
-  anchoredWindows: number;     // how many anchored windows were tested
+  anchoredWindows: number;
+  // P1: Rolling walk-forward cross-check
+  rollingWinRate: number;      // rolling WF win rate (fixed sliding window)
+  rollingSampleSize: number;
+  anchoredRollingGap: number;  // |anchored - rolling| win rate gap (large = regime unstable)
+  regimeStable: boolean;       // true if gap < 15%
   description: string;
 }
 
@@ -54,6 +59,7 @@ export function walkForwardBacktest(
     oosWinRate: 0, oosAvgReturn: 0, oosMaxDrawdown: 0, oosSharpe: 0,
     oosSampleSize: 0, kellyFraction: 0, kellyCI5: 0, kellyCI95: 0, kellyUncertainty: 0,
     inSampleWinRate: 0, overfitGap: 0, honest: false, anchoredWindows: 0,
+    rollingWinRate: 0, rollingSampleSize: 0, anchoredRollingGap: 0, regimeStable: false,
     description: "insufficient data or no action",
   };
 
@@ -164,15 +170,56 @@ export function walkForwardBacktest(
   const kellyUncertainty = kellyCI95 - kellyCI5;
 
   const overfitGap = inSampleWinRate - oosWinRate;
-  // honest now also requires bootstrap CI5 > 0 (95% of resamples show positive Kelly)
-  const honest = oosWinRate > 0.50 && overfitGap < 0.15 && oosTrades.length >= 5 && kellyCI5 > 0;
+
+  // P1: ROLLING walk-forward cross-check — fixed sliding training window
+  // (200 candles) that moves forward. Unlike anchored (which keeps all
+  // history), rolling forgets old data. If anchored and rolling disagree,
+  // the regime is unstable → reduce confidence.
+  const rollingWindowSize = 200; // fixed training window
+  const rollingTrades: OOSTrade[] = [];
+  for (let testStart = rollingWindowSize; testStart + 20 <= candles.length; testStart += testWindowSize) {
+    const trainCandles = candles.slice(testStart - rollingWindowSize, testStart); // FIXED 200-candle window
+    const testEnd = Math.min(testStart + testWindowSize, candles.length);
+    const testCandles = candles.slice(testStart, testEnd);
+    if (trainCandles.length < rollingWindowSize || testCandles.length < 20) continue;
+
+    const trainATR = calcATR(trainCandles, 14);
+    const trainADX = approximateADX(trainCandles);
+    const trainATRRatio = trainATR / (avgATR(trainCandles, 50) || trainATR);
+    const trainAdxBand = trainADX < 20 ? "low" : trainADX > 25 ? "high" : "mid";
+    const trainAtrBand = trainATRRatio > 1.5 ? "high" : trainATRRatio < 0.8 ? "low" : "normal";
+    if (trainAdxBand !== adxBand || trainAtrBand !== atrBand) continue;
+
+    const entry = testCandles[0].close;
+    const stop = action === "LONG" ? entry - 2 * trainATR : action === "SHORT" ? entry + 2 * trainATR : entry;
+    const target = action === "LONG" ? entry + 3 * trainATR : action === "SHORT" ? entry - 3 * trainATR : entry;
+    let exitPrice = entry;
+    let exited = false;
+    for (let i = 0; i < testCandles.length; i++) {
+      const c = testCandles[i];
+      if (action === "LONG" && c.low <= stop) { exitPrice = stop; exited = true; break; }
+      if (action === "SHORT" && c.high >= stop) { exitPrice = stop; exited = true; break; }
+      if (action === "LONG" && c.high >= target) { exitPrice = target; exited = true; break; }
+      if (action === "SHORT" && c.low <= target) { exitPrice = target; exited = true; break; }
+    }
+    if (!exited) exitPrice = testCandles[testCandles.length - 1].close;
+    const ret = action === "LONG" ? (exitPrice - entry) / entry : action === "SHORT" ? (entry - exitPrice) / entry : 0;
+    rollingTrades.push({ return: ret, holdHours: testCandles.length, maxDrawdown: 0, win: ret > 0 });
+  }
+  const rollingWinRate = rollingTrades.length > 0 ? rollingTrades.filter((t) => t.win).length / rollingTrades.length : 0;
+  const anchoredRollingGap = Math.abs(oosWinRate - rollingWinRate);
+  const regimeStable = anchoredRollingGap < 0.15;
+
+  // honest now requires: OOS win >50%, overfit gap <15%, CI5>0, AND regime stable
+  const honest = oosWinRate > 0.50 && overfitGap < 0.15 && oosTrades.length >= 5 && kellyCI5 > 0 && regimeStable;
 
   return {
     oosWinRate, oosAvgReturn, oosMaxDrawdown, oosSharpe,
     oosSampleSize: oosTrades.length,
     kellyFraction, kellyCI5, kellyCI95, kellyUncertainty,
     inSampleWinRate, overfitGap, honest, anchoredWindows: windowsTested,
-    description: `OOS: ${(oosWinRate * 100).toFixed(0)}% win (${oosTrades.length} trades, ${windowsTested} anchored windows), Sharpe ${oosSharpe.toFixed(1)}, Kelly ${(kellyFraction * 100).toFixed(1)}% [CI5=${(kellyCI5 * 100).toFixed(1)}%, CI95=${(kellyCI95 * 100).toFixed(1)}%]. Overfit gap ${(overfitGap * 100).toFixed(0)}%. ${honest ? "Edge confirmed OOS (95% bootstrap positive)." : "Edge NOT confirmed."}`,
+    rollingWinRate, rollingSampleSize: rollingTrades.length, anchoredRollingGap, regimeStable,
+    description: `OOS: ${(oosWinRate * 100).toFixed(0)}% win (${oosTrades.length} trades, ${windowsTested} anchored windows), Sharpe ${oosSharpe.toFixed(1)}, Kelly ${(kellyFraction * 100).toFixed(1)}% [CI5=${(kellyCI5 * 100).toFixed(1)}%, CI95=${(kellyCI95 * 100).toFixed(1)}%]. Rolling cross-check: ${(rollingWinRate * 100).toFixed(0)}% (n=${rollingTrades.length}), gap ${(anchoredRollingGap * 100).toFixed(0)}% ${regimeStable ? "✓ stable" : "⚠ UNSTABLE"}. Overfit gap ${(overfitGap * 100).toFixed(0)}%. ${honest ? "Edge confirmed OOS (95% bootstrap + regime stable)." : "Edge NOT confirmed."}`,
   };
 }
 
