@@ -46,3 +46,28 @@
 - `GET /api/signal/metrics` — Prometheus format (alpha_funding_zscore, alpha_oos_winrate, alpha_kelly_ci5, alpha_liquidity_cap_active, alpha_regime_stable, alpha_absorption_validated, alpha_capital_at_risk, alpha_data_stale)
 - `GET /api/signal/alpha?capital=10000000` — Full JSON signal output
 - `POST /api/signal/alert` — Severity-classified alerts + multi-channel dispatch
+
+### 9. Circuit breaker tripped
+**Symptom:** `circuitBreaker.open=true`, warning says "CIRCUIT BREAKER TRIPPED".
+**Diagnosis:** Pair has 3 consecutive OOS-validated losing signals. Edge may have degraded for this pair.
+**Action:** Do NOT override. Signals suppressed for cooldown (1h→2h→4h→8h exponential). After cooldown, half-open probe allows ONE signal. If it wins → circuit closes. If it loses → re-open with longer cooldown. Check `circuitBreaker.cooldownSec` for time remaining.
+
+### 10. Limit order recommendation
+**Symptom:** `limitOrder.recommendation` = "use_market" or "improve_price".
+**Diagnosis:** Order book queue is too deep relative to your order size. Fill probability low (<30%). Adverse selection cost outweighs spread savings.
+**Action:** Use market order instead of limit. Or improve your price (cross half-spread) for better fill probability. Check `limitOrder.fillProbability` and `limitOrder.netExpectedCostPct`.
+
+### 11. Expected value negative (EV severity = WARN)
+**Symptom:** `impact.evSeverity=WARN`, `impact.expectedValueIdr <= 0`.
+**Diagnosis:** Impact × probability = negative expected value. Even though the signal fired, the OOS win rate is too low for the risk/reward ratio.
+**Action:** Do NOT execute. The system correctly identifies this as negative EV. Wait for OOS win rate to improve (more data) or for a better risk/reward entry.
+
+### 12. Email alert not received
+**Symptom:** CRITICAL alert sent but no email.
+**Diagnosis:** `L2_ALERT_SMTP_HOST` or `L2_ALERT_EMAIL_TO` env vars not set.
+**Action:** Set SMTP env vars: `L2_ALERT_SMTP_HOST`, `L2_ALERT_SMTP_PORT` (default 587), `L2_ALERT_SMTP_USER`, `L2_ALERT_SMTP_PASS`, `L2_ALERT_EMAIL_TO`, `L2_ALERT_EMAIL_FROM`. Email is only sent for CRITICAL severity (not ERROR/WARN/INFO).
+
+### 13. Absorption multi-level sweep all negative
+**Symptom:** `absorptionValidation.validated=false`, description says "NO validated cell found across 6 reversal levels".
+**Diagnosis:** Absorption ratio (volume/body) does not predict reversals at ANY reversal level (0.3% to 3%). This is a robust honest negative — not a threshold tuning issue.
+**Action:** Accept that absorption is not predictive for this pair. The system still uses microstructure (OI trend, CVD divergence) for confirmation, but absorption alone is not sufficient. Consider alternative microstructure signals (e.g., delta volume divergence).

@@ -40,7 +40,8 @@ import { getBinanceKlinesWithMeta, convertKlinesToIdr, type KlinesResult } from 
 import { getMicrostructure, type MicrostructureData } from "./microstructure";
 import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
 import { validateAbsorptionThreshold, type AbsorptionValidation } from "./absorption-validation";
-import { computeWalkTheBookCap, type WalkTheBookResult } from "./walk-the-book";
+import { computeWalkTheBookCap, computeLimitOrderCost, type WalkTheBookResult, type LimitOrderCostModel } from "./walk-the-book";
+import { getCircuitBreaker, type CircuitBreakerState } from "./alpha-circuit-breaker";
 import { getTicker, getDepth } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
 
@@ -153,11 +154,33 @@ export interface AlphaSignal {
 
   // === IMPACT SEVERITY (P4) ===
   impact: {
-    capitalAtRiskPct: number;       // positionSizePct (% of portfolio at risk)
-    expectedLossIdr: number;        // if stop hit: how much IDR lost
-    concentrationPct: number;       // what % of total portfolio risk this represents
+    capitalAtRiskPct: number;
+    expectedLossIdr: number;
+    concentrationPct: number;
     impactLevel: "HIGH" | "MEDIUM" | "LOW";
+    // v5: impact × probability = expected value
+    probability: number;            // OOS win rate (probability of success)
+    expectedValueIdr: number;       // (prob × expectedWin) - ((1-prob) × expectedLoss)
+    evSeverity: "CRITICAL" | "ERROR" | "WARN" | "INFO";  // combined severity
   } | null;
+
+  // === LIMIT ORDER COST MODEL (P2) ===
+  limitOrder: {
+    recommendation: "use_limit" | "use_market" | "improve_price";
+    fillProbability: number;
+    netExpectedCostPct: number;
+    adverseSelectionPct: number;
+    description: string;
+  } | null;
+
+  // === CIRCUIT BREAKER (P7) ===
+  circuitBreaker: {
+    open: boolean;
+    consecutiveLosses: number;
+    winRate: number;
+    cooldownSec: number;
+    trips: number;
+  };
 
   rationale: string[];
   invalidation: string;
@@ -268,11 +291,18 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     getMicrostructure(pair, usdtRefPrice),
   ]);
 
-  // P3: Walk-the-book liquidity cap (replaces simple depth estimate)
+  // P3: Walk-the-book liquidity cap
   const liquidity = computeWalkTheBookLiquidity(depth, idrPrice, capitalIdr);
 
-  // P2: Absorption threshold OOS validation (from historical candles)
+  // P2: Absorption threshold OOS validation
   const absorptionValidation = validateAbsorptionThreshold(candles1hSource);
+
+  // P2 (v5): Limit order cost model
+  const orderVol = idrPrice > 0 ? (capitalIdr * 0.02) / idrPrice : 0; // estimate ~2% capital order
+  const limitOrder = depth ? computeLimitOrderCost(depth, "buy", orderVol) : null;
+
+  // P7: Circuit breaker state
+  const circuitBreaker = await getCircuitBreaker(pair);
 
   return generateSignalFromCandles(pair, capitalIdr, candles1h, candles1d, {
     dataSource: dataSource as string,
@@ -283,6 +313,8 @@ async function generatePairSignal(pair: string, capitalIdr: number): Promise<Alp
     liquidity,
     absorptionValidation,
     candles1h: candles1h,
+    limitOrder,
+    circuitBreaker,
   });
 }
 
@@ -331,6 +363,8 @@ interface SignalContext {
   liquidity: AlphaSignal["liquidity"];
   absorptionValidation: AbsorptionValidation | null;
   candles1h: Candle[];
+  limitOrder: LimitOrderCostModel | null;
+  circuitBreaker: CircuitBreakerState;
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -391,6 +425,40 @@ async function generateSignalFromCandles(
   let regimeEdge: AlphaSignal["edges"]["regime"] = "no_trade";
   if (regime.adx > 25) regimeEdge = "trend_follow";
   else if (regime.adx < 20) regimeEdge = "mean_revert";
+
+  // P7: CIRCUIT BREAKER — if open, force FLAT for this pair
+  if (ctx.circuitBreaker.open) {
+    return {
+      pair,
+      timestamp: new Date().toISOString(),
+      dataStale: ctx.dataStale,
+      dataSource: ctx.dataSource,
+      action: "FLAT",
+      strength: "none",
+      conviction: 0,
+      confirmed: false,
+      entry: price, stopLoss: price, takeProfit1: price, takeProfit2: price,
+      positionSizePct: 0, positionSizeIdr: 0,
+      notionalIdr: 0, notionalCapPct: 0, leverage: 0, rewardRiskRatio: 0,
+      edges: { funding: fundingEdge, fundingZScore, regime: regimeEdge, volatility: volEdge, trend: "no_trend" },
+      microstructure: ctx.microstructure ? {
+        oiTrend: ctx.microstructure.oiTrend, oiChange4hPct: ctx.microstructure.oiChange4hPct,
+        cvd1h: ctx.microstructure.cvd1h, cvdDivergence: ctx.microstructure.cvdDivergence,
+        absorptionDetected: ctx.microstructure.absorptionDetected, takerBuyRatio: ctx.microstructure.takerBuyRatio1h,
+        confirmation: ctx.microstructure.confirmation,
+      } : null,
+      backtest: { oosWinRate: 0, oosAvgReturn: 0, oosSampleSize: 0, oosSharpe: 0, oosMaxDrawdown: 0, kellyFraction: 0, kellyCI5: 0, kellyCI95: 0, kellyUncertainty: 0, inSampleWinRate: 0, overfitGap: 0, honest: false, anchoredWindows: 0, rollingWinRate: 0, rollingSampleSize: 0, anchoredRollingGap: 0, regimeStable: false, description: "circuit breaker open" },
+      liquidity: ctx.liquidity,
+      absorptionValidation: ctx.absorptionValidation ? { optimalThreshold: ctx.absorptionValidation.optimalThreshold, precision: ctx.absorptionValidation.precision, precisionCI5: ctx.absorptionValidation.precisionCI5, precisionCI95: ctx.absorptionValidation.precisionCI95, lift: ctx.absorptionValidation.lift, validated: ctx.absorptionValidation.validated, description: ctx.absorptionValidation.description } : null,
+      impact: null,
+      limitOrder: ctx.limitOrder ? { recommendation: ctx.limitOrder.recommendation, fillProbability: ctx.limitOrder.fillProbability, netExpectedCostPct: ctx.limitOrder.netExpectedCostPct, adverseSelectionPct: ctx.limitOrder.adverseSelectionPct, description: ctx.limitOrder.description } : null,
+      circuitBreaker: { open: true, consecutiveLosses: ctx.circuitBreaker.consecutiveLosses, winRate: ctx.circuitBreaker.winRate, cooldownSec: ctx.circuitBreaker.cooldownSec, trips: ctx.circuitBreaker.trips },
+      rationale: [`CIRCUIT BREAKER OPEN: ${ctx.circuitBreaker.consecutiveLosses} consecutive losses. Cooldown ${Math.floor(ctx.circuitBreaker.cooldownSec / 60)}min remaining. Trips: ${ctx.circuitBreaker.trips}. Signals suppressed for this pair.`],
+      invalidation: "Circuit breaker is open. Wait for cooldown to elapse, then half-open probe will test one signal.",
+      warning: `CIRCUIT BREAKER TRIPPED. This pair has lost ${ctx.circuitBreaker.consecutiveLosses} consecutive OOS signals. Edge may have degraded. Do NOT override.`,
+      raw: { price, atr, atrPercent, rsi, adx: regime.adx, fundingRate, fundingZScore, fundingPercentile, regime: regime.regime },
+    };
+  }
 
   // DETERMINE ACTION
   let action: AlphaSignal["action"] = "FLAT";
@@ -626,12 +694,40 @@ async function generateSignalFromCandles(
       validated: ctx.absorptionValidation.validated,
       description: ctx.absorptionValidation.description,
     } : null,
-    impact: action !== "FLAT" ? {
-      capitalAtRiskPct: positionSizePct,
-      expectedLossIdr: positionSizeIdr, // if stop hit, lose the risked amount
-      concentrationPct: positionSizePct / 0.06 * 100, // % of 6% max portfolio risk
-      impactLevel: positionSizePct > 0.03 ? "HIGH" : positionSizePct > 0.01 ? "MEDIUM" : "LOW",
+    impact: action !== "FLAT" ? (() => {
+      const capitalAtRiskPct = positionSizePct;
+      const expectedLossIdr = positionSizeIdr;
+      const concentrationPct = positionSizePct / 0.06 * 100;
+      const impactLevel = positionSizePct > 0.03 ? "HIGH" : positionSizePct > 0.01 ? "MEDIUM" : "LOW";
+      // v5: impact × probability = expected value
+      const probability = wfResult.oosWinRate;
+      const expectedWinIdr = positionSizeIdr * rewardRisk; // win = size × R:R
+      const expectedValueIdr = (probability * expectedWinIdr) - ((1 - probability) * expectedLossIdr);
+      // EV severity: combine impact level + probability + EV sign
+      let evSeverity: "CRITICAL" | "ERROR" | "WARN" | "INFO";
+      if (impactLevel === "HIGH" && probability > 0.55 && expectedValueIdr > 0) evSeverity = "CRITICAL";
+      else if (impactLevel === "MEDIUM" && probability > 0.50 && expectedValueIdr > 0) evSeverity = "ERROR";
+      else if (expectedValueIdr <= 0) evSeverity = "WARN";
+      else evSeverity = "INFO";
+      return {
+        capitalAtRiskPct, expectedLossIdr, concentrationPct, impactLevel,
+        probability, expectedValueIdr, evSeverity,
+      };
+    })() : null,
+    limitOrder: ctx.limitOrder ? {
+      recommendation: ctx.limitOrder.recommendation,
+      fillProbability: ctx.limitOrder.fillProbability,
+      netExpectedCostPct: ctx.limitOrder.netExpectedCostPct,
+      adverseSelectionPct: ctx.limitOrder.adverseSelectionPct,
+      description: ctx.limitOrder.description,
     } : null,
+    circuitBreaker: {
+      open: ctx.circuitBreaker.open,
+      consecutiveLosses: ctx.circuitBreaker.consecutiveLosses,
+      winRate: ctx.circuitBreaker.winRate,
+      cooldownSec: ctx.circuitBreaker.cooldownSec,
+      trips: ctx.circuitBreaker.trips,
+    },
     rationale,
     invalidation,
     warning,

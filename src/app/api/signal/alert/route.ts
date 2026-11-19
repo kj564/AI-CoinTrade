@@ -97,6 +97,22 @@ export async function POST() {
         } catch { /* ignore */ }
       }
 
+      // P4: Email (CRITICAL only) — uses nodemailer via dynamic import
+      if (severity === "CRITICAL" && process.env.L2_ALERT_SMTP_HOST && process.env.L2_ALERT_EMAIL_TO) {
+        try {
+          const { sendEmailTest } = await import("@/lib/alerting/email");
+          await sendEmailTest(
+            `[CRITICAL] Alpha Signal: ${s.action} ${s.pair.toUpperCase()}`,
+            message,
+            "critical",
+            `alert-${s.pair}-${Date.now()}`,
+          );
+          channels.push("email");
+        } catch (e) {
+          console.warn(`[alert] email failed for ${s.pair}:`, e instanceof Error ? e.message : e);
+        }
+      }
+
       alerts.push({ pair: s.pair, severity, action: s.action, sent: channels.length > 0, channels });
     }
 
