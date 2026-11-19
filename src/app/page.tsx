@@ -6,18 +6,46 @@ import { useState, useEffect } from "react";
 // Simple BELI / JUAL / TUNGGU per pair.
 // Translates the quant engine into decisions a beginner can follow.
 
-// Pair config based on replay results (anti-lookahead + cost-adjusted):
-// ETH: +25.1% net → ENABLE (edge terkuat)
-// BTC: +4.5% net → ENABLE (marginal)
-// SOL: -20.8% net → DISABLE (EV negatif)
-// BNB: -6.2% net → DISABLE (EV negatif)
-// XRP: -18.9% net → DISABLE (EV negatif)
-const PAIR_CONFIG: Record<string, { enabled: boolean; name: string; note: string }> = {
-  eth_idr: { enabled: true, name: "Ethereum", note: "Edge terkuat (75% win, +25% net 21 hari)" },
-  btc_idr: { enabled: true, name: "Bitcoin", note: "Marginal setelah biaya (+4.5% net)" },
-  sol_idr: { enabled: false, name: "Solana", note: "EV negatif setelah biaya (-20.8%)" },
-  bnb_idr: { enabled: false, name: "BNB", note: "EV negatif setelah biaya (-6.2%)" },
-  xrp_idr: { enabled: false, name: "XRP", note: "EV negatif setelah biaya (-18.9%)" },
+// Pair config — HONEST labels based on 21-day cost-adjusted replay.
+// These are NOT permanent conclusions. All statuses auto-review weekly.
+// 21 days is enough to disable temporarily, not enough to conclude permanently.
+const PAIR_CONFIG: Record<string, {
+  enabled: boolean;
+  name: string;
+  label: string;        // KANDIDAT EDGE | MARGINAL | NONAKTIF SEMENTARA
+  note: string;
+  evidence: string;     // what proof we have
+}> = {
+  eth_idr: {
+    enabled: true, name: "Ethereum",
+    label: "KANDIDAT EDGE",
+    note: "+25.1% net setelah biaya (21 hari replay)",
+    evidence: "21 hari replay, 75% win, Sharpe 13.1 — belum cukup untuk live",
+  },
+  btc_idr: {
+    enabled: true, name: "Bitcoin",
+    label: "MARGINAL",
+    note: "+4.5% net setelah biaya (21 hari replay)",
+    evidence: "EV tipis setelah biaya, 64% win — butuh validasi lebih lanjut",
+  },
+  sol_idr: {
+    enabled: false, name: "Solana",
+    label: "NONAKTIF SEMENTARA",
+    note: "-20.8% net setelah biaya (21 hari replay)",
+    evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+  },
+  bnb_idr: {
+    enabled: false, name: "BNB",
+    label: "NONAKTIF SEMENTARA",
+    note: "-6.2% net setelah biaya (21 hari replay)",
+    evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+  },
+  xrp_idr: {
+    enabled: false, name: "XRP",
+    label: "NONAKTIF SEMENTARA",
+    note: "-18.9% net setelah biaya (21 hari replay)",
+    evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+  },
 };
 
 interface Signal {
@@ -62,17 +90,23 @@ export default function TradingAssistant() {
   const [data, setData] = useState<AlphaResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [capital, setCapital] = useState(10000000);
-  const [riskPct, setRiskPct] = useState(0.5); // 0.5% risk per trade
+  const [riskPct, setRiskPct] = useState(0.5);
   const [mode, setMode] = useState<"paper" | "live">("paper");
+  const [portfolio, setPortfolio] = useState<any>(null);
 
   useEffect(() => {
     let active = true;
     const doFetch = async () => {
       setLoading(true);
       try {
-        const r = await fetch(`/api/signal/alpha?capital=${capital}`);
-        const d = await r.json();
-        if (active) setData(d);
+        const [alphaRes, portRes] = await Promise.all([
+          fetch(`/api/signal/alpha?capital=${capital}`).then((r) => r.json()),
+          fetch(`/api/signal/portfolio`).then((r) => r.json()).catch(() => null),
+        ]);
+        if (active) {
+          setData(alphaRes);
+          if (portRes) setPortfolio(portRes);
+        }
       } catch { /* ignore */ }
       if (active) setLoading(false);
     };
@@ -198,7 +232,7 @@ export default function TradingAssistant() {
         {/* ENABLED PAIRS */}
         <section style={{ marginBottom: "24px" }}>
           <h2 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px", color: "#a3a3a3" }}>
-            Pair Aktif <span style={{ color: "#525252", fontSize: "12px" }}>(ETH + BTC — edge terkonfirmasi setelah biaya)</span>
+            Pair Aktif <span style={{ color: "#525252", fontSize: "12px" }}>(KANDIDAT — bukan edge terkonfirmasi)</span>
           </h2>
           <div style={{ display: "grid", gap: "16px" }}>
             {enabledPairs.map((s) => {
@@ -224,7 +258,7 @@ export default function TradingAssistant() {
         {disabledPairs.length > 0 && (
           <section style={{ marginBottom: "24px" }}>
             <h2 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px", color: "#525252" }}>
-              Pair Nonaktif <span style={{ fontSize: "12px" }}>(EV negatif setelah biaya)</span>
+              Pair Nonaktif <span style={{ fontSize: "12px" }}>(NONAKTIF SEMENTARA — ditinjau mingguan)</span>
             </h2>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "8px" }}>
               {disabledPairs.map((s) => {
@@ -233,12 +267,51 @@ export default function TradingAssistant() {
                   <div key={s.pair} style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
                       <span style={{ fontSize: "13px", fontWeight: 600, color: "#525252" }}>{config.name}</span>
-                      <span style={{ fontSize: "10px", fontWeight: 700, color: "#404040", border: "1px solid #262626", borderRadius: "3px", padding: "2px 6px" }}>NONAKTIF</span>
+                      <span style={{ fontSize: "9px", fontWeight: 700, color: "#f59e0b", border: "1px solid #f59e0b30", borderRadius: "3px", padding: "2px 6px" }}>NONAKTIF SEMENTARA</span>
                     </div>
-                    <div style={{ fontSize: "11px", color: "#404040" }}>{config.note}</div>
+                    <div style={{ fontSize: "11px", color: "#525252" }}>{config.note}</div>
+                    <div style={{ fontSize: "10px", color: "#404040", marginTop: "4px" }}>{config.evidence}</div>
                   </div>
                 );
               })}
+            </div>
+          </section>
+        )}
+
+        {/* PAPER TRADING STATUS */}
+        {portfolio && (
+          <section style={{ marginBottom: "24px" }}>
+            <div style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px" }}>
+              <div style={{ fontSize: "11px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
+                Paper Trading Status
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "8px" }}>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#404040" }}>Total Sinyal</div>
+                  <div style={{ fontSize: "16px", fontWeight: 600 }}>{portfolio.totalSignals ?? 0}</div>
+                </div>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#404040" }}>Win Rate</div>
+                  <div style={{ fontSize: "16px", fontWeight: 600, color: (portfolio.winRate ?? 0) > 0.5 ? "#16a34a" : "#dc2626" }}>
+                    {((portfolio.winRate ?? 0) * 100).toFixed(0)}%
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#404040" }}>Net P&L</div>
+                  <div style={{ fontSize: "16px", fontWeight: 600, color: (portfolio.totalPnlIdr ?? 0) > 0 ? "#16a34a" : "#dc2626" }}>
+                    {fmtIdr(portfolio.totalPnlIdr ?? 0)}
+                  </div>
+                </div>
+                <div>
+                  <div style={{ fontSize: "10px", color: "#404040" }}>Sharpe</div>
+                  <div style={{ fontSize: "16px", fontWeight: 600 }}>{(portfolio.sharpeRatio ?? 0).toFixed(1)}</div>
+                </div>
+              </div>
+              <div style={{ fontSize: "11px", color: "#404040", marginTop: "8px" }}>
+                {portfolio.openSignals > 0
+                  ? `${portfolio.openSignals} posisi terbuka · ${portfolio.closedSignals} closed`
+                  : "Belum ada sinyal terekam. Paper trading berjalan otomatis setiap jam."}
+              </div>
             </div>
           </section>
         )}
@@ -294,6 +367,15 @@ function PairCard({
         <div>
           <span style={{ fontSize: "18px", fontWeight: 700 }}>{config.name}</span>
           <span style={{ fontSize: "12px", color: "#525252", marginLeft: "8px" }}>IDR</span>
+          <div style={{ marginTop: "4px" }}>
+            <span style={{
+              fontSize: "9px", fontWeight: 700,
+              color: config.label === "KANDIDAT EDGE" ? "#16a34a" : config.label === "MARGINAL" ? "#f59e0b" : "#525252",
+              border: `1px solid ${config.label === "KANDIDAT EDGE" ? "#16a34a30" : config.label === "MARGINAL" ? "#f59e0b30" : "#262626"}`,
+              borderRadius: "3px", padding: "2px 6px",
+            }}>{config.label}</span>
+            <span style={{ fontSize: "10px", color: "#404040", marginLeft: "6px" }}>{config.evidence}</span>
+          </div>
         </div>
         <div style={{
           fontSize: "20px", fontWeight: 800, color: statusColor,
