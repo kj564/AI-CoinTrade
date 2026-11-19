@@ -2,20 +2,31 @@
 
 import { useState, useEffect } from "react";
 
-// ── ALPHA SIGNAL DASHBOARD ──
-// Real edges: funding contrarian + volatility scaling + regime routing + Kelly.
-// NOT the old indicator-based advisor (proven noise).
-// Each signal has: entry, stop (2 ATR), targets (1.5R/3R), position size,
-// regime-matched backtest, invalidation criteria.
+// ── TRADING ASSISTANT ──
+// Simple BELI / JUAL / TUNGGU per pair.
+// Translates the quant engine into decisions a beginner can follow.
 
-interface AlphaSignal {
+// Pair config based on replay results (anti-lookahead + cost-adjusted):
+// ETH: +25.1% net → ENABLE (edge terkuat)
+// BTC: +4.5% net → ENABLE (marginal)
+// SOL: -20.8% net → DISABLE (EV negatif)
+// BNB: -6.2% net → DISABLE (EV negatif)
+// XRP: -18.9% net → DISABLE (EV negatif)
+const PAIR_CONFIG: Record<string, { enabled: boolean; name: string; note: string }> = {
+  eth_idr: { enabled: true, name: "Ethereum", note: "Edge terkuat (75% win, +25% net 21 hari)" },
+  btc_idr: { enabled: true, name: "Bitcoin", note: "Marginal setelah biaya (+4.5% net)" },
+  sol_idr: { enabled: false, name: "Solana", note: "EV negatif setelah biaya (-20.8%)" },
+  bnb_idr: { enabled: false, name: "BNB", note: "EV negatif setelah biaya (-6.2%)" },
+  xrp_idr: { enabled: false, name: "XRP", note: "EV negatif setelah biaya (-18.9%)" },
+};
+
+interface Signal {
   pair: string;
-  action: "LONG" | "SHORT" | "REDUCE" | "FLAT" | "CLOSE";
+  action: string;
   strength: string;
   conviction: number;
   confirmed: boolean;
   dataStale: boolean;
-  dataSource: string;
   entry: number;
   stopLoss: number;
   takeProfit1: number;
@@ -27,53 +38,19 @@ interface AlphaSignal {
   leverage: number;
   rewardRiskRatio: number;
   edges: { funding: string; fundingZScore: number; regime: string; volatility: string; trend: string };
-  microstructure: {
-    oiTrend: string; oiChange4hPct: number; cvd1h: number;
-    cvdDivergence: boolean; absorptionDetected: boolean;
-    takerBuyRatio: number; confirmation: string;
-  } | null;
-  backtest: {
-    oosWinRate: number; oosAvgReturn: number; oosSampleSize: number;
-    oosSharpe: number; oosMaxDrawdown: number; kellyFraction: number;
-    kellyCI5: number; kellyCI95: number; kellyUncertainty: number;
-    inSampleWinRate: number; overfitGap: number; honest: boolean;
-    anchoredWindows: number; rollingWinRate: number; rollingSampleSize: number;
-    anchoredRollingGap: number; regimeStable: boolean; description: string;
-  };
-  liquidity: {
-    maxNotionalWithoutSlippage: number; topBidDepth: number; topAskDepth: number;
-    spreadPct: number; liquidityCapActive: boolean;
-    walkBookLevels: number; walkBookSlippagePct: number; walkBookMethod: string;
-  } | null;
-  absorptionValidation: {
-    optimalThreshold: number; precision: number; precisionCI5: number;
-    precisionCI95: number; lift: number; validated: boolean; description: string;
-  } | null;
-  impact: {
-    capitalAtRiskPct: number; expectedLossIdr: number; concentrationPct: number;
-    impactLevel: string; probability: number; expectedValueIdr: number;
-    evSeverity: string;
-  } | null;
-  limitOrder: {
-    recommendation: string; fillProbability: number; netExpectedCostPct: number;
-    adverseSelectionPct: number; description: string;
-  } | null;
-  circuitBreaker: {
-    open: boolean; consecutiveLosses: number; winRate: number;
-    cooldownSec: number; trips: number;
-  };
+  microstructure: { oiTrend: string; absorptionDetected: boolean; confirmation: string } | null;
+  backtest: { oosWinRate: number; oosSampleSize: number; honest: boolean; kellyCI5: number; regimeStable: boolean };
+  impact: { evSeverity: string; expectedValueIdr: number; impactLevel: string } | null;
+  limitOrder: { recommendation: string; fillProbability: number } | null;
+  circuitBreaker: { open: boolean; consecutiveLosses: number; cooldownSec: number; trips: number };
   rationale: string[];
   invalidation: string;
   warning: string | null;
-  raw: {
-    price: number; atr: number; atrPercent: number; rsi: number; adx: number;
-    fundingRate: number; fundingZScore: number; fundingPercentile: number; regime: string;
-  };
+  raw: { price: number; fundingRate: number; fundingZScore: number; adx: number; rsi: number; atrPercent: number };
 }
 
 interface AlphaResult {
-  signals: AlphaSignal[];
-  portfolioAllocation: { pair: string; action: string; allocationPct: number }[];
+  signals: Signal[];
   capitalAtRisk: number;
   regimeSummary: string;
   signalCheck?: { checked: number; closed: number; wins: number; losses: number };
@@ -81,20 +58,12 @@ interface AlphaResult {
   disclaimer: string;
 }
 
-export default function AlphaDashboard() {
+export default function TradingAssistant() {
   const [data, setData] = useState<AlphaResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [capital, setCapital] = useState(10000000);
-
-  const fetchSignals = async () => {
-    setLoading(true);
-    try {
-      const r = await fetch(`/api/signal/alpha?capital=${capital}`);
-      const d = await r.json();
-      setData(d);
-    } catch { /* ignore */ }
-    setLoading(false);
-  };
+  const [riskPct, setRiskPct] = useState(0.5); // 0.5% risk per trade
+  const [mode, setMode] = useState<"paper" | "live">("paper");
 
   useEffect(() => {
     let active = true;
@@ -113,155 +82,187 @@ export default function AlphaDashboard() {
   }, [capital]);
 
   const fmtIdr = (n: number) => "Rp " + n.toLocaleString("id-ID", { maximumFractionDigits: 0 });
-  const fmtPct = (n: number, dp = 2) => `${(n * 100).toFixed(dp)}%`;
+  const fmtAsset = (n: number) => n < 1 ? n.toFixed(6) : n.toFixed(4);
 
-  const actionColor = (a: string) =>
-    a === "LONG" ? "#16a34a"
-    : a === "SHORT" ? "#dc2626"
-    : a === "REDUCE" ? "#f59e0b"
-    : a === "CLOSE" ? "#f59e0b"
-    : "#6b7280";
+  // Compute position size from risk
+  function computePosition(signal: Signal) {
+    const riskAmount = capital * (riskPct / 100);
+    const stopDistance = Math.abs(signal.entry - signal.stopLoss);
+    if (stopDistance <= 0) return { assetAmount: 0, riskAmount, notional: 0, leverage: 0 };
+    const assetAmount = riskAmount / stopDistance;
+    const notional = assetAmount * signal.entry;
+    const leverage = notional / capital;
+    return { assetAmount, riskAmount, notional, leverage };
+  }
 
-  const activeSignals = data?.signals.filter((s) => s.action === "LONG" || s.action === "SHORT") ?? [];
-  const flatSignals = data?.signals.filter((s) => s.action === "FLAT") ?? [];
+  // Gate logic: determine BELI/JUAL/TUNGGU
+  function gate(signal: Signal): { status: "BELI" | "JUAL" | "TUNGGU" | "NONAKTIF"; reason: string } {
+    const config = PAIR_CONFIG[signal.pair];
+    if (!config?.enabled) {
+      return { status: "NONAKTIF", reason: config?.note ?? "Pair dinonaktifkan" };
+    }
+    // Gate 1: circuit breaker
+    if (signal.circuitBreaker?.open) {
+      const mins = Math.floor((signal.circuitBreaker.cooldownSec ?? 0) / 60);
+      return { status: "TUNGGU", reason: `Circuit breaker aktif (${signal.circuitBreaker.consecutiveLosses} loss beruntun). Dijeda ${mins} menit.` };
+    }
+    // Gate 2: data stale
+    if (signal.dataStale) {
+      return { status: "TUNGGU", reason: "Data market tidak update. Tunggu data fresh." };
+    }
+    // Gate 3: action FLAT
+    if (signal.action === "FLAT") {
+      return { status: "TUNGGU", reason: simplifyReason(signal.rationale[0]) };
+    }
+    // Gate 4: OOS not honest
+    if (!signal.backtest?.honest) {
+      return { status: "TUNGGU", reason: "Edge belum terkonfirmasi out-of-sample. Butuh lebih banyak data." };
+    }
+    // Gate 5: Kelly CI5 ≤ 0
+    if (signal.backtest?.kellyCI5 <= 0) {
+      return { status: "TUNGGU", reason: "Kelly CI5 ≤ 0. Ukuran posisi belum bisa dihitung dengan keyakinan." };
+    }
+    // Gate 6: EV ≤ 0
+    if (signal.impact && signal.impact.expectedValueIdr <= 0) {
+      return { status: "TUNGGU", reason: "Biaya (fee + slippage) lebih besar dari expected return. Tidak menguntungkan setelah biaya." };
+    }
+    // All gates passed → BELI or JUAL
+    return {
+      status: signal.action === "LONG" ? "BELI" : "JUAL",
+      reason: "Semua gate lolos: funding ekstrem, mikrostruktur konfirmasi, OOS honest, EV positif.",
+    };
+  }
+
+  function simplifyReason(rationale: string): string {
+    if (rationale.includes("No aligned edge")) return "Tidak ada edge saat ini. Funding tidak ekstrem, regime tidak jelas.";
+    if (rationale.includes("BLOCKED")) return "Sinyal funding ada tapi momentum masih kuat. Berbahaya untuk lawan arah.";
+    if (rationale.includes("FLAT is a position")) return "Tidak ada edge. Menahan adalah keputusan yang benar.";
+    return rationale.slice(0, 100);
+  }
+
+  const enabledPairs = data?.signals.filter((s) => PAIR_CONFIG[s.pair]?.enabled) ?? [];
+  const disabledPairs = data?.signals.filter((s) => !PAIR_CONFIG[s.pair]?.enabled) ?? [];
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif" }}>
-      <div style={{ maxWidth: "1200px", margin: "0 auto", padding: "24px 16px" }}>
+      <div style={{ maxWidth: "800px", margin: "0 auto", padding: "24px 16px" }}>
         {/* HEADER */}
-        <header style={{ marginBottom: "32px", borderBottom: "1px solid #262626", paddingBottom: "16px" }}>
-          <h1 style={{ fontSize: "28px", fontWeight: 700, margin: 0, letterSpacing: "-0.5px" }}>
-            Alpha Signal Terminal
-          </h1>
-          <p style={{ fontSize: "13px", color: "#737373", margin: "6px 0 0" }}>
-            Funding contrarian + volatility scaling + regime routing + fractional Kelly.
-            Real edges, honest backtests, risk-managed signals.
+        <header style={{ marginBottom: "24px" }}>
+          <h1 style={{ fontSize: "24px", fontWeight: 700, margin: 0 }}>Trading Assistant</h1>
+          <p style={{ fontSize: "13px", color: "#737373", margin: "4px 0 0" }}>
+            Keputusan sederhana: BELI / JUAL / TUNGGU. Berdasarkan funding rate, mikrostruktur, dan validasi out-of-sample.
           </p>
         </header>
 
-        {/* PORTFOLIO SUMMARY */}
-        {data && (
-          <section style={{ marginBottom: "32px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "12px" }}>
-              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
-                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Capital at Risk</div>
-                <div style={{ fontSize: "28px", fontWeight: 700, color: data.capitalAtRisk > 0.04 ? "#f59e0b" : "#e5e5e5", marginTop: "4px" }}>
-                  {fmtPct(data.capitalAtRisk)}
-                </div>
-                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Max 6% (risk-managed)</div>
-              </div>
-              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
-                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Active Signals</div>
-                <div style={{ fontSize: "28px", fontWeight: 700, marginTop: "4px" }}>{activeSignals.length}</div>
-                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>{activeSignals.filter((s) => s.action === "LONG").length} long · {activeSignals.filter((s) => s.action === "SHORT").length} short</div>
-              </div>
-              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
-                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Flat (No Edge)</div>
-                <div style={{ fontSize: "28px", fontWeight: 700, color: "#525252", marginTop: "4px" }}>{flatSignals.length}</div>
-                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Not trading = valid position</div>
-              </div>
-              <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
-                <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px" }}>Capital</div>
-                <input
-                  type="number"
-                  value={capital}
-                  onChange={(e) => setCapital(Math.max(100000, parseInt(e.target.value) || 10000000))}
-                  onBlur={fetchSignals}
-                  style={{ background: "transparent", border: "none", color: "#e5e5e5", fontSize: "20px", fontWeight: 700, width: "100%", outline: "none" }}
+        {/* INPUT */}
+        <section style={{ marginBottom: "24px", background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "12px" }}>
+            <div>
+              <label style={{ fontSize: "11px", color: "#737373", display: "block", marginBottom: "4px" }}>Dana Trading</label>
+              <input
+                type="number"
+                value={capital}
+                onChange={(e) => setCapital(Math.max(100000, parseInt(e.target.value) || 10000000))}
+                style={{ width: "100%", background: "#0a0a0a", border: "1px solid #262626", borderRadius: "4px", color: "#e5e5e5", padding: "8px", fontSize: "14px", outline: "none" }}
+              />
+            </div>
+            <div>
+              <label style={{ fontSize: "11px", color: "#737373", display: "block", marginBottom: "4px" }}>Risk per Trade</label>
+              <select
+                value={riskPct}
+                onChange={(e) => setRiskPct(parseFloat(e.target.value))}
+                style={{ width: "100%", background: "#0a0a0a", border: "1px solid #262626", borderRadius: "4px", color: "#e5e5e5", padding: "8px", fontSize: "14px", outline: "none" }}
+              >
+                <option value={0.25}>0.25% (aman)</option>
+                <option value={0.5}>0.5% (standar)</option>
+                <option value={1}>1% (agresif)</option>
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize: "11px", color: "#737373", display: "block", marginBottom: "4px" }}>Mode</label>
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as "paper" | "live")}
+                style={{ width: "100%", background: "#0a0a0a", border: "1px solid #262626", borderRadius: "4px", color: "#e5e5e5", padding: "8px", fontSize: "14px", outline: "none" }}
+              >
+                <option value="paper">Paper Trading (virtual)</option>
+                <option value="live">Live (uang nyata)</option>
+              </select>
+            </div>
+          </div>
+          <div style={{ marginTop: "8px", fontSize: "11px", color: "#525252" }}>
+            Risk per trade: {fmtIdr(capital * riskPct / 100)} · {mode === "paper" ? "Mode virtual — tidak ada uang nyata" : "⚠ Mode live — uang nyata"}
+          </div>
+        </section>
+
+        {/* ENABLED PAIRS */}
+        <section style={{ marginBottom: "24px" }}>
+          <h2 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px", color: "#a3a3a3" }}>
+            Pair Aktif <span style={{ color: "#525252", fontSize: "12px" }}>(ETH + BTC — edge terkonfirmasi setelah biaya)</span>
+          </h2>
+          <div style={{ display: "grid", gap: "16px" }}>
+            {enabledPairs.map((s) => {
+              const g = gate(s);
+              const pos = computePosition(s);
+              return (
+                <PairCard
+                  key={s.pair}
+                  signal={s}
+                  gate={g}
+                  position={pos}
+                  fmtIdr={fmtIdr}
+                  fmtAsset={fmtAsset}
+                  riskPct={riskPct}
+                  mode={mode}
                 />
-                <div style={{ fontSize: "11px", color: "#525252", marginTop: "2px" }}>Click to edit</div>
-              </div>
-            </div>
+              );
+            })}
+          </div>
+        </section>
 
-            {/* Regime summary */}
-            <div style={{ background: "#141414", border: "1px solid #262626", borderRadius: "8px", padding: "12px 16px", marginTop: "12px" }}>
-              <div style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase", letterSpacing: "1px", marginBottom: "4px" }}>Market Regime</div>
-              <div style={{ fontSize: "13px", color: "#a3a3a3" }}>{data.regimeSummary}</div>
-            </div>
-          </section>
-        )}
-
-        {/* ACTIVE SIGNALS */}
-        {data && activeSignals.length > 0 && (
-          <section style={{ marginBottom: "32px" }}>
-            <h2 style={{ fontSize: "16px", fontWeight: 600, marginBottom: "16px", color: "#e5e5e5" }}>
-              Active Signals <span style={{ color: "#525252", fontSize: "12px", fontWeight: 400 }}>({activeSignals.length})</span>
+        {/* DISABLED PAIRS */}
+        {disabledPairs.length > 0 && (
+          <section style={{ marginBottom: "24px" }}>
+            <h2 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px", color: "#525252" }}>
+              Pair Nonaktif <span style={{ fontSize: "12px" }}>(EV negatif setelah biaya)</span>
             </h2>
-            <div style={{ display: "grid", gap: "16px" }}>
-              {activeSignals.map((s) => (
-                <SignalCard key={s.pair} signal={s} fmtIdr={fmtIdr} fmtPct={fmtPct} actionColor={actionColor} />
-              ))}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: "8px" }}>
+              {disabledPairs.map((s) => {
+                const config = PAIR_CONFIG[s.pair];
+                return (
+                  <div key={s.pair} style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                      <span style={{ fontSize: "13px", fontWeight: 600, color: "#525252" }}>{config.name}</span>
+                      <span style={{ fontSize: "10px", fontWeight: 700, color: "#404040", border: "1px solid #262626", borderRadius: "3px", padding: "2px 6px" }}>NONAKTIF</span>
+                    </div>
+                    <div style={{ fontSize: "11px", color: "#404040" }}>{config.note}</div>
+                  </div>
+                );
+              })}
             </div>
           </section>
         )}
 
-        {/* FLAT SIGNALS (no edge — valid) */}
-        {data && flatSignals.length > 0 && (
-          <section style={{ marginBottom: "32px" }}>
-            <h2 style={{ fontSize: "16px", fontWeight: 600, marginBottom: "16px", color: "#737373" }}>
-              No Edge — Flat <span style={{ color: "#525252", fontSize: "12px", fontWeight: 400 }}>({flatSignals.length})</span>
-            </h2>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: "12px" }}>
-              {flatSignals.map((s) => (
-                <div key={s.pair} style={{ background: "#111", border: s.circuitBreaker?.open ? "1px solid #dc2626" : "1px solid #262626", borderRadius: "8px", padding: "16px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-                    <span style={{ fontSize: "14px", fontWeight: 600 }}>{s.pair.toUpperCase()}</span>
-                    <span style={{ fontSize: "12px", fontWeight: 700, color: s.circuitBreaker?.open ? "#dc2626" : "#525252" }}>
-                      {s.circuitBreaker?.open ? "CIRCUIT OPEN" : "FLAT"}
-                    </span>
-                  </div>
-                  <div style={{ fontSize: "12px", color: "#737373" }}>
-                    <div>Price: {fmtIdr(s.raw.price)}</div>
-                    <div>Funding: {(s.raw.fundingRate * 100).toFixed(4)}% (z={s.raw.fundingZScore.toFixed(2)}) · ADX: {s.raw.adx.toFixed(0)} · RSI: {s.raw.rsi.toFixed(0)}</div>
-                    {s.limitOrder && (
-                      <div style={{ marginTop: "4px" }}>
-                        <span style={{ color: s.limitOrder.recommendation === "use_market" ? "#dc2626" : s.limitOrder.recommendation === "use_limit" ? "#16a34a" : "#f59e0b", fontWeight: 600 }}>
-                          {s.limitOrder.recommendation.toUpperCase()}
-                        </span>
-                        <span style={{ color: "#525252" }}> · fill {(s.limitOrder.fillProbability * 100).toFixed(0)}% · net cost {s.limitOrder.netExpectedCostPct.toFixed(3)}%</span>
-                      </div>
-                    )}
-                    {s.circuitBreaker && s.circuitBreaker.consecutiveLosses > 0 && (
-                      <div style={{ marginTop: "4px", color: s.circuitBreaker.open ? "#dc2626" : "#f59e0b" }}>
-                        CB: {s.circuitBreaker.consecutiveLosses} losses · winRate {(s.circuitBreaker.winRate * 100).toFixed(0)}% · trips {s.circuitBreaker.trips}
-                      </div>
-                    )}
-                    <div style={{ marginTop: "6px", color: "#525252" }}>{s.rationale[0]}</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {/* DISCLAIMER */}
+        {/* FOOTER */}
         {data && (
-          <footer style={{ marginTop: "40px", paddingTop: "16px", borderTop: "1px solid #262626" }}>
-            <div style={{ fontSize: "11px", color: "#525252", lineHeight: 1.6, background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "8px", padding: "12px" }}>
-              <strong style={{ color: "#737373" }}>Disclaimer:</strong> {data.disclaimer}
+          <footer style={{ marginTop: "32px", paddingTop: "16px", borderTop: "1px solid #262626" }}>
+            <div style={{ fontSize: "11px", color: "#525252", background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "10px" }}>
+              {data.disclaimer}
             </div>
             <div style={{ fontSize: "11px", color: "#404040", marginTop: "8px", textAlign: "center" }}>
-              Generated: {data.generatedAt} · Next refresh: 60s
-              {data.signalCheck && data.signalCheck.checked > 0 && (
-                <span style={{ marginLeft: "8px" }}>· Signal check: {data.signalCheck.checked} open → {data.signalCheck.closed} closed ({data.signalCheck.wins}W/{data.signalCheck.losses}L)</span>
-              )}
-              {loading && <span style={{ marginLeft: "8px", color: "#525252" }}>· refreshing…</span>}
-            </div>
-            <div style={{ fontSize: "11px", color: "#404040", marginTop: "4px", textAlign: "center" }}>
-              <a href="/api/signal/portfolio" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Portfolio P&L →</a>
+              Update: {data.generatedAt} · Refresh 60d ·{" "}
+              <a href="/api/signal/replay" target="_blank" rel="noopener noreferrer" style={{ color: "#525252" }}>Replay</a>
               {" · "}
-              <a href="/api/signal/metrics" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Prometheus Metrics →</a>
-              {" · "}
-              <a href="/api/signal/alert" target="_blank" rel="noopener noreferrer" style={{ color: "#525252", textDecoration: "none" }}>Alert Check →</a>
+              <a href="/api/signal/portfolio" target="_blank" rel="noopener noreferrer" style={{ color: "#525252" }}>Portfolio</a>
+              {loading && " · updating…"}
             </div>
           </footer>
         )}
 
-        {/* LOADING STATE */}
         {!data && !loading && (
-          <div style={{ textAlign: "center", padding: "60px 0", color: "#525252" }}>
-            <button onClick={fetchSignals} style={{ padding: "12px 24px", background: "#171717", border: "1px solid #262626", borderRadius: "8px", color: "#e5e5e5", cursor: "pointer", fontSize: "14px" }}>
-              Generate Signals
+          <div style={{ textAlign: "center", padding: "40px", color: "#525252" }}>
+            <button onClick={() => { setData(null); }} style={{ padding: "12px 24px", background: "#171717", border: "1px solid #262626", borderRadius: "8px", color: "#e5e5e5", cursor: "pointer" }}>
+              Mulai
             </button>
           </div>
         )}
@@ -270,185 +271,134 @@ export default function AlphaDashboard() {
   );
 }
 
-function SignalCard({ signal: s, fmtIdr, fmtPct, actionColor }: {
-  signal: AlphaSignal;
+function PairCard({
+  signal, gate, position, fmtIdr, fmtAsset, riskPct, mode,
+}: {
+  signal: Signal;
+  gate: { status: "BELI" | "JUAL" | "TUNGGU" | "NONAKTIF"; reason: string };
+  position: { assetAmount: number; riskAmount: number; notional: number; leverage: number };
   fmtIdr: (n: number) => string;
-  fmtPct: (n: number, dp?: number) => string;
-  actionColor: (a: string) => string;
+  fmtAsset: (n: number) => string;
+  riskPct: number;
+  mode: "paper" | "live";
 }) {
-  const [showDetails, setShowDetails] = useState(false);
+  const config = PAIR_CONFIG[signal.pair];
+  const isAction = gate.status === "BELI" || gate.status === "JUAL";
+  const statusColor = gate.status === "BELI" ? "#16a34a" : gate.status === "JUAL" ? "#dc2626" : gate.status === "TUNGGU" ? "#f59e0b" : "#525252";
+  const statusBg = gate.status === "BELI" ? "#16a34a15" : gate.status === "JUAL" ? "#dc262615" : gate.status === "TUNGGU" ? "#f59e0b15" : "#52525210";
 
   return (
-    <div style={{ background: "#141414", border: `1px solid ${actionColor(s.action)}40`, borderRadius: "8px", overflow: "hidden" }}>
+    <div style={{ background: "#141414", border: `2px solid ${statusColor}40`, borderRadius: "8px", overflow: "hidden" }}>
       {/* HEADER */}
-      <div style={{ padding: "16px", borderBottom: "1px solid #262626", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <span style={{ fontSize: "18px", fontWeight: 700 }}>{s.pair.toUpperCase()}</span>
-          <span style={{ fontSize: "14px", fontWeight: 700, color: actionColor(s.action), padding: "2px 10px", border: `1px solid ${actionColor(s.action)}`, borderRadius: "4px" }}>
-            {s.action}
-          </span>
-          <span style={{ fontSize: "11px", color: "#737373", textTransform: "uppercase" }}>{s.strength}</span>
+      <div style={{ padding: "16px", borderBottom: `1px solid ${statusColor}30`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <span style={{ fontSize: "18px", fontWeight: 700 }}>{config.name}</span>
+          <span style={{ fontSize: "12px", color: "#525252", marginLeft: "8px" }}>IDR</span>
         </div>
-        <div style={{ textAlign: "right" }}>
-          <div style={{ fontSize: "18px", fontWeight: 600 }}>{fmtIdr(s.entry)}</div>
-          <div style={{ fontSize: "11px", color: "#525252" }}>entry price</div>
+        <div style={{
+          fontSize: "20px", fontWeight: 800, color: statusColor,
+          padding: "4px 16px", background: statusBg, borderRadius: "6px",
+          letterSpacing: "1px",
+        }}>
+          {gate.status}
         </div>
       </div>
 
-      {/* RISK PARAMETERS */}
-      <div style={{ padding: "16px" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: "12px", marginBottom: "16px" }}>
-          <div>
-            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Stop Loss</div>
-            <div style={{ fontSize: "15px", fontWeight: 600, color: "#dc2626" }}>{fmtIdr(s.stopLoss)}</div>
-            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.entry - s.stopLoss) / s.entry)} (2 ATR)</div>
+      {/* TUNGGU / NONAKTIF — simple reason */}
+      {!isAction && (
+        <div style={{ padding: "16px" }}>
+          <p style={{ fontSize: "14px", color: "#a3a3a3", margin: 0 }}>{gate.reason}</p>
+          <div style={{ marginTop: "12px", fontSize: "12px", color: "#525252" }}>
+            <span>Harga: {fmtIdr(signal.raw.price)}</span>
+            {" · "}
+            <span>Funding z: {signal.raw.fundingZScore.toFixed(2)}</span>
+            {" · "}
+            <span>ADX: {signal.raw.adx.toFixed(0)}</span>
+            {" · "}
+            <span>RSI: {signal.raw.rsi.toFixed(0)}</span>
           </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Target 1 (1.5R)</div>
-            <div style={{ fontSize: "15px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(s.takeProfit1)}</div>
-            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.takeProfit1 - s.entry) / s.entry)}</div>
+          {signal.circuitBreaker?.consecutiveLosses > 0 && (
+            <div style={{ marginTop: "8px", fontSize: "12px", color: "#f59e0b" }}>
+              Circuit breaker: {signal.circuitBreaker.consecutiveLosses} loss beruntun · {signal.circuitBreaker.trips}x trip
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* BELI / JUAL — full action card */}
+      {isAction && (
+        <div style={{ padding: "16px" }}>
+          {/* Price levels */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "12px", marginBottom: "16px" }}>
+            <div>
+              <div style={{ fontSize: "11px", color: "#525252" }}>Harga Masuk</div>
+              <div style={{ fontSize: "16px", fontWeight: 600 }}>{fmtIdr(signal.entry)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: "11px", color: "#525252" }}>Stop Loss</div>
+              <div style={{ fontSize: "16px", fontWeight: 600, color: "#dc2626" }}>{fmtIdr(signal.stopLoss)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: "11px", color: "#525252" }}>Target 1 (jual 50%)</div>
+              <div style={{ fontSize: "16px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(signal.takeProfit1)}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: "11px", color: "#525252" }}>Target 2 (jual sisa)</div>
+              <div style={{ fontSize: "16px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(signal.takeProfit2)}</div>
+            </div>
           </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Target 2 (3R)</div>
-            <div style={{ fontSize: "15px", fontWeight: 600, color: "#16a34a" }}>{fmtIdr(s.takeProfit2)}</div>
-            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(Math.abs(s.takeProfit2 - s.entry) / s.entry)}</div>
+
+          {/* Position sizing */}
+          <div style={{ background: "#0f0f0f", border: "1px solid #1a1a1a", borderRadius: "6px", padding: "12px", marginBottom: "16px" }}>
+            <div style={{ fontSize: "11px", color: "#525252", marginBottom: "8px" }}>Ukuran Posisi (risk {riskPct}%)</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "8px" }}>
+              <div>
+                <span style={{ fontSize: "11px", color: "#525252" }}>Beli: </span>
+                <span style={{ fontSize: "14px", fontWeight: 600 }}>{fmtAsset(position.assetAmount)} {signal.pair.replace("_idr", "").toUpperCase()}</span>
+              </div>
+              <div>
+                <span style={{ fontSize: "11px", color: "#525252" }}>Risiko: </span>
+                <span style={{ fontSize: "14px", fontWeight: 600, color: "#dc2626" }}>{fmtIdr(position.riskAmount)}</span>
+              </div>
+              <div>
+                <span style={{ fontSize: "11px", color: "#525252" }}>Notional: </span>
+                <span style={{ fontSize: "14px", fontWeight: 600 }}>{fmtIdr(position.notional)}</span>
+              </div>
+              <div>
+                <span style={{ fontSize: "11px", color: "#525252" }}>Leverage: </span>
+                <span style={{ fontSize: "14px", fontWeight: 600, color: position.leverage > 2 ? "#f59e0b" : "#737373" }}>{position.leverage.toFixed(2)}x</span>
+              </div>
+            </div>
           </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase" }}>Position Size</div>
-            <div style={{ fontSize: "15px", fontWeight: 600 }}>{fmtIdr(s.positionSizeIdr)}</div>
-            <div style={{ fontSize: "10px", color: "#404040" }}>{fmtPct(s.positionSizePct)} of capital</div>
+
+          {/* Execution steps */}
+          <div style={{ background: "#0a0f0a", border: "1px solid #16a34a30", borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
+            <div style={{ fontSize: "11px", color: "#16a34a", fontWeight: 600, marginBottom: "8px" }}>INSTRUKSI EKSEKUSI</div>
+            <ol style={{ margin: 0, paddingLeft: "20px", fontSize: "12px", color: "#a3a3a3", lineHeight: 1.8 }}>
+              <li>Pasang {signal.limitOrder?.recommendation === "use_limit" ? "limit" : "market"} {gate.status === "BELI" ? "buy" : "sell"} di {fmtIdr(signal.entry)}.</li>
+              <li>Jika terisi, langsung pasang stop loss di {fmtIdr(signal.stopLoss)}.</li>
+              <li>Jual 50% di Target 1 ({fmtIdr(signal.takeProfit1)}).</li>
+              <li>Setelah Target 1 tercapai, pindahkan stop ke breakeven (harga masuk).</li>
+              <li>Jual sisa di Target 2 ({fmtIdr(signal.takeProfit2)}).</li>
+              <li>Batalkan order jika sinyal berubah menjadi TUNGGU.</li>
+            </ol>
+          </div>
+
+          {/* Important notes */}
+          <div style={{ fontSize: "12px", color: "#525252", marginBottom: "8px" }}>
+            <div style={{ color: "#f59e0b", marginBottom: "4px" }}>⚠ Penting:</div>
+            <div>• Masuk setelah candle 1 jam ditutup (bukan "sekarang").</div>
+            <div>• Jangan masuk jika harga sudah bergerak &gt;0.5% dari harga sinyal.</div>
+            <div>• {gate.reason}</div>
+            {signal.warning && <div style={{ color: "#f59e0b", marginTop: "4px" }}>• {signal.warning.slice(0, 100)}</div>}
+          </div>
+
+          {/* Invalidation */}
+          <div style={{ fontSize: "11px", color: "#525252", borderTop: "1px solid #1a1a1a", paddingTop: "8px" }}>
+            <strong>Batalkan jika:</strong> {signal.invalidation.slice(0, 120)}
           </div>
         </div>
-
-        {/* MICROSTRUCTURE CONFIRMATION */}
-        {s.microstructure && (
-          <div style={{ background: s.confirmed ? "#0a1a0a" : "#0f0f0f", border: `1px solid ${s.confirmed ? "#16a34a40" : "#1a1a1a"}`, borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
-            <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
-              Microstructure {s.confirmed && <span style={{ color: "#16a34a", fontWeight: 700 }}>✓ CONFIRMED</span>}
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
-              <div>
-                <div style={{ fontSize: "10px", color: "#525252" }}>OI Trend</div>
-                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.oiTrend === "declining" ? "#16a34a" : s.microstructure.oiTrend === "rising" ? "#dc2626" : "#737373" }}>
-                  {s.microstructure.oiTrend} ({s.microstructure.oiChange4hPct.toFixed(1)}%)
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: "10px", color: "#525252" }}>CVD 1h</div>
-                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.cvd1h > 0 ? "#16a34a" : "#dc2626" }}>
-                  {s.microstructure.cvd1h > 0 ? "net buy" : "net sell"}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: "10px", color: "#525252" }}>Absorption</div>
-                <div style={{ fontSize: "13px", fontWeight: 600, color: s.microstructure.absorptionDetected ? "#f59e0b" : "#525252" }}>
-                  {s.microstructure.absorptionDetected ? "DETECTED" : "none"}
-                </div>
-              </div>
-              <div>
-                <div style={{ fontSize: "10px", color: "#525252" }}>Taker Buy %</div>
-                <div style={{ fontSize: "13px", fontWeight: 600 }}>{(s.microstructure.takerBuyRatio * 100).toFixed(0)}%</div>
-              </div>
-            </div>
-            <div style={{ fontSize: "11px", color: "#737373", marginTop: "6px" }}>
-              Verdict: {s.microstructure.confirmation}
-            </div>
-          </div>
-        )}
-
-        {/* OOS BACKTEST with bootstrap CI */}
-        <div style={{ background: "#0f0f0f", border: `1px solid ${s.backtest.honest ? "#16a34a40" : "#1a1a1a"}`, borderRadius: "6px", padding: "12px", marginBottom: "12px" }}>
-          <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "8px" }}>
-            Anchored Walk-Forward OOS <span style={{ color: "#404040" }}>(n={s.backtest.oosSampleSize}, {s.backtest.anchoredWindows} windows)</span>
-            {s.backtest.honest && s.backtest.oosSampleSize > 0 && <span style={{ color: "#16a34a", marginLeft: "8px", fontWeight: 700 }}>✓ EDGE CONFIRMED (95% bootstrap)</span>}
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(100px, 1fr))", gap: "8px" }}>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Win Rate</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosWinRate > 0.5 ? "#16a34a" : "#dc2626" }}>
-                {s.backtest.oosSampleSize > 0 ? fmtPct(s.backtest.oosWinRate, 0) : "—"}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>OOS Sharpe</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.oosSharpe > 1 ? "#16a34a" : "#737373" }}>
-                {s.backtest.oosSampleSize > 0 ? s.backtest.oosSharpe.toFixed(1) : "—"}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly (point)</div>
-              <div style={{ fontSize: "14px", fontWeight: 600 }}>{fmtPct(s.backtest.kellyFraction, 1)}</div>
-            </div>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly CI5 (conservative)</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.kellyCI5 > 0 ? "#16a34a" : "#dc2626" }}>
-                {fmtPct(s.backtest.kellyCI5, 1)}
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Kelly CI [5-95%]</div>
-              <div style={{ fontSize: "12px", fontWeight: 500, color: s.backtest.kellyUncertainty > 0.3 ? "#f59e0b" : "#737373" }}>
-                {(s.backtest.kellyCI5 * 100).toFixed(1)}–{(s.backtest.kellyCI95 * 100).toFixed(1)}%
-              </div>
-            </div>
-            <div>
-              <div style={{ fontSize: "10px", color: "#525252" }}>Overfit Gap</div>
-              <div style={{ fontSize: "14px", fontWeight: 600, color: s.backtest.overfitGap > 0.15 ? "#dc2626" : "#737373" }}>
-                {fmtPct(s.backtest.overfitGap, 0)}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* RATIONALE */}
-        <div style={{ marginBottom: "12px" }}>
-          <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "6px" }}>Rationale</div>
-          {s.rationale.map((r, i) => (
-            <div key={i} style={{ fontSize: "12px", color: "#a3a3a3", marginBottom: "3px", paddingLeft: "8px", borderLeft: "2px solid #262626" }}>
-              {r}
-            </div>
-          ))}
-        </div>
-
-        {/* WARNING */}
-        {s.warning && (
-          <div style={{ background: "#1a1000", border: "1px solid #f59e0b40", borderRadius: "6px", padding: "8px 12px", marginBottom: "12px" }}>
-            <span style={{ fontSize: "11px", color: "#f59e0b" }}>{s.warning}</span>
-          </div>
-        )}
-
-        {/* INVALIDATION */}
-        <div style={{ background: "#0f0a0a", border: "1px solid #dc262640", borderRadius: "6px", padding: "8px 12px", marginBottom: "12px" }}>
-          <span style={{ fontSize: "10px", color: "#dc2626", textTransform: "uppercase" }}>Invalidation: </span>
-          <span style={{ fontSize: "11px", color: "#a3a3a3" }}>{s.invalidation}</span>
-        </div>
-
-        {/* DETAILS TOGGLE */}
-        <button
-          onClick={() => setShowDetails(!showDetails)}
-          style={{ background: "transparent", border: "1px solid #262626", color: "#737373", padding: "4px 12px", borderRadius: "4px", fontSize: "11px", cursor: "pointer" }}
-        >
-          {showDetails ? "Hide" : "Show"} raw data + edges
-        </button>
-
-        {showDetails && (
-          <div style={{ marginTop: "12px", paddingTop: "12px", borderTop: "1px solid #262626" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "8px", marginBottom: "12px" }}>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>ATR: </span><span style={{ fontSize: "12px" }}>{s.raw.atr.toFixed(0)} ({s.raw.atrPercent.toFixed(2)}%)</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>RSI: </span><span style={{ fontSize: "12px" }}>{s.raw.rsi.toFixed(0)}</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>ADX: </span><span style={{ fontSize: "12px" }}>{s.raw.adx.toFixed(0)}</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Funding z: </span><span style={{ fontSize: "12px", color: Math.abs(s.raw.fundingZScore) > 2 ? "#dc2626" : Math.abs(s.raw.fundingZScore) > 1 ? "#f59e0b" : "#737373" }}>{s.raw.fundingZScore.toFixed(2)} ({s.raw.fundingPercentile.toFixed(0)}th)</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>R:R: </span><span style={{ fontSize: "12px" }}>{s.rewardRiskRatio.toFixed(2)}:1</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Conviction: </span><span style={{ fontSize: "12px" }}>{s.conviction}/100</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Notional: </span><span style={{ fontSize: "12px" }}>Rp {s.notionalIdr.toLocaleString("id-ID", { maximumFractionDigits: 0 })} ({(s.notionalCapPct * 100).toFixed(0)}%, {s.leverage.toFixed(1)}x)</span></div>
-              <div><span style={{ fontSize: "10px", color: "#525252" }}>Data: </span><span style={{ fontSize: "12px", color: s.dataStale ? "#dc2626" : "#16a34a" }}>{s.dataStale ? "STALE" : "fresh"} ({s.dataSource})</span></div>
-            </div>
-            <div style={{ fontSize: "11px", color: "#525252" }}>
-              <strong>Edges:</strong> funding={s.edges.funding} (z={s.edges.fundingZScore.toFixed(2)}) · regime={s.edges.regime} · vol={s.edges.volatility} · trend={s.edges.trend}
-            </div>
-          </div>
-        )}
-      </div>
+      )}
     </div>
   );
 }
