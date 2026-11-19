@@ -36,23 +36,26 @@ import { detectRegime } from "./regime";
 
 export interface ReplayedSignal {
   pair: string;
-  candleTime: number;          // unix sec
+  candleTime: number;          // unix sec — signal candle
+  entryTime: number;           // unix sec — entry candle (next candle)
   action: "LONG" | "SHORT";
-  entryPrice: number;
+  entryPrice: number;          // next candle OPEN (no lookahead)
   stopLoss: number;
   takeProfit: number;
   fundingZScore: number;
   adx: number;
   rsi: number;
   regime: string;
-  edgeSource: string;          // "funding_contrarian" | "trend_follow" | "mean_revert"
+  edgeSource: string;
   // Outcome
-  status: "target_hit" | "stopped_out" | "expired";
+  status: "target_hit" | "stopped_out" | "gap_stopped" | "expired";
   exitPrice: number;
-  exitTime: number;            // unix sec
-  pnlPct: number;
+  exitTime: number;
+  rawPnlPct: number;           // P&L before costs
+  costPct: number;             // total round-trip cost (fee + slippage)
+  netPnlPct: number;           // P&L after costs
   holdHours: number;
-  won: boolean;
+  won: boolean;                // netPnlPct > 0
 }
 
 export interface ReplayResult {
@@ -60,15 +63,22 @@ export interface ReplayResult {
   totalSignals: number;
   wins: number;
   losses: number;
-  winRate: number;
-  avgPnlPct: number;
-  totalPnlPct: number;         // cumulative P&L as % of capital per trade
+  winRate: number;             // net win rate (after costs)
+  avgPnlPct: number;           // net avg P&L
+  totalPnlPct: number;         // net cumulative P&L
   avgHoldHours: number;
-  sharpeRatio: number;
+  sharpeRatio: number;         // net Sharpe
   maxDrawdownPct: number;
   bestTrade: number;
   worstTrade: number;
-  byEdge: { edge: string; count: number; winRate: number; pnlPct: number }[];
+  // Frictionless comparison (before costs)
+  frictionlessWinRate: number;
+  frictionlessTotalPnl: number;
+  frictionlessSharpe: number;
+  // Cost stats
+  avgCostPct: number;
+  totalCostPct: number;
+  byEdge: { edge: string; count: number; winRate: number; netPnlPct: number; frictionlessPnlPct: number }[];
   signals: ReplayedSignal[];
   description: string;
 }
@@ -144,12 +154,20 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
   const signals: ReplayedSignal[] = [];
   const minWarmup = 50;
 
-  for (let i = minWarmup; i < candles.length - 24; i++) {
+  // Cost model: INDODAX fee 0.3% per side (taker) + ~0.05% slippage per side
+  // for small orders. Total round-trip: 0.7%.
+  // This is CONSERVATIVE — actual could be higher for thin pairs.
+  const FEE_PER_SIDE = 0.003;      // 0.3%
+  const SLIPPAGE_PER_SIDE = 0.0005; // 0.05% (small orders)
+  const ROUND_TRIP_COST = (FEE_PER_SIDE + SLIPPAGE_PER_SIDE) * 2; // 0.7%
+
+  for (let i = minWarmup; i < candles.length - 25; i++) {
     const candle = candles[i];
     const candleTime = candle.time;
 
-    // Find funding rate active at this candle's time
-    // Funding rates are 8h apart. Find the most recent rate before candleTime.
+    // === PREFIX-ONLY: all data used here is from candle i and before ===
+
+    // Funding z-score: only rates available up to candleTime
     let activeRate: number | null = null;
     let fundingRatesUpToNow: number[] = [];
     for (const f of fundingHistory) {
@@ -160,13 +178,12 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
     }
     if (activeRate === null || fundingRatesUpToNow.length < 20) continue;
 
-    // Compute funding z-score using rates available up to this point
-    const ratesForZ = fundingRatesUpToNow.slice(-180); // up to 180 rates
+    const ratesForZ = fundingRatesUpToNow.slice(-180);
     const mean = ratesForZ.reduce((a, b) => a + b, 0) / ratesForZ.length;
     const std = Math.sqrt(ratesForZ.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / ratesForZ.length);
     const zScore = std > 0 ? (activeRate - mean) / std : 0;
 
-    // Compute regime from candle history up to this point
+    // Regime: only candles up to i
     const candleSlice = candles.slice(0, i + 1);
     const atr = calcATR(candleSlice, 14);
     const adx = approximateADX(candleSlice);
@@ -175,70 +192,99 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
     const regime = dailySlice.length >= 7 ? detectRegime(candleSlice, dailySlice) : null;
     const dailyTrend = regime?.dailyTrend ?? "neutral";
 
-    // Determine what action WOULD have fired
+    // Determine action
     let action: "LONG" | "SHORT" | null = null;
     let edgeSource = "";
 
-    // Edge 1: Funding contrarian
     if (zScore > 2 && (adx < 20 || dailyTrend === "bearish")) {
-      action = "SHORT";
-      edgeSource = "funding_contrarian";
+      action = "SHORT"; edgeSource = "funding_contrarian";
     } else if (zScore < -2 && (adx < 20 || dailyTrend === "bullish")) {
-      action = "LONG";
-      edgeSource = "funding_contrarian";
-    }
-    // Edge 2: Trend following
-    else if (adx > 25 && dailyTrend !== "neutral") {
-      action = dailyTrend === "bullish" ? "LONG" : "SHORT";
-      edgeSource = "trend_follow";
-    }
-    // Edge 3: Mean reversion
-    else if (adx < 20 && (rsi < 30 || rsi > 70)) {
-      action = rsi < 30 ? "LONG" : "SHORT";
-      edgeSource = "mean_revert";
+      action = "LONG"; edgeSource = "funding_contrarian";
+    } else if (adx > 25 && dailyTrend !== "neutral") {
+      action = dailyTrend === "bullish" ? "LONG" : "SHORT"; edgeSource = "trend_follow";
+    } else if (adx < 20 && (rsi < 30 || rsi > 70)) {
+      action = rsi < 30 ? "LONG" : "SHORT"; edgeSource = "mean_revert";
     }
 
-    if (!action) continue; // would have been FLAT
+    if (!action) continue;
 
-    // Simulate the trade
-    const entry = candle.close;
+    // === ANTI-LOOKAHEAD: entry at NEXT candle's open ===
+    // Signal is generated at candle i's close. Entry executes at candle i+1's open.
+    // This simulates 1-bar latency (you see the signal, then place order).
+    const entryCandle = candles[i + 1];
+    const entry = entryCandle.open;
+    const entryTime = entryCandle.time;
     const stop = action === "LONG" ? entry - 2 * atr : entry + 2 * atr;
     const target = action === "LONG" ? entry + 3 * atr : entry - 3 * atr;
 
-    // Walk forward through subsequent candles to find exit
-    let exitPrice = entry;
-    let exitTime = candleTime;
-    let status: "target_hit" | "stopped_out" | "expired" = "expired";
+    // === GAP-THROUGH CHECK: if entry candle opens beyond stop/target ===
+    // If price gaps through the stop on entry, fill at open (worse than stop).
+    // If price gaps through the target on entry, fill at open (better than target).
+    let exitPrice = 0;
+    let exitTime = entryTime;
+    let status: "target_hit" | "stopped_out" | "gap_stopped" | "expired" = "expired";
     let holdHours = 0;
 
-    for (let j = i + 1; j < Math.min(i + 48, candles.length); j++) {
-      const future = candles[j];
-      holdHours = j - i;
-
-      if (action === "LONG") {
-        if (future.low <= stop) { exitPrice = stop; exitTime = future.time; status = "stopped_out"; break; }
-        if (future.high >= target) { exitPrice = target; exitTime = future.time; status = "target_hit"; break; }
+    if (action === "LONG") {
+      if (entryCandle.open <= stop) {
+        // Gap through stop on entry — fill at open (worse)
+        exitPrice = entryCandle.open;
+        status = "gap_stopped";
+        holdHours = 0; // stopped on entry candle
+      } else if (entryCandle.open >= target) {
+        // Gap through target on entry — fill at open (better)
+        exitPrice = entryCandle.open;
+        status = "target_hit";
+        holdHours = 0;
       } else {
-        if (future.high >= stop) { exitPrice = stop; exitTime = future.time; status = "stopped_out"; break; }
-        if (future.low <= target) { exitPrice = target; exitTime = future.time; status = "target_hit"; break; }
+        // Walk forward from entry candle to find stop/target
+        for (let j = i + 1; j < Math.min(i + 49, candles.length); j++) {
+          const future = candles[j];
+          holdHours = j - i;
+          if (future.low <= stop) { exitPrice = stop; exitTime = future.time; status = "stopped_out"; break; }
+          if (future.high >= target) { exitPrice = target; exitTime = future.time; status = "target_hit"; break; }
+        }
+      }
+    } else { // SHORT
+      if (entryCandle.open >= stop) {
+        exitPrice = entryCandle.open;
+        status = "gap_stopped";
+        holdHours = 0;
+      } else if (entryCandle.open <= target) {
+        exitPrice = entryCandle.open;
+        status = "target_hit";
+        holdHours = 0;
+      } else {
+        for (let j = i + 1; j < Math.min(i + 49, candles.length); j++) {
+          const future = candles[j];
+          holdHours = j - i;
+          if (future.high >= stop) { exitPrice = stop; exitTime = future.time; status = "stopped_out"; break; }
+          if (future.low <= target) { exitPrice = target; exitTime = future.time; status = "target_hit"; break; }
+        }
       }
     }
 
-    // If not exited, mark-to-market at last checked candle
+    // If not exited, mark-to-market
     if (status === "expired") {
-      const lastIdx = Math.min(i + 47, candles.length - 1);
+      const lastIdx = Math.min(i + 48, candles.length - 1);
       exitPrice = candles[lastIdx].close;
       exitTime = candles[lastIdx].time;
       holdHours = lastIdx - i;
     }
 
-    const pnlPct = action === "LONG"
+    // Raw P&L (frictionless)
+    const rawPnlPct = action === "LONG"
       ? (exitPrice - entry) / entry
       : (entry - exitPrice) / entry;
+
+    // Net P&L (after costs)
+    const costPct = ROUND_TRIP_COST;
+    const netPnlPct = rawPnlPct - costPct;
 
     signals.push({
       pair,
       candleTime,
+      entryTime,
       action,
       entryPrice: entry,
       stopLoss: stop,
@@ -251,9 +297,11 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
       status,
       exitPrice,
       exitTime,
-      pnlPct,
+      rawPnlPct,
+      costPct,
+      netPnlPct,
       holdHours,
-      won: pnlPct > 0,
+      won: netPnlPct > 0,
     });
   }
 
@@ -261,36 +309,49 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
     return emptyReplay(pair, "no signals would have fired in the replay period");
   }
 
-  // Aggregate stats
+  // NET stats (after costs)
   const wins = signals.filter((s) => s.won);
   const losses = signals.filter((s) => !s.won);
   const winRate = wins.length / signals.length;
-  const avgPnl = signals.reduce((a, s) => a + s.pnlPct, 0) / signals.length;
-  const totalPnl = signals.reduce((a, s) => a + s.pnlPct, 0);
+  const avgNetPnl = signals.reduce((a, s) => a + s.netPnlPct, 0) / signals.length;
+  const totalNetPnl = signals.reduce((a, s) => a + s.netPnlPct, 0);
   const avgHold = signals.reduce((a, s) => a + s.holdHours, 0) / signals.length;
-  const stdPnl = Math.sqrt(signals.reduce((a, s) => a + Math.pow(s.pnlPct - avgPnl, 2), 0) / signals.length);
-  const sharpe = stdPnl > 0 && avgHold > 0 ? (avgPnl / stdPnl) * Math.sqrt(365 * 24 / avgHold) : 0;
+  const stdNetPnl = Math.sqrt(signals.reduce((a, s) => a + Math.pow(s.netPnlPct - avgNetPnl, 2), 0) / signals.length);
+  const netSharpe = stdNetPnl > 0 && avgHold > 0 ? (avgNetPnl / stdNetPnl) * Math.sqrt(365 * 24 / avgHold) : 0;
 
-  // Max drawdown (cumulative P&L peak-to-trough)
-  let cumPnl = 0, peak = 0, maxDD = 0;
+  // Max drawdown (net)
+  let cumNet = 0, peakNet = 0, maxDD = 0;
   for (const s of signals) {
-    cumPnl += s.pnlPct;
-    if (cumPnl > peak) peak = cumPnl;
-    const dd = peak - cumPnl;
+    cumNet += s.netPnlPct;
+    if (cumNet > peakNet) peakNet = cumNet;
+    const dd = peakNet - cumNet;
     if (dd > maxDD) maxDD = dd;
   }
 
-  // Per-edge breakdown
-  const edgeMap = new Map<string, { count: number; wins: number; pnl: number }>();
+  // FRICTIONLESS stats (before costs — for comparison)
+  const frictionlessWins = signals.filter((s) => s.rawPnlPct > 0);
+  const frictionlessWinRate = frictionlessWins.length / signals.length;
+  const frictionlessTotalPnl = signals.reduce((a, s) => a + s.rawPnlPct, 0);
+  const avgRawPnl = signals.reduce((a, s) => a + s.rawPnlPct, 0) / signals.length;
+  const stdRawPnl = Math.sqrt(signals.reduce((a, s) => a + Math.pow(s.rawPnlPct - avgRawPnl, 2), 0) / signals.length);
+  const frictionlessSharpe = stdRawPnl > 0 && avgHold > 0 ? (avgRawPnl / stdRawPnl) * Math.sqrt(365 * 24 / avgHold) : 0;
+
+  // Cost stats
+  const avgCost = signals.reduce((a, s) => a + s.costPct, 0) / signals.length;
+  const totalCost = signals.reduce((a, s) => a + s.costPct, 0);
+
+  // Per-edge breakdown (net + frictionless)
+  const edgeMap = new Map<string, { count: number; wins: number; netPnl: number; rawPnl: number }>();
   for (const s of signals) {
-    const e = edgeMap.get(s.edgeSource) ?? { count: 0, wins: 0, pnl: 0 };
+    const e = edgeMap.get(s.edgeSource) ?? { count: 0, wins: 0, netPnl: 0, rawPnl: 0 };
     e.count++;
     if (s.won) e.wins++;
-    e.pnl += s.pnlPct;
+    e.netPnl += s.netPnlPct;
+    e.rawPnl += s.rawPnlPct;
     edgeMap.set(s.edgeSource, e);
   }
   const byEdge = Array.from(edgeMap.entries()).map(([edge, e]) => ({
-    edge, count: e.count, winRate: e.wins / e.count, pnlPct: e.pnl,
+    edge, count: e.count, winRate: e.wins / e.count, netPnlPct: e.netPnl, frictionlessPnlPct: e.rawPnl,
   }));
 
   return {
@@ -299,16 +360,21 @@ export async function replaySignals(pair: string): Promise<ReplayResult> {
     wins: wins.length,
     losses: losses.length,
     winRate,
-    avgPnlPct: avgPnl,
-    totalPnlPct: totalPnl,
+    avgPnlPct: avgNetPnl,
+    totalPnlPct: totalNetPnl,
     avgHoldHours: avgHold,
-    sharpeRatio: sharpe,
+    sharpeRatio: netSharpe,
     maxDrawdownPct: maxDD,
-    bestTrade: Math.max(...signals.map((s) => s.pnlPct)),
-    worstTrade: Math.min(...signals.map((s) => s.pnlPct)),
+    bestTrade: Math.max(...signals.map((s) => s.netPnlPct)),
+    worstTrade: Math.min(...signals.map((s) => s.netPnlPct)),
+    frictionlessWinRate,
+    frictionlessTotalPnl,
+    frictionlessSharpe,
+    avgCostPct: avgCost,
+    totalCostPct: totalCost,
     byEdge,
     signals,
-    description: `Replay (${candles.length} candles, ≈${Math.floor(candles.length / 24)} days): ${signals.length} signals would have fired. Win rate ${(winRate * 100).toFixed(0)}%, avg P&L ${(avgPnl * 100).toFixed(2)}%, Sharpe ${sharpe.toFixed(1)}, max DD ${(maxDD * 100).toFixed(1)}%. Edges: ${byEdge.map((e) => `${e.edge}(${e.count}w/${(e.winRate * 100).toFixed(0)}%)`).join(", ")}`,
+    description: `Replay (${candles.length} candles, ≈${Math.floor(candles.length / 24)} days, anti-lookahead + cost-adjusted): ${signals.length} signals. NET win ${(winRate * 100).toFixed(0)}%, net P&L ${(totalNetPnl * 100).toFixed(1)}%, net Sharpe ${netSharpe.toFixed(1)}, max DD ${(maxDD * 100).toFixed(1)}%. Frictionless: ${(frictionlessWinRate * 100).toFixed(0)}% win, ${(frictionlessTotalPnl * 100).toFixed(1)}% P&L. Cost drag: ${(totalCost * 100).toFixed(1)}% total. Edges: ${byEdge.map((e) => `${e.edge}(n=${e.count} net=${(e.netPnlPct * 100).toFixed(1)}% vs raw=${(e.frictionlessPnlPct * 100).toFixed(1)}%)`).join(", ")}`,
   };
 }
 
@@ -316,7 +382,8 @@ function emptyReplay(pair: string, reason: string): ReplayResult {
   return {
     pair, totalSignals: 0, wins: 0, losses: 0, winRate: 0, avgPnlPct: 0,
     totalPnlPct: 0, avgHoldHours: 0, sharpeRatio: 0, maxDrawdownPct: 0,
-    bestTrade: 0, worstTrade: 0, byEdge: [], signals: [],
+    bestTrade: 0, worstTrade: 0, frictionlessWinRate: 0, frictionlessTotalPnl: 0,
+    frictionlessSharpe: 0, avgCostPct: 0, totalCostPct: 0, byEdge: [], signals: [],
     description: `Replay: ${reason}`,
   };
 }
