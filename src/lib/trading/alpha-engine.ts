@@ -707,13 +707,34 @@ async function generateSignalFromCandles(
   // ── EDGE CONFLICT DETECTION (P11) ──
   // When funding contrarian says one direction but trend says the opposite,
   // edges conflict → force FLAT. Never trade against funding when funding is extreme.
-  if (action !== "FLAT" && fundingEdge !== "neutral") {
-    const fundingDirection = fundingEdge === "contrarian_long" ? "LONG" : "SHORT";
-    if (action !== fundingDirection) {
-      rationale.push(`EDGE CONFLICT: Funding contrarian says ${fundingDirection} (z=${fundingZScore.toFixed(2)}) but signal action is ${action}. Edges conflict → force FLAT. Never trade against extreme funding.`);
-      action = "FLAT";
-      strength = "none";
-      conviction = 0;
+  // TWO checks: (a) fundingEdge classification, (b) direct z-score check.
+  // The direct z-score check is a safety net — even if fundingEdge is "neutral"
+  // (e.g., funding module returned data but didn't classify as extreme), the
+  // raw z-score still catches the conflict.
+  if (action !== "FLAT") {
+    // Check (a): fundingEdge classification
+    if (fundingEdge !== "neutral") {
+      const fundingDirection = fundingEdge === "contrarian_long" ? "LONG" : "SHORT";
+      if (action !== fundingDirection) {
+        rationale.push(`EDGE CONFLICT: Funding contrarian says ${fundingDirection} (z=${fundingZScore.toFixed(2)}) but signal action is ${action}. Edges conflict → force FLAT. Never trade against extreme funding.`);
+        action = "FLAT";
+        strength = "none";
+        conviction = 0;
+      }
+    }
+    // Check (b): direct z-score safety net (catches cases where fundingEdge is neutral but z is extreme)
+    if (action !== "FLAT") {
+      if (fundingZScore < -2 && action === "SHORT") {
+        rationale.push(`EDGE CONFLICT (z-score safety net): Funding z=${fundingZScore.toFixed(2)} < -2 → contrarian LONG bias, but action is SHORT. Force FLAT. Never SHORT when funding is extremely negative (short squeeze risk).`);
+        action = "FLAT";
+        strength = "none";
+        conviction = 0;
+      } else if (fundingZScore > 2 && action === "LONG") {
+        rationale.push(`EDGE CONFLICT (z-score safety net): Funding z=${fundingZScore.toFixed(2)} > +2 → contrarian SHORT bias, but action is LONG. Force FLAT. Never LONG when funding is extremely positive (long squeeze risk).`);
+        action = "FLAT";
+        strength = "none";
+        conviction = 0;
+      }
     }
   }
 

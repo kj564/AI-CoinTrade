@@ -15,6 +15,10 @@ import { recordSignalOutcome } from "./alpha-circuit-breaker";
 import { getDrawdownState, DRAWDOWN_HALT_PCT } from "./drawdown-monitor";
 
 // Record a new signal in the journal (called when action ≠ FLAT)
+// PER-PAIR COOLDOWN: if there's ANY open signal for this pair (regardless of action),
+// don't create a new one. This prevents duplicate signals from hot-reload windows,
+// cron re-runs, or race conditions. To create a new signal, the previous one must
+// be closed first (stop/target hit, or manual cancel).
 export async function journalSignal(signal: {
   pair: string;
   action: string;
@@ -34,12 +38,18 @@ export async function journalSignal(signal: {
   capitalIdr?: number;
 }): Promise<string | null> {
   try {
-    // Don't double-record: if there's an open signal for this pair with same action, skip
-    const existing = await db.signalJournal.findFirst({
-      where: { pair: signal.pair, action: signal.action, status: "open" },
+    // PER-PAIR COOLDOWN: if there's ANY open signal for this pair, skip.
+    // This is stricter than the old check (which only blocked same pair + same action).
+    // Now even if action changes (e.g., SHORT → LONG), the existing open signal blocks
+    // the new one. Close the existing position first before opening a new one.
+    const existingOpen = await db.signalJournal.findFirst({
+      where: { pair: signal.pair, status: "open" },
       orderBy: { createdAt: "desc" },
     });
-    if (existing) return existing.id; // already open, don't duplicate
+    if (existingOpen) {
+      console.log(`[journal] PER-PAIR COOLDOWN: ${signal.pair} already has open ${existingOpen.action} signal (created ${existingOpen.createdAt.toISOString()}). Skipping new ${signal.action} signal.`);
+      return existingOpen.id; // return existing ID, don't create duplicate
+    }
 
     // Compute drawdown state at signal time (for risk-context + halt check)
     const capitalIdr = signal.capitalIdr ?? 10_000_000;
