@@ -704,6 +704,56 @@ async function generateSignalFromCandles(
     rationale.push(`FLAT is a position. Not trading IS the signal when no edge exists.`);
   }
 
+  // ── EDGE CONFLICT DETECTION (P11) ──
+  // When funding contrarian says one direction but trend says the opposite,
+  // edges conflict → force FLAT. Never trade against funding when funding is extreme.
+  if (action !== "FLAT" && fundingEdge !== "neutral") {
+    const fundingDirection = fundingEdge === "contrarian_long" ? "LONG" : "SHORT";
+    if (action !== fundingDirection) {
+      rationale.push(`EDGE CONFLICT: Funding contrarian says ${fundingDirection} (z=${fundingZScore.toFixed(2)}) but signal action is ${action}. Edges conflict → force FLAT. Never trade against extreme funding.`);
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+    }
+  }
+
+  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS WITH BOOTSTRAP CI
+  // Computed here (before hard gates) so gates can check OOS sample + Kelly CI.
+  const wfResult = walkForwardBacktest(candles1h, regime, action);
+
+  // ── HARD GATES (P12) — applied BEFORE return, prevents journaling/alerting ──
+  // These gates MUST pass for any actionable signal. If any fails, force FLAT.
+  // This closes the loop: the UI gate and the engine gate are now the same.
+  if (action !== "FLAT") {
+    // Gate 1: OOS sample size — need at least 5 OOS trades for any signal
+    // (20 for "confirmed" but 5 is the absolute minimum to compute Kelly)
+    if (wfResult.oosSampleSize < 5) {
+      rationale.push(`HARD GATE FAIL: OOS sample n=${wfResult.oosSampleSize} < 5. Edge NOT validated out-of-sample. Force FLAT — no journaling, no alert.`);
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+    }
+    // Gate 2: OOS honest (win rate > 50% AND overfit gap < 15%)
+    else if (!wfResult.honest) {
+      rationale.push(`HARD GATE FAIL: Walk-forward OOS not honest (win rate ${(wfResult.oosWinRate * 100).toFixed(0)}%, overfit gap ${(wfResult.overfitGap * 100).toFixed(0)}%). Edge NOT confirmed out-of-sample. Force FLAT.`);
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+    }
+    // Gate 3: Kelly CI5 > 0 (95% of bootstrap resamples show positive Kelly)
+    else if (wfResult.kellyCI5 <= 0) {
+      rationale.push(`HARD GATE FAIL: Kelly CI5 = ${(wfResult.kellyCI5 * 100).toFixed(1)}% ≤ 0. Cannot size position with confidence. Force FLAT.`);
+      action = "FLAT";
+      strength = "none";
+      conviction = 0;
+    }
+    // Gate 4: OOS sample < 20 → allow but mark as unconfirmed (weak strength only)
+    else if (wfResult.oosSampleSize < 20) {
+      if (strength === "strong") strength = "moderate";
+      rationale.push(`SOFT GATE: OOS sample n=${wfResult.oosSampleSize} < 20. Edge not fully confirmed. Strength capped at moderate.`);
+    }
+  }
+
   if (volEdge === "high_vol_size_down") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = high vol → size halved`);
   else if (volEdge === "low_vol_size_up") rationale.push(`ATR ratio ${atrRatio.toFixed(2)}x = low vol → size increased`);
 
@@ -721,9 +771,6 @@ async function generateSignalFromCandles(
     stopLoss = price; takeProfit1 = price; takeProfit2 = price;
   }
   const rewardRisk = action !== "FLAT" ? Math.abs(takeProfit1 - price) / Math.abs(price - stopLoss) : 0;
-
-  // P3+P4: WALK-FORWARD OOS BACKTEST + KELLY FROM OOS WITH BOOTSTRAP CI
-  const wfResult = walkForwardBacktest(candles1h, regime, action);
 
   // P4: Use 5th percentile bootstrap Kelly (conservative — only bet if 95%
   // of bootstrap resamples show positive Kelly). Falls back to point estimate
