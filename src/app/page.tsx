@@ -24,36 +24,49 @@ const PAIR_CONFIG: Record<string, {
   label: string;
   note: string;
   evidence: string;
+  tier: "MAJOR" | "MICROCAP";
 }> = {
   eth_idr: {
     enabled: true, name: "Ethereum",
     label: "KANDIDAT EDGE",
     note: "+25.1% net setelah biaya (21 hari replay)",
     evidence: "21 hari replay, 75% win, Sharpe 13.1 — belum cukup untuk live",
+    tier: "MAJOR",
   },
   btc_idr: {
     enabled: true, name: "Bitcoin",
     label: "MARGINAL",
     note: "+4.5% net setelah biaya (21 hari replay)",
     evidence: "EV tipis setelah biaya, 64% win — butuh validasi lebih lanjut",
+    tier: "MAJOR",
   },
   sol_idr: {
     enabled: false, name: "Solana",
     label: "NONAKTIF SEMENTARA",
     note: "-20.8% net setelah biaya (21 hari replay)",
     evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+    tier: "MAJOR",
   },
   bnb_idr: {
     enabled: false, name: "BNB",
     label: "NONAKTIF SEMENTARA",
     note: "-6.2% net setelah biaya (21 hari replay)",
     evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+    tier: "MAJOR",
   },
   xrp_idr: {
     enabled: false, name: "XRP",
     label: "NONAKTIF SEMENTARA",
     note: "-18.9% net setelah biaya (21 hari replay)",
     evidence: "EV negatif setelah biaya. Ditinjau ulang mingguan.",
+    tier: "MAJOR",
+  },
+  unmd_idr: {
+    enabled: false, name: "UNMD (Utility NexusMind)",
+    label: "WATCHLIST",
+    note: "Microcap — likuiditas sangat rendah, spread lebar, manipulasi riskan",
+    evidence: "Volume 24h ~Rp 97-280jt. Syarat: volume ≥500jt, spread ≤1%, 100 candle, 20 OOS trade.",
+    tier: "MICROCAP",
   },
 };
 
@@ -93,6 +106,16 @@ interface Signal {
   rationale: string[];
   invalidation: string;
   warning: string | null;
+  microcap: {
+    isMicrocap: boolean;
+    gatePassed: boolean;
+    status: "WATCHLIST" | "KANDIDAT_EDGE" | "KANDIDAT_LIVE_MICRO" | "not_microcap";
+    checks: { name: string; passed: boolean; actual: number; required: number; unit: string }[];
+    failedChecks: string[];
+    reason: string;
+    maxRiskPct: number;
+    maxNotionalIdr: number;
+  } | null;
   raw: { price: number; fundingRate: number; fundingZScore: number; adx: number; rsi: number; atrPercent: number };
 }
 
@@ -349,10 +372,18 @@ export default function TradingAssistant() {
     return { assetAmount, riskAmount, notional, leverage };
   }
 
-  function gate(signal: Signal): { status: "BELI" | "JUAL" | "TUNGGU" | "NONAKTIF"; reason: string } {
+  function gate(signal: Signal): { status: "BELI" | "JUAL" | "TUNGGU" | "NONAKTIF" | "WATCHLIST"; reason: string } {
     const config = PAIR_CONFIG[signal.pair];
     if (!config?.enabled) {
+      // Microcap pairs (UNMD) show WATCHLIST, not NONAKTIF
+      if (config?.tier === "MICROCAP") {
+        return { status: "WATCHLIST", reason: config.note };
+      }
       return { status: "NONAKTIF", reason: config?.note ?? "Pair dinonaktifkan" };
+    }
+    // Microcap liquidity gate (even if enabled, check gate)
+    if (signal.microcap?.isMicrocap && !signal.microcap.gatePassed) {
+      return { status: "WATCHLIST", reason: signal.microcap.reason };
     }
     if (signal.circuitBreaker?.open) {
       const mins = Math.floor((signal.circuitBreaker.cooldownSec ?? 0) / 60);
@@ -389,8 +420,9 @@ export default function TradingAssistant() {
     return rationale.slice(0, 120);
   }
 
-  const enabledPairs = data?.signals.filter((s) => PAIR_CONFIG[s.pair]?.enabled) ?? [];
-  const disabledPairs = data?.signals.filter((s) => !PAIR_CONFIG[s.pair]?.enabled) ?? [];
+  const enabledPairs = data?.signals.filter((s) => PAIR_CONFIG[s.pair]?.enabled && PAIR_CONFIG[s.pair]?.tier === "MAJOR") ?? [];
+  const disabledPairs = data?.signals.filter((s) => !PAIR_CONFIG[s.pair]?.enabled && PAIR_CONFIG[s.pair]?.tier === "MAJOR") ?? [];
+  const watchlistPairs = data?.signals.filter((s) => PAIR_CONFIG[s.pair]?.tier === "MICROCAP") ?? [];
   const dd = portfolio?.drawdown;
 
   return (
@@ -492,6 +524,77 @@ export default function TradingAssistant() {
                     </div>
                     <div style={{ fontSize: "11px", color: "#525252" }}>{config.note}</div>
                     <div style={{ fontSize: "10px", color: "#404040", marginTop: "4px" }}>{config.evidence}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {/* WATCHLIST (MICROCAP) */}
+        {watchlistPairs.length > 0 && (
+          <section style={{ marginBottom: "24px" }}>
+            <h2 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px", color: "#a3a3a3" }}>
+              Pair Watchlist <span style={{ fontSize: "12px", color: "#525252" }}>(MICROCAP — likuiditas rendah, risiko tinggi)</span>
+            </h2>
+            <div style={{ display: "grid", gap: "12px" }}>
+              {watchlistPairs.map((s) => {
+                const config = PAIR_CONFIG[s.pair];
+                const g = gate(s);
+                const mc = s.microcap;
+                return (
+                  <div key={s.pair} style={{ background: "#0f0f0f", border: "1px solid #3b82f630", borderRadius: "8px", padding: "14px" }}>
+                    {/* Header */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+                      <div>
+                        <span style={{ fontSize: "14px", fontWeight: 700 }}>{config.name}</span>
+                        <span style={{ fontSize: "10px", color: "#525252", marginLeft: "6px" }}>IDR · MICROCAP</span>
+                      </div>
+                      <span style={{
+                        fontSize: "10px", fontWeight: 700, color: mc?.status === "WATCHLIST" ? "#f59e0b" : mc?.status === "KANDIDAT_EDGE" ? "#eab308" : "#16a34a",
+                        border: `1px solid ${mc?.status === "WATCHLIST" ? "#f59e0b30" : mc?.status === "KANDIDAT_EDGE" ? "#eab30830" : "#16a34a30"}`,
+                        borderRadius: "3px", padding: "3px 8px",
+                      }}>{mc?.status ?? "WATCHLIST"}</span>
+                    </div>
+
+                    {/* Reason */}
+                    <div style={{ fontSize: "12px", color: "#a3a3a3", marginBottom: "8px" }}>{g.reason}</div>
+
+                    {/* Microcap gate checks */}
+                    {mc && mc.checks.length > 0 && (
+                      <div style={{ background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: "4px", padding: "8px", marginBottom: "8px" }}>
+                        <div style={{ fontSize: "10px", color: "#525252", textTransform: "uppercase", marginBottom: "6px" }}>Liquidity Gate Checks</div>
+                        <div style={{ display: "grid", gap: "3px" }}>
+                          {mc.checks.map((c, i) => (
+                            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: "11px" }}>
+                              <span style={{ color: c.passed ? "#16a34a" : "#dc2626" }}>
+                                {c.passed ? "✓" : "✗"} {c.name}
+                              </span>
+                              <span style={{ color: "#525252", fontSize: "10px" }}>
+                                {c.unit === "IDR" ? `Rp ${c.actual.toLocaleString("id-ID", { maximumFractionDigits: 0 })}` : c.actual.toFixed(c.unit === "%" ? 2 : 0)}{c.unit} / {c.unit === "IDR" ? `Rp ${c.required.toLocaleString("id-ID", { maximumFractionDigits: 0 })}` : c.required}{c.unit}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Microcap sizing rules */}
+                    {mc && (
+                      <div style={{ fontSize: "10px", color: "#404040", display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                        <span>Max risk: {(mc.maxRiskPct * 100).toFixed(1)}%</span>
+                        <span>Max notional: Rp {mc.maxNotionalIdr.toLocaleString("id-ID")}</span>
+                        <span>Limit order only</span>
+                        {config.evidence && <span style={{ color: "#525252" }}>· {config.evidence}</span>}
+                      </div>
+                    )}
+
+                    {/* Price info */}
+                    {s.raw && (
+                      <div style={{ marginTop: "8px", fontSize: "11px", color: "#525252" }}>
+                        Harga: Rp {s.raw.price.toLocaleString("id-ID", { maximumFractionDigits: 0 })} · Funding z: {s.raw.fundingZScore.toFixed(2)} · ADX: {s.raw.adx.toFixed(0)}
+                      </div>
+                    )}
                   </div>
                 );
               })}

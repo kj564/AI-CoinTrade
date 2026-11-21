@@ -42,6 +42,7 @@ import { walkForwardBacktest, type WalkForwardResult } from "./walk-forward";
 import { validateAbsorptionThreshold, type AbsorptionValidation } from "./absorption-validation";
 import { computeWalkTheBookCap, computeLimitOrderCost, type WalkTheBookResult, type LimitOrderCostModel } from "./walk-the-book";
 import { getCircuitBreaker, type CircuitBreakerState } from "./alpha-circuit-breaker";
+import { isMicrocap, runMicrocapGate, type MicrocapGateResult } from "./microcap-rules";
 import { journalSignal, checkOpenSignals } from "./signal-journal";
 import { getTicker, getDepth } from "@/lib/indodax";
 import { calcATR, type Candle } from "./backtest";
@@ -192,6 +193,18 @@ export interface AlphaSignal {
   invalidation: string;
   warning: string | null;
 
+  // === MICROCAP GATE (for tokens like UNMD) ===
+  microcap: {
+    isMicrocap: boolean;
+    gatePassed: boolean;
+    status: "WATCHLIST" | "KANDIDAT_EDGE" | "KANDIDAT_LIVE_MICRO" | "not_microcap";
+    checks: { name: string; passed: boolean; actual: number; required: number; unit: string }[];
+    failedChecks: string[];
+    reason: string;
+    maxRiskPct: number;      // 0.001 for microcap, 0.01 for normal
+    maxNotionalIdr: number;  // 250000 for microcap, capital*0.30 for normal
+  } | null;
+
   raw: {
     price: number;
     atr: number;
@@ -219,7 +232,7 @@ export interface AlphaEngineResult {
   disclaimer: string;
 }
 
-const PAIRS = ["btc_idr", "eth_idr", "sol_idr", "bnb_idr", "xrp_idr"];
+const PAIRS = ["btc_idr", "eth_idr", "sol_idr", "bnb_idr", "xrp_idr", "unmd_idr"];
 const DEFAULT_CAPITAL = 10_000_000; // Rp 10jt
 
 // Risk per trade: 1% of capital (professional standard for retail)
@@ -378,6 +391,25 @@ async function generatePairSignal(
   // P7: Circuit breaker state
   const circuitBreaker = await getCircuitBreaker(pair);
 
+  // P10: Microcap liquidity gate (for tokens like UNMD).
+  // Runs BEFORE the normal signal logic. If the gate fails, the signal is
+  // forced to FLAT with WATCHLIST status — no BELI/JUAL for illiquid microcaps.
+  let microcapGate: MicrocapGateResult | null = null;
+  if (isMicrocap(pair)) {
+    microcapGate = runMicrocapGate(
+      pair,
+      candles1hSource,
+      depth,
+      idrPrice,
+      circuitBreaker.totalSignals,
+    );
+    if (!microcapGate.passed) {
+      console.log(`[alpha] microcap gate FAILED for ${pair}: ${microcapGate.failedChecks.join(", ")}. Status: WATCHLIST.`);
+    } else {
+      console.log(`[alpha] microcap gate PASSED for ${pair}. Status: ${microcapGate.status}.`);
+    }
+  }
+
   // P9: Correlation-aware concentration penalty.
   // We don't yet know the final action (determined inside generateSignalFromCandles),
   // but funding z-score implies likely direction: positive funding → SHORT (contrarian),
@@ -415,6 +447,7 @@ async function generatePairSignal(
     isHalted,
     concentrationPenalty,
     concentrationExposure,
+    microcapGate,
   });
 }
 
@@ -472,6 +505,8 @@ interface SignalContext {
   // P9: correlation-aware concentration penalty
   concentrationPenalty: number;   // 0.0 → 1.0 (multiply position size by this)
   concentrationExposure: number;  // effective correlated exposure (0 → maxExposure)
+  // P10: microcap liquidity gate (for tokens like UNMD)
+  microcapGate: MicrocapGateResult | null;
 }
 
 // Resample 1h candles to 1d candles (aggregate by calendar day).
@@ -563,6 +598,16 @@ async function generateSignalFromCandles(
       rationale: [`CIRCUIT BREAKER OPEN: ${ctx.circuitBreaker.consecutiveLosses} consecutive losses. Cooldown ${Math.floor(ctx.circuitBreaker.cooldownSec / 60)}min remaining. Trips: ${ctx.circuitBreaker.trips}. Signals suppressed for this pair.`],
       invalidation: "Circuit breaker is open. Wait for cooldown to elapse, then half-open probe will test one signal.",
       warning: `CIRCUIT BREAKER TRIPPED. This pair has lost ${ctx.circuitBreaker.consecutiveLosses} consecutive OOS signals. Edge may have degraded. Do NOT override.`,
+      microcap: ctx.microcapGate ? {
+        isMicrocap: true,
+        gatePassed: ctx.microcapGate.passed,
+        status: ctx.microcapGate.status,
+        checks: ctx.microcapGate.checks,
+        failedChecks: ctx.microcapGate.failedChecks,
+        reason: ctx.microcapGate.reason,
+        maxRiskPct: ctx.microcapGate.rules.maxRiskPct,
+        maxNotionalIdr: ctx.microcapGate.rules.maxNotionalIdr,
+      } : null,
       raw: { price, atr, atrPercent, rsi, adx: regime.adx, fundingRate, fundingZScore, fundingPercentile, regime: regime.regime },
     };
   }
@@ -702,12 +747,29 @@ async function generateSignalFromCandles(
     stopLoss = price; takeProfit1 = price; takeProfit2 = price;
   }
 
+  // P10: Microcap liquidity gate — if gate failed, force FLAT + WATCHLIST.
+  // Microcap tokens (UNMD) must pass liquidity gates BEFORE any signal logic.
+  if (ctx.microcapGate && !ctx.microcapGate.passed && action !== "FLAT") {
+    rationale.push(`MICROCAP GATE FAILED: ${ctx.microcapGate.failedChecks.join(", ")}. Pair stays in WATCHLIST. Likuiditas tidak memenuhi syarat — biaya eksekusi dapat menghapus edge.`);
+    action = "FLAT";
+    strength = "none";
+    conviction = 0;
+    stopLoss = price; takeProfit1 = price; takeProfit2 = price;
+  }
+
+  // P10b: Microcap sizing caps — if gate passed but pair is microcap, apply
+  // stricter risk% and notional caps (0.1% risk, Rp 250k max notional).
+  const isMicrocapPair = ctx.microcapGate !== null;
+  const microcapMaxRiskPct = ctx.microcapGate?.rules.maxRiskPct ?? RISK_PER_TRADE_PCT;
+  const microcapMaxNotional = ctx.microcapGate?.rules.maxNotionalIdr ?? capitalIdr * 0.30;
+  const effectiveRiskPct = isMicrocapPair ? Math.min(RISK_PER_TRADE_PCT, microcapMaxRiskPct) : RISK_PER_TRADE_PCT;
+
   let positionSizePct = action !== "FLAT" ? Math.min(fractionalKelly, 0.05) * volScale * riskMultiplier : 0;
 
   // P5: NOTIONAL CAP — three layers: capital cap (30%), leverage cap (3x),
   // AND liquidity cap (max notional without >0.5% slippage from order book).
-  // Risk per trade is the base 1% scaled by vol AND drawdown multiplier.
-  const scaledRiskPct = RISK_PER_TRADE_PCT * riskMultiplier;
+  // Risk per trade is the base 1% (or 0.1% for microcap) scaled by vol AND drawdown multiplier.
+  const scaledRiskPct = effectiveRiskPct * riskMultiplier;
   const riskAmount = capitalIdr * (positionSizePct > 0 ? scaledRiskPct : 0) * volScale;
   const stopDistance = action !== "FLAT" ? Math.abs(price - stopLoss) : 0;
   let notionalIdr = stopDistance > 0 ? (riskAmount / stopDistance) * price : 0;
@@ -715,6 +777,16 @@ async function generateSignalFromCandles(
   const maxLeverage = 3.0;
   let notionalCapPct = notionalIdr / capitalIdr;
   let leverage = notionalCapPct;
+
+  // Layer 0: Microcap notional cap (Rp 250k for UNMD — BEFORE capital cap)
+  if (isMicrocapPair && notionalIdr > microcapMaxNotional) {
+    const scaleDown = microcapMaxNotional / notionalIdr;
+    notionalIdr = microcapMaxNotional;
+    positionSizePct *= scaleDown;
+    notionalCapPct = notionalIdr / capitalIdr;
+    leverage = notionalCapPct;
+    rationale.push(`MICROCAP NOTIONAL CAP: notional capped to Rp ${microcapMaxNotional.toLocaleString("id-ID")} (microcap sizing rule). Risk ${(effectiveRiskPct * 100).toFixed(2)}%.`);
+  }
 
   // Layer 1: Capital cap (30%)
   if (notionalCapPct > maxNotionalPct) {
@@ -884,6 +956,16 @@ async function generateSignalFromCandles(
     rationale,
     invalidation,
     warning,
+    microcap: ctx.microcapGate ? {
+      isMicrocap: true,
+      gatePassed: ctx.microcapGate.passed,
+      status: ctx.microcapGate.status,
+      checks: ctx.microcapGate.checks,
+      failedChecks: ctx.microcapGate.failedChecks,
+      reason: ctx.microcapGate.reason,
+      maxRiskPct: ctx.microcapGate.rules.maxRiskPct,
+      maxNotionalIdr: ctx.microcapGate.rules.maxNotionalIdr,
+    } : null,
     raw: {
       price, atr, atrPercent, rsi,
       adx: regime.adx,
